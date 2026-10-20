@@ -1,0 +1,8 @@
+# @package gnc_node
+# 정지 유지(Station Keeping) — 고정 목표점 유지
+guidance:
+  mode: "target"
+  target_x: 0.0                    # 목표 X [m]
+  target_y: 0.0                    # 목표 Y [m]
+  target_theta: 0.0                # 목표 방향각 [rad]
+  # traj_* 키는 trajectory 모드에서만 사용 (gnc/guidance/trajectory.yaml 참조)

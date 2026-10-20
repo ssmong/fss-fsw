@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# Virtual environments
+.venv/
+.venv-wsl/
+venv/
+env/
+
+# ROS2 / colcon
+install/
+log/
+build/
+
+# Hydra outputs
+outputs/
+multirun/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Calibration raw data (모델은 커밋, 원시 데이터는 제외)
+calibration/*.csv
+calibration/*.bag
+
+# Secrets
+.env
+*.key
+
+# XG5000 (PLC IDE) 에디터 상태 + 자동 백업 (메인 .xgwx만 추적)
+plc/*.state
+plc/*.xgwx_bkx*

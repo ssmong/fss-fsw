@@ -1,0 +1,16 @@
+# @package imu_bridge_node
+# Xsens MTi-630-DK IMU 브릿지 — 키는 imu_bridge_node ROS2 파라미터와 1:1
+#
+# 장치 스펙 (MT0512P, EKF 노이즈는 gnc/navigator/ekf.yaml에서 사용):
+#   자이로 ARW 0.007 °/s/√Hz | 가속도 VRW 60 μg/√Hz | 최대 출력 400Hz
+#   드라이버: xsens_mti_ros2_driver (xsenssupport, ros2 브랜치) → /imu/data 발행
+#   포트 잠김 시: fuser -k /dev/ttyUSB0
+input_topic: "/imu/data"
+output_topic: "/sensors/imu"
+frame_id: "body"
+
+# 공식 드라이버 출력: 우수좌표계 Z-up (수평 정지 시 accel Z ≈ +9.81)
+# 센서 벡터를 FSS 본체 프레임(X 전방, Y 좌측, Z 상방)으로 보내는 고정 회전.
+# IMU 축 표시가 본체 축과 같은 현재 장착은 identity를 사용한다. 중력이나 부상 자세로
+# 이 값을 자동 보정하지 않는다. 축 반응이 실제로 다를 때만 알려진 90°/180° 회전을 적용한다.
+mounting_quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]

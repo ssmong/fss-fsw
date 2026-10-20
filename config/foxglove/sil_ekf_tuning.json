@@ -1,0 +1,136 @@
+{
+  "configById": {
+    "Plot!position_compare": {
+      "title": "위치: 참값 vs EKF [m]",
+      "paths": [
+        { "value": "/sim/true_state.x", "enabled": true, "timestampMethod": "headerStamp", "label": "true x", "color": "#f2cc60", "lineSize": 2.5 },
+        { "value": "/navigation/state.x", "enabled": true, "timestampMethod": "headerStamp", "label": "EKF x", "color": "#00d4aa", "lineSize": 2.5 },
+        { "value": "/sim/true_state.y", "enabled": true, "timestampMethod": "headerStamp", "label": "true y", "color": "#d2a8ff", "lineSize": 2.5 },
+        { "value": "/navigation/state.y", "enabled": true, "timestampMethod": "headerStamp", "label": "EKF y", "color": "#58a6ff", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!position_error": {
+      "title": "위치 오차 크기 [m]",
+      "paths": [
+        { "value": "/fss/derived/metrics.estimation_position_error", "enabled": true, "timestampMethod": "receiveTime", "label": "EKF - true", "color": "#58a6ff", "lineSize": 2.5 },
+        { "value": "/fss/derived/metrics.tracking_position_error", "enabled": true, "timestampMethod": "receiveTime", "label": "true - target", "color": "#f85149", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!heading_compare": {
+      "title": "방향: 참값 vs EKF vs 목표 [deg]",
+      "paths": [
+        { "value": "/sim/true_state.theta.@degrees", "enabled": true, "timestampMethod": "headerStamp", "label": "true", "color": "#f2cc60", "lineSize": 2.5 },
+        { "value": "/navigation/state.theta.@degrees", "enabled": true, "timestampMethod": "headerStamp", "label": "EKF", "color": "#00d4aa", "lineSize": 2.5 },
+        { "value": "/gnc/trajectory_ref.theta_ref.@degrees", "enabled": true, "timestampMethod": "headerStamp", "label": "target", "color": "#d2a8ff", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!velocity_compare": {
+      "title": "속도: 참값 vs EKF [m/s]",
+      "paths": [
+        { "value": "/sim/true_state.vx", "enabled": true, "timestampMethod": "headerStamp", "label": "true vx", "color": "#f2cc60", "lineSize": 2.5 },
+        { "value": "/navigation/state.vx", "enabled": true, "timestampMethod": "headerStamp", "label": "EKF vx", "color": "#00d4aa", "lineSize": 2.5 },
+        { "value": "/sim/true_state.vy", "enabled": true, "timestampMethod": "headerStamp", "label": "true vy", "color": "#d2a8ff", "lineSize": 2.5 },
+        { "value": "/navigation/state.vy", "enabled": true, "timestampMethod": "headerStamp", "label": "EKF vy", "color": "#58a6ff", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!uncertainty": {
+      "title": "EKF 위치 불확실도 1σ [m]",
+      "paths": [
+        { "value": "/navigation/state.std_x", "enabled": true, "timestampMethod": "headerStamp", "label": "σx", "color": "#58a6ff", "lineSize": 2.5 },
+        { "value": "/navigation/state.std_y", "enabled": true, "timestampMethod": "headerStamp", "label": "σy", "color": "#00d4aa", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!valves": {
+      "title": "밸브 0–7: 명령 vs 적용",
+      "paths": [
+        { "value": "/actuators/valve_status.commanded_duty_cycles[:]", "enabled": true, "timestampMethod": "receiveTime", "label": "command", "color": "#f0883e", "lineSize": 2.5 },
+        { "value": "/actuators/valve_status.applied_values[:].@div(4000)", "enabled": true, "timestampMethod": "receiveTime", "label": "applied", "color": "#00d4aa", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "xAxisVal": "index"
+    },
+    "Log!system": {
+      "topicToRender": "/rosout",
+      "foxglovePanelTitle": "WARN / ERROR LOG"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {
+    "8f0c2d42-f88a-4af6-9f5d-4d51a7426633": {
+      "name": "FSS Derived Metrics",
+      "sourceCode": "import { Input } from \"./types.ts\";\n\ntype State = { x: number; y: number; theta: number };\ntype Reference = { x_ref: number; y_ref: number; theta_ref: number };\ntype Output = {\n  estimation_position_error: number;\n  estimation_heading_error_deg: number;\n  tracking_position_error: number;\n  tracking_heading_error_deg: number;\n};\n\nexport const inputs = [\n  \"/navigation/state\",\n  \"/sim/true_state\",\n  \"/gnc/trajectory_ref\",\n];\nexport const output = \"/fss/derived/metrics\";\n\nlet truth: State | undefined;\nlet reference: Reference | undefined;\n\nfunction wrapAngle(value: number): number {\n  return ((value + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;\n}\n\nexport default function script(\n  event:\n    | Input<\"/navigation/state\">\n    | Input<\"/sim/true_state\">\n    | Input<\"/gnc/trajectory_ref\">,\n): Output | undefined {\n  if (event.topic === \"/sim/true_state\") {\n    truth = event.message;\n    return;\n  }\n  if (event.topic === \"/gnc/trajectory_ref\") {\n    reference = event.message;\n    return;\n  }\n  if (truth == undefined || reference == undefined) {\n    return;\n  }\n\n  const nav = event.message;\n  return {\n    estimation_position_error: Math.hypot(nav.x - truth.x, nav.y - truth.y),\n    estimation_heading_error_deg:\n      wrapAngle(nav.theta - truth.theta) * 180 / Math.PI,\n    tracking_position_error:\n      Math.hypot(truth.x - reference.x_ref, truth.y - reference.y_ref),\n    tracking_heading_error_deg:\n      wrapAngle(truth.theta - reference.theta_ref) * 180 / Math.PI,\n  };\n}\n"
+    }
+  },
+  "linkedGlobalVariables": [],
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "direction": "column",
+    "first": {
+      "direction": "row",
+      "first": {
+        "direction": "column",
+        "first": "Plot!position_compare",
+        "second": "Plot!position_error",
+        "splitPercentage": 55
+      },
+      "second": {
+        "direction": "column",
+        "first": "Plot!heading_compare",
+        "second": "Plot!velocity_compare",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 50
+    },
+    "second": {
+      "direction": "row",
+      "first": "Plot!uncertainty",
+      "second": {
+        "direction": "row",
+        "first": "Plot!valves",
+        "second": "Log!system",
+        "splitPercentage": 58
+      },
+      "splitPercentage": 34
+    },
+    "splitPercentage": 67
+  }
+}

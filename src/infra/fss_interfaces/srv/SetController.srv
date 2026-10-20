@@ -1,0 +1,5 @@
+# 제어기 유형 변경
+string controller_type   # "pid", "lqr" (빈 문자열 = 현재 제어기 리셋)
+---
+bool success
+string message

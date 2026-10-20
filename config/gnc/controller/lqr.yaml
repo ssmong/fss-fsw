@@ -1,0 +1,6 @@
+# @package gnc_node
+# 제어기 선택: LQR — K 게인은 lqr_gains.yaml (compute_lqr_gains.py 생성)
+translational:
+  type: "lqr"
+rotational:
+  type: "lqr"

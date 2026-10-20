@@ -1,0 +1,27 @@
+[project]
+name = "fss-fsw"
+version = "0.2.0"
+description = "FSS(Floating Spacecraft Simulator) 비행 소프트웨어"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+# These tests launch ROS directly; distro plugins must not import unselected optional-backend tests.
+addopts = "-p no:launch_testing -p no:launch_ros"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
+# B: bugbear (흔한 버그 패턴), SIM: 간결화 가능 코드, RUF: ruff 전용
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

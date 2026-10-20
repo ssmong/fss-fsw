@@ -1,0 +1,12 @@
+# @package _global_
+# 실측 밸브 맵으로 GNC 할당→드라이버 역변환→플랜트를 실행하는 SIL 예제.
+defaults:
+  - override /system/sim_valve: mapped
+
+system:
+  use_sim: true
+
+experiment:
+  name: "valve_map_demo"
+
+valve_thrust_map_file: "calibration/valve_thrust_measured.yaml"

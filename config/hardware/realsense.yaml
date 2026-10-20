@@ -1,0 +1,46 @@
+# Intel RealSense D435i 드라이버 설정 (realsense2_camera `config_file` 포맷)
+#
+# Hydra 파일이 아니라 realsense-ros 4.x가 직접 읽는 flat dict다. sensors.launch.py와
+# start_realsense.sh 기본 모드가 이 파일을 공통으로 사용한다.
+#
+# 역할 분리:
+#   - Xsens /sensors/imu: 현재 FSS EKF의 유일한 관성 센서
+#   - D435i /camera/camera/imu: 카메라 알고리즘·시간 동기·기록 검증용 보조 IMU
+# D435i IMU를 /sensors/imu로 remap하거나 두 IMU를 같은 토픽에 발행하지 않는다.
+
+# 장치 선택과 재연결. 숫자 SN 앞 '_'는 ROS2의 숫자형 자동 변환을 막는 공식 우회 규칙이다.
+serial_no: "_247122073297"
+device_type: "d435i"
+initial_reset: true
+wait_for_device_timeout: 10.0
+reconnect_timeout: 6.0
+
+# 영상 스트림. 컬러와 깊이를 함께 쓰므로 같은 시각의 frameset과 color 정렬 depth를 만든다.
+enable_color: true
+enable_depth: true
+enable_infra1: false
+enable_infra2: false
+rgb_camera.color_profile: "640x480x30"
+rgb_camera.color_format: "RGB8"
+depth_module.depth_profile: "640x480x30"
+depth_module.depth_format: "Z16"
+enable_sync: true
+align_depth.enable: true
+
+# PointCloud/RGBD는 CPU·USB·rosbag 부하가 크므로 필요한 알고리즘에서만 별도로 켠다.
+pointcloud.enable: false
+enable_rgbd: false
+
+# D435i 보조 IMU. 현재 장치 세대의 accel 프로파일은 100/200Hz 계열이다.
+enable_gyro: true
+enable_accel: true
+gyro_fps: 200
+accel_fps: 100
+unite_imu_method: 2  # 2=linear_interpolation, /camera/camera/imu를 gyro 시각에 발행
+
+# 카메라 내부 TF만 발행한다. body→camera_link 외부 장착 TF는 실측 전까지 발행하지 않는다.
+publish_tf: true
+tf_publish_rate: 0.0
+
+# 스트림 누락과 온도를 /diagnostics에서 1초마다 확인한다.
+diagnostics_period: 1.0

@@ -1,0 +1,14 @@
+# @package vicon_bridge_node
+# FSS_VICON 지상국 → Jetson: UDP JSON (x/y: mm, yaw: deg)
+# 지상국의 UDP 목적지는 Jetson IP와 아래 port로 설정한다.
+bind_ip: "0.0.0.0"                # Jetson 수신 인터페이스
+port: 9870
+source_ip: ""                     # 빈 값: 모든 송신 IP 허용. 필요 시 지상국 IPv4 지정
+object_name: "robotA"             # 지상국에 등록한 물체 이름 (objects의 키)
+poll_rate_hz: 200.0
+
+# 입력은 이미 지상국에서 정한 테이블 좌표다. 같은 원점·축이면 모두 0 유지.
+vicon_frame_id: "table"
+frame_offset_x: 0.0                # [m]
+frame_offset_y: 0.0
+frame_rotation_deg: 0.0            # [deg]

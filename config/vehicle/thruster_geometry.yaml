@@ -1,0 +1,61 @@
+# 추력기 기하학적 배치
+# 본체 프레임: X 전방, Y 좌측, Z 상방 (테이블 수직)
+# 평면 우주선이므로 Fx, Fy, Mz만 유효
+# TODO: 실측값으로 위치 업데이트 필요
+thruster_geometry:
+  # 대칭 사각형 본체 기하학 파라미터
+  body_half_width: 0.15          # 질량 중심에서 각 면까지의 거리 [m]
+  thruster_lateral_offset: 0.05  # 면 중심에서 추력기까지의 횡방향 오프셋 [m]
+
+  thrusters:
+    # +X 면 (전방): 추력 방향 +X
+    - id: 0
+      position: [0.15, 0.05, 0.0]     # 질량 중심으로부터의 위치 [m]
+      direction: [1.0, 0.0, 0.0]       # 추력 방향 (본체 프레임)
+    - id: 1
+      position: [0.15, -0.05, 0.0]
+      direction: [1.0, 0.0, 0.0]
+
+    # -X 면 (후방): 추력 방향 -X
+    - id: 2
+      position: [-0.15, 0.05, 0.0]
+      direction: [-1.0, 0.0, 0.0]
+    - id: 3
+      position: [-0.15, -0.05, 0.0]
+      direction: [-1.0, 0.0, 0.0]
+
+    # +Y 면 (좌측): 추력 방향 +Y
+    - id: 4
+      position: [0.05, 0.15, 0.0]
+      direction: [0.0, 1.0, 0.0]
+    - id: 5
+      position: [-0.05, 0.15, 0.0]
+      direction: [0.0, 1.0, 0.0]
+
+    # -Y 면 (우측): 추력 방향 -Y
+    - id: 6
+      position: [0.05, -0.15, 0.0]
+      direction: [0.0, -1.0, 0.0]
+    - id: 7
+      position: [-0.05, -0.15, 0.0]
+      direction: [0.0, -1.0, 0.0]
+
+  # 비례밸브 물리 사양 (PVQ30 제품군, PVQ33 베이스 배관형)
+  valve_specs:
+    model: "SMC PVQ33-5G-16-01N-X33"  # 전류 드라이버 내장 특주
+    type: "NC"                         # 상시 폐 (Normally Closed)
+    orifice_mm: 1.6                    # 오리피스 직경 [mm] (형번 16 = φ1.6)
+    port: "1/8_NPT"                    # 포트 규격
+    input_current_mA: [4, 20]          # 입력 전류 범위 [mA]
+    max_pressure_diff_MPa: 0.7         # 최대 작동 압력차 [MPa] (≈101.5 psi)
+    rated_flow_range_lpm: [0, 100]     # 사양표 정격 범위 [L/min]
+    catalog_curve_endpoint_lpm: 109    # φ1.6, ΔP=0.7MPa 그래프 종점 판독값
+    supply_pressure_psi: 80            # 공급 압력 [psi] (공압 다이어그램 기준)
+    power_W: 4.0                       # 최대 소비 전력 [W]
+
+  # 공압 시스템 압력 단계 (docs/Diagram_pneumatic_system.jpg 참조)
+  pneumatic_pressures:
+    tank_psi: 4500                     # 에어 탱크 [psi]
+    primary_regulator_psi: 800         # 1차 레귤레이터 출력 [psi]
+    thrust_line_psi: 80                # 추력 라인 공급 [psi]
+    flotation_line_psi: 60             # 부유 라인 공급 [psi]

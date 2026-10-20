@@ -1,0 +1,6 @@
+# 시스템 모드 변경 요청
+uint8 requested_mode    # SystemMode 상수 사용
+---
+bool success
+uint8 actual_mode       # 실제 전환된 모드
+string message

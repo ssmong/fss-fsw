@@ -1,0 +1,96 @@
+# SAMD21 Reaction Wheel 하드웨어 계약
+#
+# Hydra 트리 밖의 장치 계약. reaction_wheel_driver_node가 직접 읽는다.
+# 현재 기준은 `torque_current_ctrl_simple` 펌웨어다. MCU 코드가 다시 바뀌면 프로토콜,
+# 제어 상수와 안전 증거를 이 파일 및 scripts/validate_config.py와 함께 갱신한다.
+reaction_wheel:
+  enabled: false                        # 실장치 연결 허용. dry_run은 이 값과 무관하게 실행
+  integration_state: "bench_only"       # bench_only | diagnostic | gnc
+  allow_gnc_commands: false              # 현재는 독립 bench 드라이버, GNC 할당은 추력기 사용
+
+  driver:
+    command_timeout_sec: 0.25            # ROS 명령 미수신 시 STOP·출력 비활성화
+    telemetry_timeout_sec: 0.10          # MCU 상태 미수신 시 STOP·출력 비활성화
+
+  firmware:
+    variant: "torque_current_ctrl_simple"
+    control_law: "pure_current_pi"
+    control_rate_hz: 1000.0
+    pwm_frequency_hz: 20000
+    pwm_top_counts: 2400
+    current_kp_v_per_a: 1.0
+    current_ki_v_per_as: 100.0
+    integrator_limit_as: 0.12             # VBUS/KI = 12/100
+    bemf_feedforward: false
+    resistance_feedforward: false
+    coulomb_friction_feedforward: false
+    speed_observer: false
+
+  connection:
+    interface: "usb_cdc"                 # SAMD21 native USB-C CDC
+    port: "/dev/ttyACM0"                 # udev 적용 전 예상 포트; 장기적으로 고정 symlink 권장
+    baudrate: 921600                      # USB-CDC에서는 명목값이지만 host API와 맞춘다
+    command_rate_hz: 20.0                 # Jetson→MCU 목표 전송률
+    telemetry_rate_hz: 100.0              # MCU→Jetson 상태 전송률
+    rx_timeout_ms: 500                    # MCU 명령 watchdog
+    partial_line_timeout_ms: 50
+    write_timeout_ms: 50                 # host USB write 대기 상한
+
+  protocol:
+    command_torque_semantics: "wheel"    # T 값은 body 토크가 아니라 wheel 토크 [N·m]
+    body_to_wheel_torque_sign: -1.0       # +Mz body 명령에는 -wheel torque가 필요
+    torque_command: 'T,<wheel_torque_nm>\n'
+    torque_zero_command: 'T,0\n'
+    immediate_stop_chars: ["Z", "z"]    # newline 없이 즉시 STOP
+    stop_command: 'STOP\n'
+    telemetry: 'S,<current_a>,<duty>,<generated_torque_nm>,<state>\n'
+    telemetry_torque_semantics: "kt_times_measured_current"
+    telemetry_has_speed: false
+    ack_stop: 'ACK,STOP,<reason>\n'
+    ack_torque: 'ACK,T,<accepted_saturated_torque_nm>\n'
+    fault: 'FAULT,<reason>\n'
+    state_codes:
+      stop: 0
+      active: 1
+      fault: 2
+
+  electrical:
+    bus_voltage_v: 12.0
+    torque_constant_nm_per_a: 0.01405
+    continuous_current_limit_a: 0.96
+    hard_current_trip_a: 1.20
+    max_wheel_torque_nm: 0.013488         # KT × continuous_current_limit
+    torque_stop_epsilon_nm: 0.000001
+
+  wheel:
+    axis_body: [0.0, 0.0, 1.0]
+    inertia_kg_m2: 0.0001656913           # Jetson 동역학 참조값, simple MCU에서는 미사용
+    speed_feedback: "none"
+    has_physical_speed_sensor: false
+    verified_speed_limit_rad_s: null      # 물리 overspeed 한계 미확정
+    verified_momentum_limit_nms: null     # 속도 한계 확정 뒤 계산
+
+  current_sensor:
+    model: "INA226"
+    i2c_address: 0x40
+    shunt_resistance_ohm: 0.1
+    measurement_point: "motor_positive_lead"
+    signed_current_expected: true
+    current_sign: 1.0                     # 실제 부호가 반대면 펌웨어와 함께 -1.0으로 변경
+    shunt_conversion_time_us: 588
+    wiring_polarity_bench_verified: false
+
+  safety_evidence:
+    stop_active_fault_state_machine_implemented: true
+    force_outputs_off_implemented: true   # TCC0 CC=0, PMUX 해제, 두 핀 LOW
+    torque_zero_stop_implemented: true
+    immediate_z_stop_implemented: true
+    stop_word_implemented: true
+    rx_timeout_stop_implemented: true
+    overcurrent_fault_implemented: true
+    unknown_command_stop_implemented: true
+    fault_latched_until_stop_command: false  # 현재는 다음 유효 T 명령이 FAULT를 즉시 해제함
+    nonfinite_current_fault_implemented: false
+    physical_overspeed_protection: false  # 속도 센서·추정값·차단 로직 없음
+    stop_paths_bench_verified: false
+    current_loop_validated: false

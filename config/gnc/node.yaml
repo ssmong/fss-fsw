@@ -1,0 +1,19 @@
+# @package gnc_node
+# gnc_node 공통 파라미터 — 제어기 type과 무관하게 항상 필요
+# (노드가 런타임 PID↔LQR 전환을 지원하므로 게인을 모두 포함;
+#  type 선택은 gnc/controller 그룹이 담당)
+control_rate_hz: 20.0
+# GNC 자체 0 출력 가드의 임시 운용값 (manager의 지속 장애 래치 한계와 별도).
+# 실측 지연·지터·연속 누락 및 플랜트 안전 여유로 조정해야 하며, 동역학 기반 보장값은 아님.
+state_age_limit_ms: 100.0
+
+translational:
+  kp: 5.0
+  ki: 0.1
+  kd: 8.0                          # ζ ≈ 0.46 (m=10kg 기준)
+  max_force: ${vehicle.max_force_body}
+rotational:
+  kp: 3.0
+  ki: 0.05
+  kd: 1.5                          # ζ ≈ 0.61 (Izz=0.5 기준)
+  max_torque: ${vehicle.max_torque_body}

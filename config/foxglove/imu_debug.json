@@ -1,0 +1,102 @@
+{
+  "configById": {
+    "Plot!raw_gyro": {
+      "title": "Xsens Raw 자이로 [rad/s]",
+      "paths": [
+        { "value": "/imu/data.angular_velocity.x", "enabled": true, "timestampMethod": "headerStamp", "label": "gx", "color": "#ff7b72", "lineSize": 2 },
+        { "value": "/imu/data.angular_velocity.y", "enabled": true, "timestampMethod": "headerStamp", "label": "gy", "color": "#f2cc60", "lineSize": 2 },
+        { "value": "/imu/data.angular_velocity.z", "enabled": true, "timestampMethod": "headerStamp", "label": "gz", "color": "#58a6ff", "lineSize": 2 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!bridge_gyro": {
+      "title": "FSS Body 자이로 [rad/s]",
+      "paths": [
+        { "value": "/sensors/imu.angular_velocity.x", "enabled": true, "timestampMethod": "headerStamp", "label": "gx", "color": "#ff7b72", "lineSize": 2 },
+        { "value": "/sensors/imu.angular_velocity.y", "enabled": true, "timestampMethod": "headerStamp", "label": "gy", "color": "#f2cc60", "lineSize": 2 },
+        { "value": "/sensors/imu.angular_velocity.z", "enabled": true, "timestampMethod": "headerStamp", "label": "gz", "color": "#58a6ff", "lineSize": 2 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!raw_accel": {
+      "title": "Xsens Raw 가속도 [m/s²]",
+      "paths": [
+        { "value": "/imu/data.linear_acceleration.x", "enabled": true, "timestampMethod": "headerStamp", "label": "ax", "color": "#ff7b72", "lineSize": 2 },
+        { "value": "/imu/data.linear_acceleration.y", "enabled": true, "timestampMethod": "headerStamp", "label": "ay", "color": "#f2cc60", "lineSize": 2 },
+        { "value": "/imu/data.linear_acceleration.z", "enabled": true, "timestampMethod": "headerStamp", "label": "az", "color": "#58a6ff", "lineSize": 2 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!bridge_accel": {
+      "title": "FSS Body 가속도 [m/s²]",
+      "paths": [
+        { "value": "/sensors/imu.linear_acceleration.x", "enabled": true, "timestampMethod": "headerStamp", "label": "ax", "color": "#ff7b72", "lineSize": 2 },
+        { "value": "/sensors/imu.linear_acceleration.y", "enabled": true, "timestampMethod": "headerStamp", "label": "ay", "color": "#f2cc60", "lineSize": 2 },
+        { "value": "/sensors/imu.linear_acceleration.z", "enabled": true, "timestampMethod": "headerStamp", "label": "az", "color": "#58a6ff", "lineSize": 2 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!attitude": {
+      "title": "평면 자세 Yaw [deg]",
+      "paths": [
+        { "value": "/imu/data.orientation.@rpy.yaw.@degrees", "enabled": true, "timestampMethod": "headerStamp", "label": "yaw", "color": "#f0883e", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "linkedGlobalVariables": [],
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "direction": "column",
+    "first": {
+      "direction": "row",
+      "first": {
+        "direction": "column",
+        "first": "Plot!raw_gyro",
+        "second": "Plot!bridge_gyro",
+        "splitPercentage": 50
+      },
+      "second": {
+        "direction": "column",
+        "first": "Plot!raw_accel",
+        "second": "Plot!bridge_accel",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 50
+    },
+    "second": "Plot!attitude",
+    "splitPercentage": 68
+  }
+}

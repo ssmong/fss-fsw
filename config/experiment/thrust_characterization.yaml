@@ -1,0 +1,10 @@
+# @package _global_
+# 추력 특성화 실험 — 외부 추력 명령과 경쟁하지 않도록 본체 GNC 미기동
+system:
+  use_gnc: false
+
+experiment:
+  name: "thrust_characterization"
+  description: "비례밸브 정적 특성 측정 (데드밴드, 선형성, 히스테리시스)"
+  duration_sec: 0                   # 메타데이터; 현재 러너는 자동 종료하지 않음
+  record_bag: true                  # 메타데이터; 현재 rosbag은 별도로 수동 기록

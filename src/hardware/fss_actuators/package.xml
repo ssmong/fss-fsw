@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fss_actuators</name>
+  <version>0.2.0</version>
+  <description>FSS 액추에이터 드라이버: 비례밸브·메인 밸브·반응휠 제어</description>
+  <maintainer email="iyeons127@snu.ac.kr">smong_jetson</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>fss_interfaces</depend>
+  <depend>fss_hal</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>yaml-cpp</depend>
+  <depend>nlohmann-json-dev</depend>
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

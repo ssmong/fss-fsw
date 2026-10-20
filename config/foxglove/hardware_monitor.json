@@ -1,0 +1,149 @@
+{
+  "configById": {
+    "Indicator!mode": {
+      "path": "/system/mode.mode_name",
+      "style": "background",
+      "fontSize": 22,
+      "fallbackColor": "#6e7681",
+      "fallbackLabel": "IDLE",
+      "rules": [
+        { "operator": "=", "rawValue": "ACTIVE", "color": "#3fb950", "label": "ACTIVE" },
+        { "operator": "=", "rawValue": "READY", "color": "#00b8d9", "label": "READY" },
+        { "operator": "=", "rawValue": "PRESSURIZING", "color": "#d29922", "label": "PRESSURIZING" },
+        { "operator": "=", "rawValue": "SAFE_HOLD", "color": "#d29922", "label": "SAFE HOLD" },
+        { "operator": "=", "rawValue": "EMERGENCY_STOP", "color": "#f85149", "label": "E-STOP" }
+      ],
+      "foxglovePanelTitle": "SYSTEM MODE"
+    },
+    "Indicator!navigation": {
+      "path": "/system/health.navigation_degraded",
+      "style": "background",
+      "fontSize": 22,
+      "fallbackColor": "#3fb950",
+      "fallbackLabel": "NAV OK",
+      "rules": [
+        { "operator": "=", "rawValue": "true", "color": "#f85149", "label": "NAV DEGRADED" }
+      ],
+      "foxglovePanelTitle": "NAVIGATION"
+    },
+    "Indicator!actuators": {
+      "path": "/system/health.actuators_ok",
+      "style": "background",
+      "fontSize": 22,
+      "fallbackColor": "#f85149",
+      "fallbackLabel": "ACTUATOR FAULT",
+      "rules": [
+        { "operator": "=", "rawValue": "true", "color": "#3fb950", "label": "ACTUATORS OK" }
+      ],
+      "foxglovePanelTitle": "ACTUATORS"
+    },
+    "Indicator!main_valve": {
+      "path": "/system/health.main_valve_open",
+      "style": "background",
+      "fontSize": 22,
+      "fallbackColor": "#6e7681",
+      "fallbackLabel": "MAIN VALVE CLOSED",
+      "rules": [
+        { "operator": "=", "rawValue": "true", "color": "#3fb950", "label": "MAIN VALVE OPEN" }
+      ],
+      "foxglovePanelTitle": "AIR BEARING"
+    },
+    "Plot!tracking_position": {
+      "title": "위치 추종: 현재 vs 목표 [m]",
+      "paths": [
+        { "value": "/navigation/state.x", "enabled": true, "timestampMethod": "headerStamp", "label": "x current", "color": "#00d4aa", "lineSize": 2.5 },
+        { "value": "/gnc/trajectory_ref.x_ref", "enabled": true, "timestampMethod": "headerStamp", "label": "x target", "color": "#f2cc60", "lineSize": 2 },
+        { "value": "/navigation/state.y", "enabled": true, "timestampMethod": "headerStamp", "label": "y current", "color": "#58a6ff", "lineSize": 2.5 },
+        { "value": "/gnc/trajectory_ref.y_ref", "enabled": true, "timestampMethod": "headerStamp", "label": "y target", "color": "#d2a8ff", "lineSize": 2 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!tracking_heading": {
+      "title": "방향 추종 [deg]",
+      "paths": [
+        { "value": "/navigation/state.theta.@degrees", "enabled": true, "timestampMethod": "headerStamp", "label": "current", "color": "#00d4aa", "lineSize": 2.5 },
+        { "value": "/gnc/trajectory_ref.theta_ref.@degrees", "enabled": true, "timestampMethod": "headerStamp", "label": "target", "color": "#f2cc60", "lineSize": 2 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!uncertainty": {
+      "title": "EKF 위치 불확실도 1σ [m]",
+      "paths": [
+        { "value": "/navigation/state.std_x", "enabled": true, "timestampMethod": "headerStamp", "label": "σx", "color": "#58a6ff", "lineSize": 2.5 },
+        { "value": "/navigation/state.std_y", "enabled": true, "timestampMethod": "headerStamp", "label": "σy", "color": "#00d4aa", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!valves": {
+      "title": "밸브 0–7: 명령 vs PLC 적용",
+      "paths": [
+        { "value": "/actuators/valve_status.commanded_duty_cycles[:]", "enabled": true, "timestampMethod": "receiveTime", "label": "command", "color": "#f0883e", "lineSize": 2.5 },
+        { "value": "/actuators/valve_status.applied_values[:].@div(4000)", "enabled": true, "timestampMethod": "receiveTime", "label": "applied", "color": "#00d4aa", "lineSize": 2.5 }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "xAxisVal": "index"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "linkedGlobalVariables": [],
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "direction": "column",
+    "first": {
+      "direction": "row",
+      "first": {
+        "direction": "row",
+        "first": "Indicator!mode",
+        "second": "Indicator!navigation",
+        "splitPercentage": 50
+      },
+      "second": {
+        "direction": "row",
+        "first": "Indicator!actuators",
+        "second": "Indicator!main_valve",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 50
+    },
+    "second": {
+      "direction": "row",
+      "first": {
+        "direction": "column",
+        "first": "Plot!tracking_position",
+        "second": "Plot!tracking_heading",
+        "splitPercentage": 58
+      },
+      "second": {
+        "direction": "column",
+        "first": "Plot!uncertainty",
+        "second": "Plot!valves",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 58
+    },
+    "splitPercentage": 15
+  }
+}

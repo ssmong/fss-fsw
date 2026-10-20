@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fss_manager</name>
+  <version>0.2.0</version>
+  <description>FSS 시스템 관리자 — 모드 FSM + 서브시스템 건강 감시</description>
+  <maintainer email="iyeons127@snu.ac.kr">smong</maintainer>
+  <license>MIT</license>
+
+  <depend>rclcpp</depend>
+  <depend>fss_interfaces</depend>
+  <depend>std_msgs</depend>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <test_depend>rcl</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

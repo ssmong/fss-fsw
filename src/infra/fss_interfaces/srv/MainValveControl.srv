@@ -1,0 +1,5 @@
+# 메인 밸브(에어베어링) 제어
+bool open    # true = 열기, false = 닫기
+---
+bool success
+string message

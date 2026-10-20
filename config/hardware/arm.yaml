@@ -1,0 +1,25 @@
+# @package arm_driver_node
+# 이 값은 모의 실행용이다. 실제 팔의 모델/ID/부호/감속비/영점은 아직 미확정이다.
+dry_run: true
+hardware_confirmed: false
+port: "UNCONFIGURED"
+baudrate: 1000000
+return_delay_us: 0  # 토크 OFF 연결 시 EEPROM 차이가 있을 때만 설정; 2 us 단위
+command_mode: "velocity"  # velocity / position(다회전) / current; 실행 중 전환은 서비스 사용
+current_limits_a: [0.2, 0.2, 0.2]  # 관절 +방향 기준 모터 전류 A; 모의 설정, 실장치 검증 필요
+position_profile_velocity: [0.3, 0.3, 0.3]  # 위치 모드 내부 profile 상한 rad/s
+position_profile_acceleration: [1.0, 1.0, 1.0]  # 위치 모드 내부 profile 상한 rad/s²
+model_numbers: [1020, 1020, 1020]  # XM430-W350 제어표를 이용한 모의 변환
+ids: [1, 2, 3]
+directions: [1, 1, 1]
+gear_ratios: [1.0, 1.0, 1.0]      # Dynamixel 출력축 회전 / 관절 회전
+zero_ticks: [0, 0, 0]
+velocity_limits: [1.0, 1.0, 1.0]
+lower_limits: [-1.5707963267948966, -1.5707963267948966, -1.5707963267948966]  # 모의 범위 -90도
+upper_limits: [1.5707963267948966, 1.5707963267948966, 1.5707963267948966]  # 모의 범위 +90도
+acceleration_limits: [1.0, 1.0, 1.0]  # 위치 profile의 모의 가속도 상한 rad/s²
+initial_position_rad: [0.0, 0.0, 0.0]  # dry_run 초기 관절각; 실제 장치의 이동 목표가 아님
+control_rate_hz: 100.0
+command_timeout_s: 0.1
+mode_timeout_s: 1.5  # 모드 미수신 한계; 설정 검사에서 manager 발행 주기와 비교
+bus_watchdog_s: 0.1

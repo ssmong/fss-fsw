@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fss_common</name>
+  <version>0.2.0</version>
+  <description>FSS 공용 유틸리티: 경로 탐색, Hydra→ROS2 브릿지, 런치 유틸, 수학 함수</description>
+  <maintainer email="iyeons127@snu.ac.kr">smong_jetson</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <!-- hydra-core/omegaconf는 rosdep 키 없음 — install_dependencies.sh에서 pip 설치 -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

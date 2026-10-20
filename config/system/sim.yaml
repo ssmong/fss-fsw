@@ -1,0 +1,24 @@
+# @package plant_model_node
+# SIL 플랜트 모델 — 물성/노이즈는 vehicle/ekf 권위 값에서 보간 (수기 중복 금지)
+mass: ${vehicle.mass}
+inertia_zz: ${vehicle.inertia_zz}
+initial_x: 0.5                     # 초기 상태 [m, m, rad]
+initial_y: 0.3
+initial_theta: 0.2
+
+# ΔP=0.7MPa 전개방 기준 미보정 추력
+max_thrust_per_valve: ${vehicle.max_thrust_per_nozzle}
+thrust_map_file: ${valve_thrust_map_file}
+
+# 센서 주파수 / 시뮬레이션
+vicon_rate_hz: 100.0
+imu_rate_hz: 100.0
+sim_rate_hz: 1000.0
+
+# 센서 노이즈 — EKF와 동일 소스 (ekf_node 값 보간)
+vicon_position_noise: ${ekf_node.vicon_position_noise}
+vicon_heading_noise: ${ekf_node.vicon_heading_noise}
+gyro_noise_density: ${ekf_node.gyro_noise_density}
+accel_noise_density: ${ekf_node.accel_noise_density}
+gyro_bias_random_walk: ${ekf_node.gyro_bias_random_walk}
+accel_bias_random_walk: ${ekf_node.accel_bias_random_walk}

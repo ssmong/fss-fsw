@@ -1,0 +1,12 @@
+# @package _global_
+# 궤적 추종 실험 — LQR + 시간 매개변수화 궤적
+# 궤적 경유점은 gnc/guidance/trajectory.yaml 기본값 또는 CLI 오버라이드로 지정
+defaults:
+  - override /gnc/controller: lqr
+  - override /gnc/guidance: trajectory
+
+experiment:
+  name: "trajectory_tracking"
+  description: "시간 매개변수화된 궤적 추종 실험"
+  duration_sec: 180                 # 메타데이터; 현재 러너는 자동 종료하지 않음
+  record_bag: true                  # 메타데이터; 현재 rosbag은 별도로 수동 기록

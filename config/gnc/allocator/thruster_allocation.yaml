@@ -1,0 +1,7 @@
+# @package gnc_node
+# 추력 할당기 (C++ Projected Gradient Descent QP)
+allocator:
+  thrust_map_file: ${valve_thrust_map_file}
+  thrust_weight: 0.01              # 추력 사용량 최소화 가중치 (연료 절약)
+  min_thrust: 0.0                  # 최소 정규화 추력 (맵 미사용 시 입력 듀티와 동일)
+  max_thrust_per_nozzle: ${vehicle.max_thrust_per_nozzle}  # 맵 미사용 시 최대 추력 [N]

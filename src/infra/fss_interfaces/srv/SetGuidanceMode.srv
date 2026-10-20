@@ -1,0 +1,10 @@
+# 유도 모드 변경
+uint8 mode
+uint8 STATION_KEEP=0     # 정지 유지
+uint8 WAYPOINT=1         # 경유점 추종
+uint8 TRAJECTORY=2       # 궤적 추종
+uint8 PROXIMITY=3        # 근접 접근
+uint8 MANUAL=4           # 수동 제어
+---
+bool success
+string message

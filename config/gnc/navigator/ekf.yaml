@@ -1,0 +1,24 @@
+# @package ekf_node
+# 11-State EKF — 키는 ekf_node ROS2 파라미터와 1:1
+# 상태: x = [px, py, θ, vx, vy, ω, b_g, b_ax, b_ay, b_tx, b_ty]ᵀ (테이블 프레임 속도)
+# 참고: Crassidis & Junkins 2nd Ed / Groves 2nd Ed
+
+# ── IMU 노이즈 (Xsens MTi-630-DK 데이터시트 MT0512P) ──
+gyro_noise_density: 1.2217e-4      # ARW 0.007°/s/√Hz → [rad/s/√Hz]
+accel_noise_density: 5.886e-4      # VRW 60μg/√Hz → [m/s²/√Hz]
+gyro_bias_random_walk: 1.0e-5      # [rad/s/√s] (bias instability 8°/h 기반 추정)
+accel_bias_random_walk: 1.0e-4     # [m/s²/√s] (bias instability 10μg 기반 추정)
+table_accel_bias_random_walk: 1.0e-5  # [m/s²/√s] 테이블 틸트(준정적) — 회전 기동 시 분리 관측
+
+# ── Vicon 노이즈 (MX T10) ──
+vicon_position_noise: 5.0e-4       # [m] (0.5mm σ)
+vicon_heading_noise: 1.745e-3      # [rad] (~0.1°, 마커 기하 의존)
+
+# ── 이상치 게이팅 + NIS ──
+gate_threshold: 11.345             # χ²₃(0.99)
+nis_window: 50                     # NIS 이동 평균 윈도우 (~0.5s @100Hz)
+
+# ── 타이밍 ──
+publish_rate_hz: 50.0
+vicon_timeout_ms: 100.0            # 미수신 시 prediction-only 모드
+max_prediction_cycles: 50          # 초과 시 navigation_degraded (50Hz×50=1s)

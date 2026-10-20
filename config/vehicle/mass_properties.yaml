@@ -1,0 +1,20 @@
+# @package vehicle
+# 차량 물성 — 전 노드가 ${vehicle.*} 보간으로 참조하는 권위 값
+# 2026-09-22 URDF 물성: 베이스 + 팔 2개 + 그리퍼 전체.
+# 기준 자세: joint1=joint2=gripper_joint=0 rad, finger_slide=0 m (+X로 편 팔 고정).
+# Izz는 각 링크 COM 관성 + 평행축 항을 합산한 전체 COM 기준 값.
+# 단일 강체 근사: 팔 운동에 따른 COM/Izz 변화나 반작용은 현 SIL에서 연동하지 않음.
+# COM 위치(참고, base_link 기준 m): [0.0313603026135642, 6.19003452855812e-05, 0.200942244194024]
+# 현재 플랜트는 COM 오프셋을 별도 입력받지 않음. 기준점/렌치 이동은 별도 모델 작업.
+# 출처: docs/hardware/assets/mass_properties.json 및 014_Mass_Properties.md
+mass: 13.14                       # 전체 질량 [kg]
+inertia_zz: 0.4816923828888416   # 영점 고정 자세, 전체 COM 기준 [kg·m²]
+
+max_thrust_per_nozzle: 1.0         # 미보정 노즐 추력 [N] @ ΔP=0.7MPa, 전개방
+
+# 기하 유도 한계 (thruster_geometry.yaml 기준):
+#   면당 노즐 2개 → 축당 최대 힘 = 2 × max_thrust_per_nozzle
+#   토크 팔 0.05 m × 노즐 4개 조합 → 최대 순수 토크 = 0.2 × max_thrust_per_nozzle
+# Phase 5 실측 후 max_thrust_per_nozzle과 함께 갱신할 것
+max_force_body: 2.0                # 축당 최대 힘 [N]
+max_torque_body: 0.2               # 최대 순수 토크 [N·m]

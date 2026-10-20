@@ -1,0 +1,16 @@
+# @package plant_model_node
+# PVQ33-5G-16-01N-X33 카탈로그 곡선 모델
+valve_model_mode: "real"
+catalog_curve_file: "system/sim_valve/pvq33_5g_16_x33_flow_curve.yaml"
+
+# 80psi(g), 출구 대기압
+pressure_diff_mpa: 0.55158
+signal_current_min_ma: 4.0
+signal_current_max_ma: 20.0
+
+# 표준 코일 등가 전류 = X33 입력 전류 × 10
+signal_to_coil_current_gain: 10.0
+
+# 공개된 응답시간 없음. 실측 후 갱신.
+input_delay_ms: 0.0
+tau_valve_ms: 0.0

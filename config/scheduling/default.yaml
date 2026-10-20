@@ -1,0 +1,7 @@
+# @package scheduling
+# 기준 측정용: RT 정책을 요청하지 않고 기존 실행을 유지한다.
+cpu_pin: false
+gnc_cpu_core: 4
+actuator_cpu_core: 5
+gnc_rt_priority: 0
+actuator_rt_priority: 0

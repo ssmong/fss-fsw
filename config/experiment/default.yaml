@@ -1,0 +1,6 @@
+# @package experiment
+# 기본 실험 메타데이터 (제어기/유도 선택은 defaults의 gnc/* 그룹에서)
+name: "default"
+description: "기본 실험 구성 (원점 정지 유지, PID)"
+duration_sec: 60                   # 메타데이터; 현재 러너는 자동 종료하지 않음
+record_bag: true                   # 메타데이터; 현재 rosbag은 별도로 수동 기록

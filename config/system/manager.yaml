@@ -1,0 +1,14 @@
+# @package manager_node
+# 시스템 관리자 (모드 FSM + 건강 감시)
+health_check_rate_hz: ${gnc_node.control_rate_hz}  # GNC와 같은 명목 주기로 감시
+# GNC의 짧은 0 출력 가드와 별개로, 지속 미수신 시 운용 모드를 래치한다.
+# 실측 지연·지터·연속 누락과 플랜트 안전 여유로 조정할 임시 운용값.
+nav_age_limit_ms: 1000.0
+control_rate_min_hz: 15.0          # 제어 루프 최소 주파수
+auto_safe_hold: true               # ACTIVE 중 결함 시 자동 SAFE_HOLD
+
+# 항법 불확실도(EKF 1σ) 허용 한계 — 초과 시 항법 저하 → ACTIVE에서 자동 SAFE_HOLD
+# Vicon 정상 시 위치 1σ ≈ 0.3~0.5mm이므로 5mm는 오탐 여유가 크고,
+# Vicon 상실 추측항법에서는 수 초 내 도달(노이즈 모델 기준). Phase 5 실측 후 재조정
+nav_pos_std_limit: 0.005           # [m]
+nav_heading_std_limit: 0.02        # [rad] (~1.1°, 유도 자세 허용오차와 동일)

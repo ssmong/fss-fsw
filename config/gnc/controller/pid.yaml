@@ -1,0 +1,6 @@
+# @package gnc_node
+# 제어기 선택: PID (기본) — 게인/한계는 gnc/node.yaml
+translational:
+  type: "pid"
+rotational:
+  type: "pid"

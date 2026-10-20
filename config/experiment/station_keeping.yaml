@@ -1,0 +1,17 @@
+# @package _global_
+# 정지 유지 실험 — (0.5, 0.5)에서 자세 0 유지
+defaults:
+  - override /gnc/controller: pid
+  - override /gnc/guidance: station_keep
+
+experiment:
+  name: "station_keeping"
+  description: "지정 위치에서 정지 유지 실험"
+  duration_sec: 120                 # 메타데이터; 현재 러너는 자동 종료하지 않음
+  record_bag: true                  # 메타데이터; 현재 rosbag은 별도로 수동 기록
+
+gnc_node:
+  guidance:
+    target_x: 0.5
+    target_y: 0.5
+    target_theta: 0.0

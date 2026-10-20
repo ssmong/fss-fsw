@@ -1,0 +1,10 @@
+# @package plant_model_node
+# 정상상태 추력은 thrust_map_file의 밸브별 곡선을 사용한다.
+valve_model_mode: "mapped"
+catalog_curve_file: "system/sim_valve/pvq33_5g_16_x33_flow_curve.yaml"
+pressure_diff_mpa: 0.55158
+signal_current_min_ma: 4.0
+signal_current_max_ma: 20.0
+signal_to_coil_current_gain: 10.0
+input_delay_ms: 0.0
+tau_valve_ms: 0.0

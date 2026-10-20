@@ -1,0 +1,5 @@
+# velocity, position, current 중 하나. disable 상태에서만 전환한다.
+string mode
+---
+bool success
+string message

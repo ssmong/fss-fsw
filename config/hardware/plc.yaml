@@ -1,0 +1,23 @@
+# @package valve_driver_node
+# LS Electric PLC (XBM-DN16H2) Modbus TCP — 키는 valve_driver_node ROS2 파라미터와 1:1
+# 래더 프로그램: 원호 연구원 작성, 수정 금지
+# 참고: 래더 스캔 주기는 미확인, DO는 P22~P27만 사용 가능 (P20/P21 전류 용량 다름)
+thrust_map_file: ${valve_thrust_map_file}
+max_thrust_per_nozzle: ${vehicle.max_thrust_per_nozzle}  # 맵 미사용 시 선형 역변환 [N]
+plc:
+  ip: "192.168.1.2"
+  port: 502
+  timeout_sec: 1.0
+
+  # 비례밸브: D00100–D00107 (FC16 한 번에 8개 쓰기)
+  valve_register_start: 100        # D00100
+  valve_count: 8
+
+  # 메인 밸브(에어베어링): D00099 — 래더에서 M00100 변환, 매 주기 재전송(watchdog 겸용)
+  main_valve_register: 99
+
+  # XBF-DC04A 하드웨어 제약
+  value_range: [0, 4000]           # 4095 아님! 분해능 1/4000, 4–20mA
+  deadband_minimum: 0               # 실측 전 임계값 보상 비활성화
+
+  control_rate_hz: 20.0            # 제어/heartbeat 주기

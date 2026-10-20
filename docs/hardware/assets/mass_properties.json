@@ -1,0 +1,165 @@
+{
+  "date": "2026-09-22",
+  "units": {
+    "mass": "kg",
+    "com": "m",
+    "inertia": "kg m^2"
+  },
+  "frame": "+X toward next joint, +Z upward; local link origin at proximal joint except base_link",
+  "total_mass_kg": 13.14,
+  "links": {
+    "base_link": {
+      "mass_kg": 11.84,
+      "com_xyz_m": [
+        -0.011993243243243242,
+        0.0,
+        0.2119086622706818
+      ],
+      "inertia_kg_m2": {
+        "ixx": 0.2833541832204165,
+        "iyy": 0.3054816902214557,
+        "izz": 0.23438495945945945,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      }
+    },
+    "link1": {
+      "mass_kg": 0.57,
+      "com_xyz_m": [
+        0.10527661338870728,
+        2.888051656000163e-05,
+        0.09943732766310684
+      ],
+      "inertia_kg_m2": {
+        "ixx": 0.0008941060232698408,
+        "iyy": 0.0018117468047726144,
+        "izz": 0.000984900423645695,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      }
+    },
+    "link2": {
+      "mass_kg": 0.57,
+      "com_xyz_m": [
+        0.10527661338870728,
+        2.888051656000163e-05,
+        0.09943732766310684
+      ],
+      "inertia_kg_m2": {
+        "ixx": 0.0008941060232698408,
+        "iyy": 0.0018117468047726144,
+        "izz": 0.000984900423645695,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      }
+    },
+    "gripper_link": {
+      "mass_kg": 0.12143974530128855,
+      "com_xyz_m": [
+        0.05249120103131018,
+        0.008743594973482493,
+        0.11121600250190666
+      ],
+      "inertia_kg_m2": {
+        "ixx": 4.334947436548124e-05,
+        "iyy": 3.9351972577669194e-05,
+        "izz": 5.963099903174947e-05,
+        "ixy": 8.337021416477334e-07,
+        "ixz": -3.873886752617317e-12,
+        "iyz": -7.175588624080327e-12
+      }
+    },
+    "upper_finger": {
+      "mass_kg": 0.020224692629020942,
+      "com_xyz_m": [
+        0.008635333127640048,
+        0.01551574697709869,
+        0.016933739332613683
+      ],
+      "inertia_kg_m2": {
+        "ixx": 2.6341780999342767e-05,
+        "iyy": 2.409057419161275e-05,
+        "izz": 4.486516003099378e-06,
+        "ixy": 1.005527542926312e-06,
+        "ixz": 1.4891340817708835e-06,
+        "iyz": -4.6619927564661315e-06
+      }
+    },
+    "lower_finger": {
+      "mass_kg": 0.018335562069690524,
+      "com_xyz_m": [
+        0.008953253465761493,
+        -0.014734994810510752,
+        -0.010372553451737881
+      ],
+      "inertia_kg_m2": {
+        "ixx": 1.764247224694199e-05,
+        "iyy": 1.554336391094564e-05,
+        "izz": 4.25095027998319e-06,
+        "ixy": -9.54073605743477e-07,
+        "ixz": -1.0891684252340032e-06,
+        "iyz": -3.651135960153941e-06
+      }
+    }
+  },
+  "gripper_assembly_q0": {
+    "mass_kg": 0.16000000000000003,
+    "com_xyz_m": [
+      0.0600334192444204,
+      0.0069090421760883425,
+      0.112649836804093
+    ],
+    "inertia_kg_m2": {
+      "ixx": 0.00010603680514477564,
+      "iyy": 0.00011585768975377143,
+      "izz": 0.00010753001511396777,
+      "ixy": 7.949851745682176e-06,
+      "ixz": -4.965829907206236e-06,
+      "iyz": -1.4931588400658409e-05
+    },
+    "principal_moments_kg_m2": [
+      9.609083859861795e-05,
+      0.00010260650171914476,
+      0.00013072716969475214
+    ]
+  },
+  "joint1_xyz_m": [
+    0.19025,
+    -0.00025,
+    0.0
+  ],
+  "joint2_xyz_m": [
+    0.199021,
+    0.0,
+    0.0
+  ],
+  "gripper_joint_xyz_m": [
+    0.199021,
+    0.0,
+    0.0
+  ],
+  "finger_origin_xyz_m": [
+    0.075,
+    0.0,
+    0.113216
+  ],
+  "provenance": {
+    "base": "Counterweight removal from measured 12.550kg and 0.264488kg m^2; 0.710kg point mass at +X0.200m. Base Z COM and nonplanar tensor terms estimated.",
+    "arms": "570g each; retained bifilar Izz; user-accepted CAD COM (82g XM430 +488g steel, air bearing ignored). Nonplanar inertia terms estimated.",
+    "gripper": "160g total, 82g uniform CAD motor envelope +78g effective PLA by CAD volume; full estimated per-link tensor."
+  },
+  "assembly_reference_pose": {
+    "configuration": "all revolute joints = 0 rad; finger_slide = 0 m; arm locked along +X",
+    "mass_kg": 13.14,
+    "com_in_base_link_m": [
+      0.0313603026135642,
+      6.190034528558119e-05,
+      0.2009422441940235
+    ],
+    "inertia_zz_about_com_kg_m2": 0.48169238288884164,
+    "scope": "Fixed-reference-pose rigid body approximation; not coupled moving-arm dynamics."
+  }
+}
