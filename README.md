@@ -11,7 +11,7 @@ ROS2 flight software for a 3-DOF air-bearing spacecraft simulator propelled by e
 - Optional Python research GNC selected with `gnc_backend:=python`; its C++ algorithm bindings are an explicit build option. New Python controllers require code wiring as well as configuration.
 - GNC zeroes thrust after 100 ms without fresh navigation. The manager checks health at 20 Hz and latches SAFE_HOLD after 1 s of navigation silence; restored input requires manual rearming.
 
-This is a new C++ runtime port. Its implementation and SIL checks do not establish prior C++ hardware operation or measured hard real-time deadlines. See [runtime scope and verification](docs/ops/Cxx_Runtime.md).
+This is a new C++ runtime port. See [runtime scope and verification](docs/ops/Cxx_Runtime.md).
 
 ## Stack
 ROS2 Humble · C++17 · Eigen · yaml-cpp · nlohmann/json · Python 3.10 · NumPy/SciPy · Hydra · Dynamixel SDK · Jetson Orin Nano
