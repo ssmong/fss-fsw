@@ -83,7 +83,7 @@ D435i IMU는 카메라 알고리즘용 `/camera/camera/imu`에만 남겨 둔다.
 
 - 로봇팔 링크는 `/arm/link_poses`, 파지점은 `/arm/end_effector_pose`에서 수신합니다. [링크 치수와 좌표축](../docs/hardware/014_Mass_Properties.md#1-좌표계와-기준축)
 - 실험 계획은 Jetson의 `~/self_tossing_hardware/experiments/<실험>/<방법>/`에서 `trial.yaml`, `initial_setup.json`, `plan.npz`를 읽습니다.
-- Self-tossing은 **방법 선택 → 준비 → 출발** 순서입니다. Nominal 준비는 기존 `toss_fss`와 `toss_run Nominal tracking_mode:=velocity`를 사용합니다.
+- Self-tossing은 **방법 선택 → 준비 → 출발** 순서입니다. 이번 회차의 `toss_run` 옵션만 `이름:=값` 형식으로 입력하세요. 비워 두면 실험 설정의 기본값을 사용합니다.
 - 관제 PC의 `experiments/<이름>/YYYY-MM-DD/HH-MM-SS/`에 `telemetry.jsonl.gz`, `logs.txt`, `session.json`, `trajectory.png`, `tracking_error.csv`가 저장됩니다.
 
 ```bash

@@ -16,11 +16,45 @@ if "device_processes" not in globals():  # SSH bridge concatenates these modules
 
 
 TOSS_METHODS = ("Proposed", "Nominal", "JF_only")
-# The lab's Nominal run uses the velocity tracking override on its toss_run command.
-TOSS_RUN_OPTIONS = {"Nominal": ("tracking_mode:=velocity",)}
 TOSS_COMMANDS = ("toss_prepare", "toss_start", "toss_stop")
 TOSS_START_PHASES = ("IDLE", "STOPPED", "MISSED", "A_HELD")
 TOSS_UPGRADE = "Self-tossing FSW 런처 업데이트 필요"
+
+
+def toss_run_args(value):
+    """Normalize the old method-only request and the GUI's ROS launch argv."""
+    args = [value] if isinstance(value, str) else value
+    if not isinstance(args, list) or not args or args[0] not in TOSS_METHODS:
+        raise ValueError("실험 방법을 선택하세요.")
+    keys = set()
+    for option in args[1:]:
+        if not isinstance(option, str) or not option.isprintable():
+            raise ValueError("실험 옵션은 이름:=값 형식으로 입력하세요.")
+        key, separator, argument = option.partition(":=")
+        if not separator or not argument or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_./-]*", key):
+            raise ValueError("실험 옵션은 이름:=값 형식으로 입력하세요.")
+        if key in ("method", "execute"):
+            raise ValueError(f"{key}는 실험 준비에서 지정합니다.")
+        if key in keys:
+            raise ValueError(f"중복 옵션 · {key}")
+        keys.add(key)
+    return list(args)
+
+
+def matches_toss_run(record, options):
+    if len(record) != 3:
+        return False
+    try:
+        method, *extra = toss_run_args(record[2])
+    except ValueError:
+        return False
+    expected = [f"method:={method}", "execute:=true", *extra]
+    if isinstance(record[2], str):
+        # Older records stored only the method. Nominal was launched both with the
+        # alias defaults and, in the following release, a fixed velocity override.
+        return sorted(options) == sorted(expected) or (
+            method == "Nominal" and sorted(options) == sorted([*expected, "tracking_mode:=velocity"]))
+    return options == expected
 
 
 def toss_bench_installed(home=None):
@@ -150,7 +184,7 @@ class TossBench:
                 fss.append(pid)
             elif package == "self_tossing_hils" and "paper_toss.launch.py" in argv:
                 paper.append(pid)
-                paper_options = [arg for arg in argv if ":=" in arg]
+                paper_options = argv[argv.index("paper_toss.launch.py") + 1:]
             elif executable_name(argv) == "capture_executor":
                 executors.append(pid)
         if len(fss) > 1 or len(paper) > 1 or len(executors) > 1:
@@ -176,9 +210,7 @@ class TossBench:
         if paper or executors or "paper_toss_executor" in names or launch:
             if not launch or any(ancestry[pid][1] != launch for pid in paper + executors):
                 return (), "기존 실험 · " + (phase or "상태 수신 대기")
-            if paper and (len(record) != 3 or record[2] not in TOSS_METHODS
-                          or sorted(paper_options) != sorted(("execute:=true", "method:=" + record[2],
-                                                              *TOSS_RUN_OPTIONS.get(record[2], ())))):
+            if paper and not matches_toss_run(record, paper_options):
                 return (), "실행기 방법 또는 설정 불일치"
             if not fss or not paper or not executors or "paper_toss_executor" not in names or not phase:
                 return (), "실험 상태 수신 대기"
@@ -220,8 +252,10 @@ class TossBench:
     def request(self, action, value, names, verify_service):
         from fcntl import LOCK_EX, LOCK_NB, flock
 
-        if action not in TOSS_COMMANDS or (value not in TOSS_METHODS if action == "toss_prepare" else value is not True):
+        if action not in TOSS_COMMANDS or (action != "toss_prepare" and value is not True):
             raise ValueError("올바르지 않은 실험 요청")
+        if action == "toss_prepare":
+            value = toss_run_args(value)
         self.state.mkdir(mode=0o700, parents=True, exist_ok=True)
         if action != "toss_prepare":
             return self._invoke(action, value, names, verify_service)
@@ -252,7 +286,7 @@ class TossBench:
             while not self.cancelled.wait(0.25):
                 actions, status = self._stage(names(), expected_fss)
                 if actions and all(item in ("toss_start", "toss_stop") for item in actions):
-                    return f"{value} 실험 준비 완료 · {status}"
+                    return f"{value[0]} 실험 준비 완료 · {status}"
                 if (not self._owner("toss_run") or time.monotonic() >= deadline
                         or status != "실험 상태 수신 대기"):
                     raise RuntimeError(f"실행기 준비 확인 필요 · {status} · {self.state / 'toss_run.log'}")
@@ -271,7 +305,7 @@ class TossBench:
                 raise RuntimeError(status)
             command = ["bash", "-c", 'source "$HOME/.bash_aliases" && "$@"', "mission-control", action]
             if action == "toss_run":
-                command.extend((value, *TOSS_RUN_OPTIONS.get(value, ())))
+                command.extend(value)
             if action in ("toss_start", "toss_stop"):
                 verify_service("/paper_toss/" + action.removeprefix("toss_"))
                 # These aliases call the existing Trigger service, including its ownership/interlock checks.
@@ -303,4 +337,4 @@ class TossBench:
             owner = [child.pid, ticks] + ([value] if action == "toss_run" else [])
             record.with_suffix(".tmp").write_text(json.dumps(owner))
             record.with_suffix(".tmp").replace(record)
-            return f"{action} {value if action == 'toss_run' else ''} 기동 요청 · {log}".replace("  ", " ")
+            return f"{action} 기동 요청 · {log}"

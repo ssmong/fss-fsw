@@ -48,14 +48,37 @@ class TossTests(unittest.TestCase):
         self.add(12, 10, 10, ["/lab/FSS_FSW/install/fss_manager/lib/fss_manager/manager_node"])
         self.names.extend(("arm_driver_node", "manager_node"))
 
-    def paper(self, owned=False):
-        self.add(20, 1, 20, ["ros2", "launch", "self_tossing_hils", "paper_toss.launch.py", "method:=Nominal",
-                             "execute:=true", "tracking_mode:=velocity"])
+    def paper(self, owned=False, args=None):
+        method, *options = ["Nominal", "tracking_mode:=velocity"] if args is None else args
+        self.add(20, 1, 20, ["ros2", "launch", "self_tossing_hils", "paper_toss.launch.py", "method:=" + method,
+                             "execute:=true", *options])
         self.add(21, 20, 20, ["/lab/self_tossing_hardware/install_client/self_tossing_hils/lib/self_tossing_hils/capture_executor"])
         self.names.append("paper_toss_executor")
         self.b.observe({"phase": "IDLE"})
         if owned:
-            (self.b.state / "toss_run.json").write_text(json.dumps([20, 313, "Nominal"]))
+            (self.b.state / "toss_run.json").write_text(json.dumps([20, 313, method if args is None else args]))
+
+    def test_method_only_and_future_launch_arguments(self):
+        self.assertEqual(toss.toss_run_args("Nominal"), ["Nominal"])
+        args = ["Nominal", "tracking_mode:=position", "trial_file:=/lab/plan A/trial.yaml", "future_flag:=a;b"]
+        self.assertEqual(toss.toss_run_args(args), args)
+        for option in ("method:=Nominal", "execute:=true", "missing-value", "name:=", "--flag:=v",
+                       "bad\x00name:=x", "session:=a\nb", 42, "tracking_mode:=velocity"):
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                toss.toss_run_args([*args, option])
+        for value in (["Unknown"], [], {}, None, "Nominal mode:=velocity"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                toss.toss_run_args(value)
+
+    def test_new_owner_record_matches_exact_runtime_args(self):
+        self.flight()
+        args = ["Nominal", "trial_file:=/lab/test 2.yaml", "tracking_mode:=position"]
+        self.paper(owned=True, args=args)
+        self.assertEqual(self.b.available(self.names)[0], ("toss_start",))
+        self.procs[-2][1].pop()
+        self.assertEqual(self.b.available(self.names), ((), "실행기 방법 또는 설정 불일치"))
+        self.procs[-2][1][-1] = "tracking_mode:=velocity"
+        self.assertEqual(self.b.available(self.names)[0], ())
 
     def test_external_executor_status_is_observe_only(self):
         self.flight()
@@ -99,8 +122,8 @@ class TossTests(unittest.TestCase):
                 self.flight()
                 (self.b.state / "toss_fss.json").write_text("[10, 313]")
             else:
-                self.assertEqual((action, value), ("toss_run", "Nominal"))
-                self.paper(owned=True)
+                self.assertEqual((action, value), ("toss_run", ["Nominal"]))
+                self.paper(owned=True, args=value)
         with patch.dict(sys.modules, fcntl=fake_fcntl), patch.object(self.b, "_invoke", side_effect=launch) as invoke:
             self.assertIn("준비 완료", self.b.request("toss_prepare", "Nominal", lambda: self.names, Mock()))
             self.assertEqual([x.args[0] for x in invoke.call_args_list], ["toss_fss", "toss_run"])
@@ -135,6 +158,19 @@ class TossTests(unittest.TestCase):
               self.assertRaisesRegex(RuntimeError, "fixture refused")):
             self.b.request("toss_start", True, lambda: self.names, verify)
         verify.assert_called_once_with("/paper_toss/start")
+
+    @unittest.skipUnless(os.name == "posix", "Linux bash and launch locks")
+    def test_toss_run_preserves_each_option_as_one_argument(self):
+        args = ["JF_only", "future_option:=$HOME/*.yaml", "trial_file:=/lab/trial 1/a;b.yaml"]
+        (self.home / ".bash_aliases").write_text(
+            """toss_run() { printf '%s\\0' "$@" > "$HOME/argv"; }\n""")
+        with (patch.dict(os.environ, HOME=str(self.home)),
+              patch.object(self.b, "_stage", return_value=(("toss_run",), "ready")),
+              patch.object(toss, "toss_process", return_value=(1, 2, 313))):
+            self.b._invoke("toss_run", args, list, Mock())
+        self.assertEqual(self.b.children[0].wait(timeout=5), 0)
+        self.assertEqual((self.home / "argv").read_bytes().split(b"\0"), [*(a.encode() for a in args), b""])
+        self.assertEqual(json.loads((self.b.state / "toss_run.json").read_text())[2], args)
 
     def test_foreign_flight_winning_preparation_never_launches_executor(self):
         fake_fcntl = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=Mock())

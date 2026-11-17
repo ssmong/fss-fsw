@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from PySide6.QtCore import QObject, Signal
 
 from mission_terminal import ShellSessions
+from mission_toss import toss_run_args
 
 SOURCE_TIMEOUT_SEC = 2.5
 PREFERRED_WORKSPACE = ("FSS_FSW" if (Path(__file__).resolve().parents[1]
@@ -70,9 +71,13 @@ class JetsonLink(QObject):
         if name.startswith("toss_"):
             if not self.can_toss(name):
                 return
-            if name == "toss_prepare" and value not in ("Nominal", "JF_only", "Proposed"):
-                return
-            if name != "toss_prepare" and value is not True:
+            if name == "toss_prepare":
+                try:
+                    args = toss_run_args(value)
+                except ValueError:
+                    return
+                value = args[0] if isinstance(value, str) else args
+            elif value is not True:
                 return
             self.toss_pending = True
         elif name == "start_body":

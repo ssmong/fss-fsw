@@ -300,16 +300,23 @@ class MissionControlTest(unittest.TestCase):
             w._experiment_button.click()
         self.assertEqual(list(w._toss_buttons), ["toss_prepare", "toss_start", "toss_stop"])
         w._toss_method.setCurrentText("JF_only")
+        w._toss_options.setText('label:="unterminated')
+        w._toss_buttons["toss_prepare"].click()
+        self.assertTrue(b.commands.empty())
+        self.assertIn("추가 옵션", b.data.last_command_msg)
+        options = 'tracking_mode:=velocity label:="trial B"'
+        w._toss_options.setText(options)
         w._toss_buttons["toss_start"].click()
         self.assertTrue(b.commands.empty())
         w._toss_buttons["toss_prepare"].click()
-        self.assertEqual(b.commands.get_nowait()[1:], ("toss_prepare", "JF_only"))
+        self.assertEqual(b.commands.get_nowait()[1:], ("toss_prepare", ["JF_only", "tracking_mode:=velocity", "label:=trial B"]))
         w._send_toss("toss_prepare")
         self.assertFalse(b.data.recorder.active)
         self.assertTrue(a.commands.empty() and b.commands.empty())
 
         w._vehicles.setCurrentIndex(0)
         self.assertEqual(w._toss_method.currentText(), "Nominal")
+        self.assertEqual(w._toss_options.text(), "")
         self.body_status(a, toss_actions=["toss_start", "toss_stop"], toss_state="대기")
         a.inbox.put([("paper_status", SimpleNamespace(phase="ARMED"))])
         w._update()
@@ -326,6 +333,7 @@ class MissionControlTest(unittest.TestCase):
 
         w._vehicles.setCurrentIndex(1)
         self.assertEqual(w._toss_method.currentText(), "JF_only")
+        self.assertEqual(w._toss_options.text(), options)
         self.assertNotEqual(w._toss_status.text(), "ARMED")
         w._vehicles.setCurrentIndex(0)
         a.toss_pending = False

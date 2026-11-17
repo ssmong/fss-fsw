@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import html
 import math
+import shlex
 import sys
 import time
 from collections import Counter, deque
@@ -50,6 +51,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QTabWidget,
     QTextEdit,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -58,6 +60,7 @@ from mission_arm import JOINT_LABELS, ViconArmOverlay, encoder_model, feedback_s
 from mission_link import JetsonLink, PREFERRED_WORKSPACE, SOURCE_TIMEOUT_SEC
 from mission_recording import ExperimentRecorder
 from mission_terminal import TerminalView
+from mission_toss import toss_run_args
 from mission_ros import open_node
 
 
@@ -330,6 +333,7 @@ class DashboardNode:
         self.tracking_since = None
         self.target_draft = ("PID", 0.0, 0.0, 0.0)
         self.toss_method = "Nominal"
+        self.toss_options = ""
         self.toss_phase = self.toss_phase_label = ""
         self.toss_gripper = self.toss_alignment = ""
         self.toss_contact = self.toss_aligned = False
@@ -1335,6 +1339,7 @@ class Dashboard(QMainWindow):
         if changed and hasattr(self, "_target_x"):
             self._node.target_draft = self._read_target()
             self._node.toss_method = self._toss_method.currentText()
+            self._node.toss_options = self._toss_options.text()
         self._node = chosen
         if hasattr(self, "_log_panel"):
             self._bind_console(link)
@@ -1342,6 +1347,7 @@ class Dashboard(QMainWindow):
             controller, x, y, yaw = self._node.target_draft
             self._controller.button(0 if controller == "PID" else 1).setChecked(True)
             self._toss_method.setCurrentText(self._node.toss_method)
+            self._toss_options.setText(self._node.toss_options)
             for field, value in ((self._target_x, x), (self._target_y, y), (self._target_yaw, yaw)):
                 field.setValue(value)
         self._log_view_key = None
@@ -1489,11 +1495,15 @@ class Dashboard(QMainWindow):
             button.clicked.connect(lambda checked=False, name=action: self._send_toss(name))
             layout.addWidget(button, 1, col)
             self._toss_buttons[action] = button
+        self._toss_options = QLineEdit()
+        self._toss_options.setAccessibleName("toss_run 추가 옵션")
+        self._toss_options.setPlaceholderText("추가 옵션 (선택)   이름:=값")
+        layout.addWidget(self._toss_options, 2, 0, 1, 4)
         self._toss_alignment = QLabel()
         self._toss_alignment.setTextFormat(Qt.PlainText)
         self._toss_alignment.setStyleSheet(f"color:{C_TEXT_DIM};")
         self._toss_alignment.hide()
-        layout.addWidget(self._toss_alignment, 2, 0, 1, 4)
+        layout.addWidget(self._toss_alignment, 3, 0, 1, 4)
         return panel
 
     def _can_send_toss(self, link, action):
@@ -1511,6 +1521,17 @@ class Dashboard(QMainWindow):
             return
         if self._can_send_toss(link, action):
             value = self._toss_method.currentText() if action == "toss_prepare" else True
+            if action == "toss_prepare" and self._toss_options.text().strip():
+                try:
+                    value = [value, *shlex.split(self._toss_options.text())]
+                    toss_run_args(value)
+                except ValueError as exc:
+                    message = f"추가 옵션 확인 · {exc}"
+                    link.data.set_command_result(message, 30)
+                    self._toss_options.setFocus()
+                    QToolTip.showText(self._toss_options.mapToGlobal(self._toss_options.rect().bottomLeft()),
+                                      message, self._toss_options)
+                    return
             link.data.send_command(action, value)
         self._update()
 
@@ -1544,6 +1565,8 @@ class Dashboard(QMainWindow):
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
         choosing = not phase_fresh or self._toss_method.isEnabled()
         self._toss_method.setVisible(choosing)
+        self._toss_options.setVisible(choosing and self._toss_method.currentText() != "위치 제어")
+        self._toss_options.setEnabled(prepare.isEnabled())
         prepare.setVisible(choosing)
         if not link.ready or link.stopped.is_set() or link.bridge_error:
             status = "연결 대기"
