@@ -6,6 +6,7 @@ import select
 import sys
 import time
 import uuid
+from types import SimpleNamespace
 
 
 class MissionActions:
@@ -116,10 +117,77 @@ class MissionActions:
                 self.request("valve", False)
 
 
+class ValveOutput:
+    topic = "/actuators/valve_commands"
+    status_topic = "/actuators/valve_status"
+
+    def __init__(self, node, receive, parameters):
+        self.node, self.receive = node, receive
+        self.client = node.create_client(parameters, "/valve_driver_node/get_parameters")
+        self.range_request = parameters.Request(names=["plc.value_range"])
+        self.publisher_id = self.maximum = self.pending = None
+        self.next_query = 0.0
+
+    @staticmethod
+    def is_driver(endpoint):
+        return endpoint.node_name == "valve_driver_node" and endpoint.node_namespace == "/"
+
+    def output(self, header, duties):
+        self.receive("valve_output", SimpleNamespace(header=header, duty_cycles=duties))
+
+    def native(self, msg):
+        # In older workspaces GNC publishes *demand* on the very same topic.
+        publishers = self.node.get_publishers_info_by_topic(self.topic)
+        if len(publishers) == 1 and self.is_driver(publishers[0]):
+            self.output(msg.header, list(msg.duty_cycles))
+
+    def legacy(self, msg):
+        # Only the legacy driver subscribes to valve_commands. Its status
+        # holds a copy of its last successful software write in integer units.
+        if not any(self.is_driver(sub) for sub in self.node.get_subscriptions_info_by_topic(self.topic)):
+            return
+        publishers = self.node.get_publishers_info_by_topic(self.status_topic)
+        if len(publishers) != 1 or not self.is_driver(publishers[0]):
+            return
+        maximum = self.legacy_maximum(bytes(publishers[0].endpoint_gid))
+        values = msg.applied_values
+        duties = None
+        if len(values) == 8:
+            if all(value == 0 for value in values):
+                duties = [0.0] * 8
+            elif maximum and all(0 <= value <= maximum for value in values):
+                duties = [value / maximum for value in values]
+        self.output(msg.header, duties)
+
+    def legacy_maximum(self, publisher_id):
+        if publisher_id != self.publisher_id:
+            if self.pending:
+                self.pending.cancel()
+            self.publisher_id, self.maximum, self.pending = publisher_id, None, None
+            self.next_query = 0.0
+        if self.pending and self.pending.done():
+            try:
+                response = self.pending.result()
+                if response and response.values:
+                    limits = response.values[0].integer_array_value
+                    if len(limits) == 2 and limits[0] == 0 and limits[1] > 0:
+                        self.maximum = limits[1]
+            except Exception:
+                pass  # A driver restart can interrupt an in-flight request.
+            self.pending = None
+        now = time.monotonic()
+        if self.maximum is None and now >= self.next_query and self.client.service_is_ready():
+            if self.pending:
+                self.pending.cancel()
+            self.pending = self.client.call_async(self.range_request)
+            self.next_query = now + 3.0
+        return self.maximum
+
+
 def open_node(receive, reply, args=None, reject=None):
     import rclpy
     from fss_interfaces.msg import (
-        SpacecraftState, SystemHealth, SystemMode, TrajectoryReference, ValveStatus,
+        SpacecraftState, SystemHealth, SystemMode, TrajectoryReference, ValveCommands, ValveStatus,
     )
     from fss_interfaces.srv import MainValveControl, SetController, SetSystemMode
     try:
@@ -127,6 +195,7 @@ def open_node(receive, reply, args=None, reject=None):
     except ImportError:
         SetTarget = None  # Older workspaces still support monitoring and air control.
     from rcl_interfaces.msg import Log
+    from rcl_interfaces.srv import GetParameters
     from geometry_msgs.msg import PoseArray, PoseStamped
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Imu, JointState
@@ -142,6 +211,8 @@ def open_node(receive, reply, args=None, reject=None):
                 return
         actions.observe(name, msg)
         receive(name, msg)
+        if name == "valve":
+            valve_output.legacy(msg)
 
     # Standalone SSH code includes the reader; local ROS imports its sibling.
     read_plans = globals().get("load_table_plans")
@@ -164,6 +235,8 @@ def open_node(receive, reply, args=None, reject=None):
             receive("paper_trial", ["", None])
 
     node.create_subscription(String, "/paper_toss/status", paper_status, qos_profile_sensor_data)
+    valve_output = ValveOutput(node, receive, GetParameters)
+    node.create_subscription(ValveCommands, valve_output.topic, valve_output.native, 10)
 
     for name, topic, msg_type, depth in (
         ("vicon", "/sensors/vicon_state", SpacecraftState, 10),
@@ -245,6 +318,10 @@ def serve():
             data = {}
         elif name in ("plans", "paper_trial", "paper_status"):
             data = msg
+        elif name == "valve_output":
+            data = {"duty_cycles": msg.duty_cycles}
+            if recording:
+                data["header"] = message_to_ordereddict(msg.header)
         elif name == "valve":
             data = {"commanded_duty_cycles": list(msg.commanded_duty_cycles),
                     "main_valve_open": msg.main_valve_open, "modbus_rtt_ms": msg.modbus_rtt_ms}
@@ -260,6 +337,12 @@ def serve():
         emit("log", {"level": 20, "name": "Mission Control", "msg": status})
     heartbeat = 0.0
     pending = b""
+    def can_start_body():
+        return (not globals().get("read_only") and "prepare_hardware" in globals()
+                and os.getenv("FSS_MISSION_WORKSPACE") in (PUBLIC, PRIVATE_CPP)
+                and os.getenv("ROS_LOCALHOST_ONLY") == "1" and os.getenv("ROS_DOMAIN_ID", "0") == "0"
+                and not FSS_NODES.intersection(node.get_node_names()))
+
     try:
         while rclpy.ok():
             if time.monotonic() >= heartbeat:
@@ -267,6 +350,7 @@ def serve():
                 emit("connected", {"observer": node.get_name(), "peers": peers,
                                    "workspace": os.getenv("FSS_MISSION_WORKSPACE"),
                                    "private_arm": globals().get("private_arm", False),
+                                   "can_start_body": can_start_body(),
                                    "read_only": globals().get("read_only", "")})
                 heartbeat = time.monotonic() + 1
             if select.select([sys.stdin], [], [], 0)[0]:
@@ -279,6 +363,13 @@ def serve():
                     name, value = json.loads(command)
                     if name == "record_stream":
                         recording = value is True
+                    elif name == "start_body":
+                        try:
+                            if value is not True or not can_start_body():
+                                raise ValueError("기체 실행 상태를 확인하세요.")
+                            emit("reply", prepare_hardware())
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            emit("reply_error", str(exc))
                     else:
                         request(name, value)
             rclpy.spin_once(node, timeout_sec=0.02)

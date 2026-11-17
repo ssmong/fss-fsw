@@ -2,6 +2,7 @@
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <fss_interfaces/msg/spacecraft_state.hpp>
+#include <fss_interfaces/msg/system_mode.hpp>
 #include <fss_interfaces/msg/thrust_commands.hpp>
 #include <fss_interfaces/msg/trajectory_reference.hpp>
 #include <fss_interfaces/srv/set_controller.hpp>
@@ -28,6 +29,7 @@ namespace fss::gnc {
 namespace {
 
 using SpacecraftState = fss_interfaces::msg::SpacecraftState;
+using SystemMode = fss_interfaces::msg::SystemMode;
 using ThrustCommands = fss_interfaces::msg::ThrustCommands;
 using TrajectoryReference = fss_interfaces::msg::TrajectoryReference;
 using SetController = fss_interfaces::srv::SetController;
@@ -64,6 +66,7 @@ public:
             throw std::invalid_argument("state_age_limit_ms must be positive and finite");
         dt_ = 1.0 / rate;
         state_age_limit_ns_ = static_cast<int64_t>(age_ms * 1e6);
+        require_explicit_target_ = declare_parameter<bool>("require_explicit_target", false);
 
         auto translation = read_controller("translational", "max_force");
         auto rotation = read_controller("rotational", "max_torque");
@@ -93,6 +96,20 @@ public:
 
         command_pub_ = create_publisher<ThrustCommands>("/actuators/thrust_commands", 10);
         reference_pub_ = create_publisher<TrajectoryReference>("/gnc/trajectory_ref", 10);
+        if (require_explicit_target_) {
+            mode_sub_ = create_subscription<SystemMode>("/system/mode", 1,
+                [this](SystemMode::ConstSharedPtr mode) {
+                    const auto now_ns = now().nanoseconds();
+                    if (!active_mode_fresh(now_ns))
+                        pipeline_->reset();
+                    active_mode_stamp_ns_ = static_cast<int64_t>(mode->header.stamp.sec) * 1000000000
+                                            + mode->header.stamp.nanosec;
+                    if (mode->mode != SystemMode::ACTIVE || !active_mode_fresh(now_ns)) {
+                        active_mode_stamp_ns_.reset();
+                        pipeline_->reset();
+                    }
+                });
+        }
         state_sub_ = create_subscription<SpacecraftState>("/navigation/state", 10,
             [this](SpacecraftState::ConstSharedPtr state) {
                 latest_state_ = std::move(state);
@@ -141,6 +158,7 @@ public:
                     const auto type = controller_type(request->controller_type);
                     pipeline_->set_controller(type);
                     pipeline_->guidance().hold_target(target);
+                    target_received_ = true;
                     response->success = true;
                     response->message = type + " target accepted";
                 } catch (const std::exception& error) {
@@ -187,6 +205,11 @@ private:
 
     void control_loop() {
         const auto now_ns = get_clock()->now().nanoseconds();
+        if (require_explicit_target_ && (!target_received_ || !active_mode_fresh(now_ns))) {
+            pipeline_->reset();
+            publish_zero();
+            return;
+        }
         if (!latest_state_) {
             publish_zero();
             return;
@@ -226,12 +249,22 @@ private:
         }
     }
 
+    bool active_mode_fresh(int64_t now_ns) const {
+        // Three manager heartbeats at the legacy hardware rate of 2 Hz.
+        constexpr int64_t mode_timeout_ns = 1500000000;
+        return active_mode_stamp_ns_ && *active_mode_stamp_ns_ <= now_ns &&
+               now_ns - *active_mode_stamp_ns_ <= mode_timeout_ns;
+    }
+
+    bool require_explicit_target_{}, target_received_{};
+    std::optional<int64_t> active_mode_stamp_ns_;
     double dt_{};
     int64_t state_age_limit_ns_{}, latest_received_ns_{};
     std::optional<double> t0_;
     std::unique_ptr<ControlPipeline> pipeline_;
     SpacecraftState::ConstSharedPtr latest_state_;
     rclcpp::Subscription<SpacecraftState>::SharedPtr state_sub_;
+    rclcpp::Subscription<SystemMode>::SharedPtr mode_sub_;
     rclcpp::Publisher<ThrustCommands>::SharedPtr command_pub_;
     rclcpp::Publisher<TrajectoryReference>::SharedPtr reference_pub_;
     rclcpp::Service<SetGuidanceMode>::SharedPtr guidance_service_;

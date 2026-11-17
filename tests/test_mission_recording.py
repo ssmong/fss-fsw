@@ -38,6 +38,7 @@ class RecordingTest(unittest.TestCase):
             fss.receive("imu", NS(header=header, angular_velocity=NS(z=1.25), orientation_covariance=[math.nan]*9))
             fss.receive("valve", NS(header=header, commanded_duty_cycles=[0.3]*8, applied_values=[1200]*8,
                                     main_valve_open=True, modbus_rtt_ms=2.0))
+            fss.receive("valve_output", NS(header=header, duty_cycles=[0.0]*8))
             fss.receive("log", NS(name="arm", level=10, msg="숨은 DEBUG 메시지"))
             fss.send_command("target", ["pid", .2, .3, .4])
             fss.set_command_result("accepted")
@@ -46,12 +47,14 @@ class RecordingTest(unittest.TestCase):
             with gzip.open(run / "telemetry.jsonl.gz", "rt", encoding="utf-8") as fp:
                 records = [json.loads(line) for line in fp]
             self.assertEqual([r["kind"] for r in records], ["session_context", "vicon", "vicon", "imu",
-                                                          "valve", "log", "command", "command_result"])
+                                                          "valve", "valve_output", "log", "command", "command_result"])
             self.assertEqual(records[3]["data"]["angular_velocity"]["z"], 1.25)
             self.assertEqual(records[3]["data"]["orientation_covariance"], [None]*9)
             self.assertEqual(records[4]["data"]["header"]["stamp"]["nanosec"], 100)
             self.assertNotIn("applied_values", records[4]["data"])
-            self.assertEqual(records[6]["data"]["value"], ["pid", .2, .3, .4])
+            self.assertEqual(records[5]["data"], {"header": records[4]["data"]["header"],
+                                                  "duty_cycles": [0.0]*8})
+            self.assertEqual(records[7]["data"]["value"], ["pid", .2, .3, .4])
             self.assertTrue(all(r["elapsed_s"] >= 0 and r["received_unix_ns"] > 0 for r in records))
             self.assertIn("[DEBUG] arm: 숨은 DEBUG 메시지", (run / "logs.txt").read_text(encoding="utf8"))
             summary = json.loads((run / "session.json").read_text(encoding="utf8"))

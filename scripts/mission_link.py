@@ -38,6 +38,7 @@ class JetsonLink(QObject):
         self.monitor_only = monitor_only
         self.workspace = None
         self.private_arm = False
+        self.can_start_body = False
         self.read_only = "모니터링 전용" if monitor_only else ""
         self.observer = None
         self.peers = ()
@@ -73,6 +74,7 @@ class JetsonLink(QObject):
                         self.peers = value.peers
                         self.workspace = getattr(value, "workspace", None)
                         self.private_arm = getattr(value, "private_arm", False)
+                        self.can_start_body = getattr(value, "can_start_body", False)
                         self.read_only = getattr(value, "read_only", "") or (
                             "모니터링 전용" if self.monitor_only else "")
                 elif name == "bridge_error":

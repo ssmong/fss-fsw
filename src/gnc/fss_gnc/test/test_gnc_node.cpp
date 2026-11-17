@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <fss_interfaces/msg/spacecraft_state.hpp>
+#include <fss_interfaces/msg/system_mode.hpp>
 #include <fss_interfaces/msg/thrust_commands.hpp>
 #include <fss_interfaces/msg/trajectory_reference.hpp>
 #include <fss_interfaces/srv/set_controller.hpp>
@@ -230,6 +231,67 @@ TEST_F(GncNodeTest, TargetServiceAppliesPidAndLqrAndRetainsTargetOnRejectedReque
     EXPECT_DOUBLE_EQ(reference_->vx_ref, 0.0);
     EXPECT_DOUBLE_EQ(reference_->vy_ref, 0.0);
     EXPECT_DOUBLE_EQ(reference_->omega_ref, 0.0);
+}
+
+TEST_F(GncNodeTest, ExplicitTargetAndFreshActiveModeGateThrustAndResetIntegral) {
+    using Mode = fss_interfaces::msg::SystemMode;
+    using Target = fss_interfaces::srv::SetTarget;
+    auto overrides = parameters();
+    overrides.emplace_back("require_explicit_target", true);
+    for (auto& parameter : overrides) {
+        if (parameter.get_name() == "translational.kp")
+            parameter = rclcpp::Parameter("translational.kp", 0.0);
+        if (parameter.get_name() == "translational.ki")
+            parameter = rclcpp::Parameter("translational.ki", 2.0);
+    }
+    start(overrides);
+    auto nav_timer = observer_->create_wall_timer(10ms, [this] { publish(); });
+    auto mode_pub = observer_->create_publisher<Mode>("/system/mode", 1);
+    ASSERT_TRUE(spin_until([&] { return mode_pub->get_subscription_count() > 0; }));
+    auto mode = [&](uint8_t value, int age_ms = 0) {
+        Mode msg;
+        msg.mode = value;
+        msg.header.stamp = observer_->now() - rclcpp::Duration::from_seconds(age_ms / 1000.0);
+        mode_pub->publish(msg);
+    };
+    auto remains_idle = [&] {
+        auto before = commands_received_;
+        reference_.reset();
+        EXPECT_TRUE(spin_until([&] { return commands_received_ >= before + 4; }));
+        EXPECT_TRUE(zero_command());
+        EXPECT_FALSE(reference_);
+    };
+    auto client = observer_->create_client<Target>("/gnc/set_target");
+    ASSERT_TRUE(client->wait_for_service(1s));
+    auto target = [&](std::string controller, bool accepted) {
+        auto req = std::make_shared<Target::Request>();
+        req->controller_type = controller;
+        req->x = 1.0;
+        auto future = client->async_send_request(req);
+        ASSERT_TRUE(spin_until([&] { return future.wait_for(0ms) == std::future_status::ready; }));
+        EXPECT_EQ(future.get()->success, accepted);
+    };
+    mode(Mode::ACTIVE);
+    remains_idle();
+    target("unknown", false);
+    remains_idle();
+    mode(Mode::IDLE);
+    target("pid", true);
+    remains_idle();
+    mode(Mode::ACTIVE, 2000);
+    remains_idle();
+    mode(Mode::ACTIVE);
+    ASSERT_TRUE(spin_until([&] { return reference_ && command_ && command_->thrust_n[0] > 0.09; }));
+    const double accumulated = command_->thrust_n[0];
+    mode(Mode::SAFE_HOLD);
+    ASSERT_TRUE(spin_until([&] { return zero_command(); }));
+    remains_idle();
+    mode(Mode::ACTIVE);
+    ASSERT_TRUE(spin_until([&] { return command_ && command_->thrust_n[0] > 0; }));
+    EXPECT_LT(command_->thrust_n[0], accumulated * 0.6);
+    // Navigation continues after the last ACTIVE heartbeat expires.
+    ASSERT_TRUE(spin_until([&] { return zero_command(); }, 2s));
+    remains_idle();
 }
 
 TEST_F(GncNodeTest, ControlTimerUsesRosClockAndPausesWithSimulation) {

@@ -20,15 +20,15 @@ pytest.importorskip("rclpy")
 import rclpy
 from ament_index_python.packages import get_package_prefix
 from fss_interfaces.msg import (
-    SpacecraftState, SystemHealth, SystemMode, ThrustCommands, ValveCommands, ValveStatus,
+    SpacecraftState, SystemHealth, SystemMode, ThrustCommands, TrajectoryReference, ValveCommands, ValveStatus,
 )
-from fss_interfaces.srv import MainValveControl, SetSystemMode
+from fss_interfaces.srv import MainValveControl, SetSystemMode, SetTarget
 from rclpy.node import Node
 
 pytestmark = pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux ROS2 runtime tests")
 
 
-def check_native_chain(tmp_path, monkeypatch, overrides=(), convergence=None):
+def check_native_chain(tmp_path, monkeypatch, overrides=(), convergence=None, explicit_target=False):
     monkeypatch.setenv("ROS_DOMAIN_ID", "179")
     monkeypatch.setenv("ROS_LOCALHOST_ONLY", "1")
     binaries = {}
@@ -52,8 +52,13 @@ def check_native_chain(tmp_path, monkeypatch, overrides=(), convergence=None):
     helper = Node("cxx_runtime_smoke")
     latest = {}
     counts = {}
+    awaiting_target = explicit_target
 
     def receive(name, message):
+        if awaiting_target:
+            assert name != "reference"
+            if name == "thrust":
+                assert not any(message.thrust_n)
         latest[name] = message
         counts[name] = counts.get(name, 0) + 1
 
@@ -64,6 +69,7 @@ def check_native_chain(tmp_path, monkeypatch, overrides=(), convergence=None):
             ("nav", SpacecraftState, "/navigation/state"),
             ("truth", SpacecraftState, "/sim/true_state"),
             ("thrust", ThrustCommands, "/actuators/thrust_commands"),
+            ("reference", TrajectoryReference, "/gnc/trajectory_ref"),
             ("valves", ValveCommands, "/actuators/valve_commands"),
             ("status", ValveStatus, "/actuators/valve_status"),
             ("health", SystemHealth, "/system/health"),
@@ -110,7 +116,8 @@ def check_native_chain(tmp_path, monkeypatch, overrides=(), convergence=None):
         with log_path.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(
                 ["ros2", "launch", "fss_bringup", "fss_full.launch.py",
-                 "use_sim:=true", "cpu_pin:=false", "gnc_rt_priority:=0", "actuator_rt_priority:=0"],
+                 "use_sim:=true", "cpu_pin:=false", "gnc_rt_priority:=0", "actuator_rt_priority:=0",
+                 *(["require_explicit_target:=true"] if explicit_target else [])],
                 cwd=tmp_path, env=env, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
@@ -142,6 +149,16 @@ def check_native_chain(tmp_path, monkeypatch, overrides=(), convergence=None):
             transition(SystemMode.ACTIVE)
             active_stamp = latest["truth"].header.stamp
             active_time = active_stamp.sec + active_stamp.nanosec * 1e-9
+            if explicit_target:
+                target_client = helper.create_client(SetTarget, "/gnc/set_target")
+                assert not call(target_client, SetTarget.Request(controller_type="unknown")).success
+                baseline = counts.get("thrust", 0)
+                wait_for(lambda: latest["mode"].mode == SystemMode.ACTIVE and counts["thrust"] > baseline + 4,
+                         "zero thrust while ACTIVE and awaiting a valid target")
+                awaiting_target = False
+                assert call(target_client, SetTarget.Request(controller_type="pid", x=0.75)).success
+                wait_for(lambda: "reference" in latest and latest["reference"].x_ref == 0.75,
+                         "explicit pose reference")
             wait_for(lambda: "thrust" in latest and any(latest["thrust"].thrust_n)
                      and any(latest["valves"].duty_cycles)
                      and any(latest["status"].applied_values), "GNC thrust reaching simulated valves")
@@ -180,6 +197,8 @@ def check_native_chain(tmp_path, monkeypatch, overrides=(), convergence=None):
                      and not any(latest["status"].applied_values)
                      and not latest["status"].main_valve_open,
                      "E-stop zero outputs and closed main valve")
+            if explicit_target:
+                wait_for(lambda: not any(latest["thrust"].thrust_n), "GNC zero thrust on E-stop")
     finally:
         if process is not None and process.poll() is None:
             process.send_signal(signal.SIGINT)
@@ -198,6 +217,10 @@ def check_native_chain(tmp_path, monkeypatch, overrides=(), convergence=None):
 
 def test_default_cxx_chain_and_estop_with_python_plant(tmp_path, monkeypatch):
     check_native_chain(tmp_path, monkeypatch)
+
+
+def test_explicit_target_interlock_with_python_plant(tmp_path, monkeypatch):
+    check_native_chain(tmp_path, monkeypatch, explicit_target=True)
 
 
 @pytest.mark.parametrize(

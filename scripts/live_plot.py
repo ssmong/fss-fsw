@@ -377,7 +377,7 @@ class DashboardNode:
         self.hdg_err: deque[float] = deque(maxlen=history_size)
 
         # 밸브 명령
-        self.valve_cmd = [0.0] * 8
+        self.valve_cmd = None
         # 시스템 상태
         self.mode_name = "NO DATA"
         self.navigation_ok = False
@@ -585,10 +585,20 @@ class DashboardNode:
         self._mark_rx("ekf")
 
     def _cb_valve(self, msg) -> None:
-        self.valve_cmd = list(msg.commanded_duty_cycles)
         self._driver_air_open = msg.main_valve_open
         self.modbus_rtt_ms = msg.modbus_rtt_ms
         self._mark_rx("valve")
+
+    def _cb_valve_output(self, msg) -> None:
+        duties = msg.duty_cycles
+        self.valve_cmd = (list(duties) if duties is not None and len(duties) == 8
+                          and all(0 <= duty <= 1 for duty in duties) else None)
+        self._mark_rx("valve_output")
+
+    def fresh_valve_command(self):
+        if self.source_age("valve_output") <= SOURCE_TIMEOUT_SEC:
+            return self.valve_cmd
+        return None
 
     def _cb_ref(self, msg) -> None:
         timestamp = self._relative_time(msg.header.stamp)
@@ -914,6 +924,10 @@ class Dashboard(QMainWindow):
         self._position_summary = QLabel()
         footer.addWidget(self._position_summary)
         footer.addStretch()
+        self._arm_notice = QLabel()
+        self._arm_notice.setStyleSheet(f"color:{C_TEXT_DIM};")
+        self._arm_notice.hide()
+        footer.addWidget(self._arm_notice)
         self._experiment_button = QPushButton("실험 시작")
         self._experiment_button.setToolTip("선택한 FSS 데이터 기록")
         self._experiment_button.clicked.connect(self._toggle_experiment)
@@ -987,6 +1001,10 @@ class Dashboard(QMainWindow):
         row.addWidget(add)
         row.addWidget(self._vehicles)
         row.addWidget(self._disconnect_button)
+        self._start_body = QPushButton("본체 FSW 시작")
+        self._start_body.hide()
+        self._start_body.clicked.connect(lambda: self._node.send_command("start_body", True))
+        row.addWidget(self._start_body)
         row.addStretch()
         self._release_estop = QPushButton("정지 해제")
         self._release_estop.clicked.connect(self._reset_estop)
@@ -1312,7 +1330,9 @@ class Dashboard(QMainWindow):
         layout.setSizeConstraint(QLayout.SetMinimumSize)
         layout.setContentsMargins(12, 8, 12, 7)
         layout.setSpacing(2)
-        layout.addWidget(QLabel("밸브 명령"))
+        self._valve_title = QLabel("밸브 명령 · 미수신")
+        self._valve_title.setToolTip("밸브 드라이버가 전송한 채널별 명령 (0–1)")
+        layout.addWidget(self._valve_title)
         plot = pg.PlotWidget()
         plot.setFixedHeight(max(88, 5 * self.fontMetrics().height()))
         plot.setXRange(0.5, 8.5, padding=0)
@@ -1331,6 +1351,7 @@ class Dashboard(QMainWindow):
         plot.getAxis("bottom").setTicks([[(int(ch), str(ch)) for ch in channels]])
         self._valve_cmd_bar = pg.BarGraphItem(x=channels, height=np.zeros(8), width=0.65, brush=C_INFO, pen=pg.mkPen(None))
         plot.addItem(self._valve_cmd_bar)
+        self._valve_cmd_bar.hide()
         layout.addWidget(plot)
         return panel
 
@@ -1512,6 +1533,17 @@ class Dashboard(QMainWindow):
         xs, ys = zip(table[0][-1], tip) if paired else ([], [])
         self._gripper_link.setData(xs, ys, pen=pg.mkPen(tip_color, width=3))
         selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
+        connected = getattr(selected, "ready", False) if selected else node.request is not None
+        if connected and node.arm_equipped and table is None:
+            if base or joints or tip:
+                self._arm_notice.setText("로봇팔 지도 위치 미수신")
+                self._arm_notice.setToolTip("팔 데이터는 수신 중입니다. 지도에 표시할 /arm/link_poses (table)를 기다립니다.")
+            else:
+                self._arm_notice.setText("로봇팔 신호 미수신")
+                self._arm_notice.setToolTip("선택한 기체에서 로봇팔 관절각이나 링크 위치가 수신되지 않았습니다.")
+            self._arm_notice.show()
+        else:
+            self._arm_notice.hide()
         workspace = (selected.workspace or PREFERRED_WORKSPACE) if selected else PREFERRED_WORKSPACE
         private_arm = workspace.split("/", 1)[0] == "FSS_FSW" or bool(selected and (
             getattr(selected, "private_arm", False) or "FSS_FSW" in selected.read_only
@@ -1788,8 +1820,9 @@ class Dashboard(QMainWindow):
         if not health_fresh or not valve_fresh:
             self._card_act.set_status("NO DATA", "/actuators/valve_status", C_ERROR)
         elif node.actuators_ok:
-            peak = max(node.valve_cmd, default=0.0)
-            self._card_act.set_status("OK", f"peak duty {peak:.2f}", C_OK)
+            duties = node.fresh_valve_command()
+            detail = f"최대 명령 {max(duties):.2f}" if duties is not None else "명령 미수신"
+            self._card_act.set_status("OK", detail, C_OK)
         else:
             self._card_act.set_status("FAULT", "밸브/PLC 상태 확인", C_ERROR)
 
@@ -1977,8 +2010,11 @@ class Dashboard(QMainWindow):
             if times and len(times) == len(values):
                 curve.setData(list(times), list(values))
 
-        self._valve_cmd_bar.setOpts(height=node.valve_cmd)
-        self._valve_cmd_bar.setVisible(node.source_age("valve") <= SOURCE_TIMEOUT_SEC)
+        duties = node.fresh_valve_command()
+        if duties is not None:
+            self._valve_cmd_bar.setOpts(height=duties)
+        self._valve_cmd_bar.setVisible(duties is not None)
+        self._valve_title.setText("밸브 명령" if duties is not None else "밸브 명령 · 미수신")
 
         self._update_logs()
 
@@ -2096,6 +2132,7 @@ class Dashboard(QMainWindow):
         )
         if shared_domain:
             enabled = False
+        self._start_body.setVisible(bool(enabled and selected and selected.can_start_body))
         self._btn_estop.setEnabled(enabled)
         self._release_estop.setVisible(enabled and self._node.mode_name == "EMERGENCY_STOP"
                                        and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC)

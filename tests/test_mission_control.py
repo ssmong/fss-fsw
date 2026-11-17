@@ -63,6 +63,18 @@ class MissionControlTest(unittest.TestCase):
         fixed = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         self.assertEqual(self.window._terminal.font().family(), fixed.family())
 
+    def test_flight_start_requires_a_click_in_a_writable_idle_session(self):
+        link = self.connect("host", 0)
+        link.can_start_body = True
+        self.window._update()
+        self.assertFalse(self.window._start_body.isHidden())
+        self.assertTrue(link.commands.empty())
+        self.window._start_body.click()
+        self.assertEqual(link.commands.get_nowait()[1:], ("start_body", True))
+        link.read_only = "모니터링 전용"
+        self.window._update()
+        self.assertTrue(self.window._start_body.isHidden())
+
     def test_air_bearing_shows_telemetry_without_optimistic_switch_on_click(self):
         w = self.window
         link = self.connect("first", 1)
@@ -487,8 +499,9 @@ class MissionControlTest(unittest.TestCase):
             link.inbox.put([
                 ("vicon", SimpleNamespace(header=header, x=i, y=-i, theta=0)),
                 ("ref", SimpleNamespace(header=header, x_ref=2*i, y_ref=i, theta_ref=-.5*i)),
-                ("valve", SimpleNamespace(commanded_duty_cycles=[i / 4] * 8,
+                ("valve", SimpleNamespace(commanded_duty_cycles=[0.9] * 8,
                                           main_valve_open=False, modbus_rtt_ms=0)),
+                ("valve_output", SimpleNamespace(duty_cycles=[i / 4] * 8)),
             ])
         for tab, expected_x in ((1, 2), (0, 1)):
             self.window._vehicles.setCurrentIndex(tab)
@@ -508,6 +521,24 @@ class MissionControlTest(unittest.TestCase):
         self.assertIsNone(self.window._vicon_curve.xData)
         self.assertFalse(ghost.isVisible())
         self.assertFalse(self.window._valve_cmd_bar.isVisible())
+
+    def test_valve_chart_distinguishes_issued_zero_from_demand_and_missing_output(self):
+        link = self.connect("first", 1)
+        demand = SimpleNamespace(commanded_duty_cycles=[.9] * 8, main_valve_open=False, modbus_rtt_ms=1)
+        link.inbox.put([("valve", demand)])
+        self.window._update()
+        self.assertIn("미수신", self.window._valve_title.text())
+        self.assertFalse(self.window._valve_cmd_bar.isVisible())
+        link.inbox.put([("valve_output", SimpleNamespace(duty_cycles=[0] * 8)), ("valve", demand)])
+        self.window._update()
+        self.assertTrue(self.window._valve_cmd_bar.isVisible())
+        self.assertNotIn("미수신", self.window._valve_title.text())
+        self.assertEqual(list(self.window._valve_cmd_bar.opts["height"]), [0] * 8)
+        link.data._last_rx["valve_output"] -= self.ui.SOURCE_TIMEOUT_SEC + 1
+        link.inbox.put([("valve", demand)])
+        self.window._update()
+        self.assertFalse(self.window._valve_cmd_bar.isVisible())
+        self.assertIn("미수신", self.window._valve_title.text())
 
     def test_stale_mode_blocks_open_and_tracking_expires_after_five_seconds(self):
         link = self.connect("first", 1)

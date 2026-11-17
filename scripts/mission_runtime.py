@@ -158,6 +158,29 @@ def ros_network(env):
                  for key in ROS_ENV_KEYS)
 
 
+def monitoring_environment(processes, domain):
+    networks = {}
+    for name, env in processes:
+        if domain is not None and env.get("ROS_DOMAIN_ID", "0") != str(domain):
+            continue
+        _, names = networks.setdefault(ros_network(env), (env, set()))
+        names.add(name)
+    if not networks:
+        return {key: os.environ[key] for key in ROS_ENV_KEYS if key in os.environ}
+
+    def flight_evidence(names):
+        # A separate experiment client may remain alive on a different domain.
+        return (len(names & {"valve_driver_node", "manager_node"}), "valve_driver_node" in names,
+                bool(names & FSS_NODES))
+
+    best = max(flight_evidence(names) for _, names in networks.values())
+    matches = [env for env, names in networks.values() if flight_evidence(names) == best]
+    if len(matches) > 1:
+        domains = ", ".join(sorted({env.get("ROS_DOMAIN_ID", "0") for env in matches}))
+        raise RuntimeError(f"Jetson에서 모니터링할 ROS 환경을 구분할 수 없습니다 (도메인 {domains}).")
+    return matches[0]
+
+
 def private_base():
     home = Path.home()
     lab = home / PRIVATE
@@ -184,13 +207,16 @@ def local_service_owner(name, proc=Path("/proc")):
     return owned and calibrated
 
 
-def local_stacks(proc=Path("/proc")):
+def local_stacks(proc=Path("/proc"), monitor=False, domain=None):
     stacks = {"flight": [], "imu": []}
+    processes = []
+    conflicts = set()
     profile = private_base()
     calibrated = profile is None
     for argv, env in device_processes(proc):
         role = process_role(argv, os.getenv("FSS_MISSION_WORKSPACE", PUBLIC), env)
         ros_env = {key: env[key] for key in ROS_ENV_KEYS if key in env}
+        processes.append((executable_name(argv), ros_env))
         if role == "competing":
             owner = checkout_for(argv, env)
             package = launch_package(argv)
@@ -198,16 +224,23 @@ def local_stacks(proc=Path("/proc")):
                 owner = "self_tossing_hils"
             elif owner == PRIVATE or package == "hardware_runtime":
                 owner = "FSS_FSW/hardware_runtime"
-            raise HardwareBusy(ros_env, owner or package or executable_name(argv))
+            conflicts.add(owner or package or executable_name(argv))
+            continue
         stacks[role].append(ros_env)
         if profile and launch_package(argv) == profile.as_posix():
             calibrated = True
     if stacks["flight"] and not calibrated:
-        raise HardwareBusy(stacks["flight"][0], "기존 FSW · 실험실 기체 설정 미확인")
+        conflicts.add("기존 FSW · 실험실 기체 설정 미확인")
+    if conflicts or monitor:
+        environment = monitoring_environment(processes, domain)
+        if conflicts:
+            raise HardwareBusy(environment, " · ".join(sorted(conflicts)))
+        stacks["monitor"] = environment
     return stacks
 
 
 def prepare_hardware():
+    """Start or reuse hardware after an explicit operator request."""
     from fcntl import LOCK_EX, flock
 
     selected = os.getenv("FSS_MISSION_WORKSPACE", PUBLIC)
@@ -235,6 +268,12 @@ def prepare_hardware():
         profile = private_base()
         if profile and not profile.is_file():
             raise RuntimeError("실험실 기체 설정 필요 · cd ~/FSS_FSW && bash scripts/cpp_fsw.sh build")
+        install = Path.home() / selected / "install"
+        feature = "share/ament_index/resource_index/fss_mission_control/fss_gnc"
+        if not any((prefix / feature).is_file() and
+                   "require_explicit_target" in (prefix / feature).read_text().splitlines()
+                   for prefix in (install / "fss_gnc", install)):
+            raise RuntimeError("목표 전송 대기를 지원하는 Jetson C++ FSW로 업데이트하고 빌드하세요.")
 
         # Keep the stack alive across SSH/UI reconnects. Concurrent sessions see
         # the same ros2 launch process under the startup lock.
@@ -252,28 +291,32 @@ def prepare_hardware():
             start(["bash", "scripts/launch/start_imu.sh"], "imu.log")
         flight = ([str(profile), "use_sim:=false"] if profile
                   else ["fss_bringup", "fss_full.launch.py", "gnc_backend:=cpp"])
-        start(["ros2", "launch", *flight], "flight.log")
+        start(["ros2", "launch", *flight, "require_explicit_target:=true"], "flight.log")
         return "기체 소프트웨어 기동"
 
 
 def prepare_session(monitor_only=False, domain=None):
+    """Attach the bridge without starting flight software or device drivers."""
+    selected = os.getenv("FSS_MISSION_WORKSPACE", PUBLIC)
+    reason = ""
     try:
-        selected = os.getenv("FSS_MISSION_WORKSPACE", PUBLIC)
-        if monitor_only or selected == PRIVATE or domain is not None:
-            stacks = local_stacks()
-            running = stacks["flight"] or stacks["imu"]
-            if running:
-                for key in ROS_ENV_KEYS:
-                    os.environ.pop(key, None)
-                os.environ.update(running[0])
-            if domain is not None:
-                os.environ["ROS_DOMAIN_ID"] = str(domain)
-            if selected == PRIVATE:
-                return f"{selected} 모니터링 연결", f"{selected} 모니터링 전용"
-            return ("모니터링 전용 연결", "모니터링 전용") if monitor_only else ("기체 연결", "")
-        return prepare_hardware(), ""
+        stacks = local_stacks(monitor=True, domain=domain)
+        environment = stacks["monitor"]
+        if selected == PRIVATE:
+            reason = f"{selected} 모니터링 전용"
+        elif monitor_only:
+            reason = "모니터링 전용"
+        elif not stacks["flight"] and not stacks["imu"]:
+            environment = {"ROS_DOMAIN_ID": "0", "ROS_LOCALHOST_ONLY": "1"}
+        elif any(ros_network(env) != ros_network(environment) for env in stacks["flight"] + stacks["imu"]):
+            reason = "서로 다른 ROS 환경 · 모니터링 전용"
+        elif not stacks["flight"] and environment.get("ROS_LOCALHOST_ONLY", "0") != "1":
+            reason = "공유 ROS 네트워크의 IMU · 모니터링 전용"
     except HardwareBusy as busy:
-        for key in ROS_ENV_KEYS:
-            os.environ.pop(key, None)
-        os.environ.update(busy.environment)
-        return str(busy), str(busy)
+        environment, reason = busy.environment, str(busy)
+    for key in ROS_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.update(environment)
+    if domain is not None:
+        os.environ["ROS_DOMAIN_ID"] = str(domain)
+    return reason or "기체 연결", reason

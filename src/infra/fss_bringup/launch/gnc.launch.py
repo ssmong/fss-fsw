@@ -22,6 +22,11 @@ def launch_gnc(context, **node_kwargs):
     backend = LaunchConfiguration("gnc_backend").perform(context)
     if backend not in ("cpp", "python"):
         raise ValueError("gnc_backend must be cpp or python")
+    explicit_target = LaunchConfiguration("require_explicit_target").perform(context) == "true"
+    if explicit_target:
+        if backend != "cpp":
+            raise ValueError("require_explicit_target requires the C++ GNC backend")
+        node_kwargs["parameters"] = [*node_kwargs["parameters"], {"require_explicit_target": True}]
     return scheduled_node(
         context, executable="gnc_node" if backend == "cpp" else "gnc_node.py", **node_kwargs
     )
@@ -34,6 +39,10 @@ def generate_launch_description() -> LaunchDescription:
     backend_arg = DeclareLaunchArgument(
         "gnc_backend", default_value="cpp", choices=["cpp", "python"],
         description="기본 C++ 런타임 또는 Python 연구용 GNC (bindings 빌드 필요)",
+    )
+    explicit_target_arg = DeclareLaunchArgument(
+        "require_explicit_target", default_value="false", choices=["true", "false"],
+        description="목표와 ACTIVE 상태를 받은 뒤 C++ GNC 제어 시작",
     )
 
     cpu_pin_arg = DeclareLaunchArgument(
@@ -78,6 +87,7 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription([
         backend_arg,
+        explicit_target_arg,
         cpu_pin_arg,
         cpu_core_arg,
         rt_priority_arg,

@@ -83,6 +83,10 @@ def generate_launch_description() -> LaunchDescription:
         "gnc_backend", default_value="cpp", choices=["cpp", "python"],
         description="기본 C++ GNC 또는 Python 연구용 GNC (bindings 빌드 필요)",
     )
+    explicit_target_arg = DeclareLaunchArgument(
+        "require_explicit_target", default_value="false", choices=["true", "false"],
+        description="목표와 ACTIVE 상태를 받은 뒤 C++ GNC 제어 시작",
+    )
     arm_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([bringup_share, "launch", "arm.launch.py"])
@@ -150,6 +154,7 @@ def generate_launch_description() -> LaunchDescription:
         launch_arguments={
             "use_sim_time": use_sim,
             "gnc_backend": LaunchConfiguration("gnc_backend"),
+            "require_explicit_target": LaunchConfiguration("require_explicit_target"),
             "cpu_pin": cpu_pin,
             "cpu_core": scheduling["gnc_cpu_core"],
             "rt_priority": LaunchConfiguration("gnc_rt_priority"),
@@ -178,6 +183,7 @@ def generate_launch_description() -> LaunchDescription:
             use_thrusters_arg,
             use_gnc_arg,
             gnc_backend_arg,
+            explicit_target_arg,
             cpu_pin_arg,
             gnc_rt_priority_arg,
             actuator_rt_priority_arg,

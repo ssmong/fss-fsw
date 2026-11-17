@@ -104,6 +104,30 @@ class ArmPlotTest(unittest.TestCase):
         bounds = window._xy_plot.getViewBox().sceneBoundingRect().adjusted(-1, -1, 1, 1)
         self.assertTrue(all(bounds.contains(b) for b in occupied), (bounds, occupied))
 
+    def test_connected_arm_explains_missing_feedback_or_table_geometry(self):
+        node, window = self.node, self.window
+        window._update_arm()
+        self.assertTrue(window._arm_notice.isHidden())
+        node.request = lambda *_: None
+        with patch("time.monotonic", return_value=100) as now:
+            window._update_arm()
+            self.assertFalse(window._arm_notice.isHidden())
+            self.assertEqual(window._arm_notice.text(), "로봇팔 신호 미수신")
+            node._cb_arm_base(NS(header=NS(frame_id="base_link"), poses=[pose(i, 0) for i in range(4)]))
+            window._update_arm()
+            self.assertEqual(window._arm_notice.text(), "로봇팔 지도 위치 미수신")
+            self.assertIsNone(window._arm_links.xData)
+            node._cb_arm_table(NS(header=NS(frame_id="table"), poses=[pose(i, 0) for i in range(4)]))
+            window._update_arm()
+            self.assertTrue(window._arm_notice.isHidden())
+            now.return_value += self.ui.XY_TRAIL_SEC
+            window._update_arm()
+            self.assertFalse(window._arm_notice.isHidden())
+            self.assertEqual(window._arm_notice.text(), "로봇팔 신호 미수신")
+            node.arm_equipped = False
+            window._update_arm()
+            self.assertTrue(window._arm_notice.isHidden())
+
     def test_private_arm_uses_published_geometry(self):
         node, window = self.node, self.window
         node._cb_arm_joints(NS(name=["shoulder", "elbow", "wrist"], position=[0., 0., 0.]))
