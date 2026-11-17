@@ -73,13 +73,19 @@ D435i IMU는 카메라 알고리즘용 `/camera/camera/imu`에만 남겨 둔다.
 | 도구 | 추천 용도 | 실행 위치 |
 | --- | --- | --- |
 | Foxglove | 기본 원격 모니터링, 자유로운 plot 추가, rosbag 분석 | 노트북 브라우저/앱 |
-| `live_plot.py` | 실험 관제 콘솔 — 모니터링 + 제어(E-STOP/모드 스테퍼/에어베어링) | ROS2 네트워크에 연결된 노트북 |
+| `live_plot.py` | 지상국 관제, 목표 전송, 에어베어링 제어 | 실험실 PC |
 | `diagnostics/imu_live.py` | IMU raw/body 축 비교와 평면 yaw 확인 | 노트북 또는 Jetson GUI |
 | `diagnostics/realsense_live.py` | Depth/Color 영상 확인 | 노트북 또는 Jetson GUI |
 
 ### 커스텀 미션 대시보드
 
-초기 화면에는 모드, 안전 상태, XY 궤적, 목표와 오차만 표시합니다. 속도, EKF 불확실도, 밸브, 로그는 탭으로 분리되어 있습니다.
+**+ FSS 연결**로 기체를 추가하고 **로봇팔 장착** 여부를 지정합니다. 기본 화면에는 Vicon 실측과 목표, 밸브 명령(0–1), 선택한 기체의 SSH 터미널이 표시됩니다. **+**로 같은 기체의 셸을 추가하거나 **로그**를 눌러 최소 표시 등급을 고를 수 있습니다. Windows에서는 [빠른 시작](../README.md)을 따르세요.
+
+**로봇팔**은 실험 노드가 발행하는 테이블 좌표의 `/arm/link_poses`로 그리고, 파지점의 최근 5초는 `/arm/end_effector_pose`로 표시합니다. 파지점은 본체 자세와 관절 피드백으로 계산한 위치입니다. **상세 → 로봇팔**에서 어깨·팔꿈치·손목 각도와 본체 기준 형상을 확인할 수 있습니다. [이 저장소의 링크 치수와 좌표축](../docs/hardware/014_Mass_Properties.md#1-좌표계와-기준축)
+
+**계획 경로**는 Jetson의 `~/self_tossing_hardware/experiments/<실험>/<방법>/`에 있는 `trial.yaml`, `initial_setup.json`, `plan.npz`를 읽습니다. 연한 회색 파선은 선택한 계획 전체이고, 빨간 파선은 실행 중인 실험의 계획 시간이 도달한 구간입니다. 기체의 실제 움직임은 Vicon 궤적으로 비교합니다.
+
+**실험 시작 → 실험 종료**로 선택한 기체의 수신 데이터를 관제 PC에 기록합니다. `experiments/<이름>/YYYY-MM-DD/HH-MM-SS/`에서 `telemetry.jsonl.gz`(수신 시각과 ROS 메시지), `logs.txt`(전체 등급), `session.json`(기체·시작/종료 시각·수신 건수), `trajectory.png`(XY 궤적)를 확인하세요. 모니터링 연결에서도 기록할 수 있습니다.
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -91,7 +97,7 @@ python3 scripts/live_plot.py --fullscreen
 python3 scripts/live_plot.py --opengl       # PyOpenGL 설치 시 선택
 ```
 
-제어 바의 모드 스테퍼(PRESSURIZE→READY→ACTIVE)는 FSM 허용 전이 + 서브시스템 준비도가 충족될 때만 활성화되고, E-STOP은 항상 활성입니다. 실제 게이팅은 `manager_node`가 강제하며 GUI는 이를 미러링합니다.
+에어베어링 ON과 목표 전송은 `manager_node`의 준비 상태를 확인하며 진행합니다. 서비스 응답과 거부 사유는 관제 로그에서 확인합니다.
 
 새 시계열은 `live_plot.py`의 `Dashboard._build_detail_tabs()`에서 `SeriesSpec`을 추가해 공통 스타일과 자동 갱신을 재사용합니다. `line_style`은 `solid`, `dashed`, `dotted` 중에서 선택할 수 있습니다.
 

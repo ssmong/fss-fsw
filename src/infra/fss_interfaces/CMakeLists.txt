@@ -23,6 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/MainValveControl.srv"
   "srv/SetGuidanceMode.srv"
   "srv/SetController.srv"
+  "srv/SetTarget.srv"
   "srv/SetSystemMode.srv"
   DEPENDENCIES std_msgs geometry_msgs
 )

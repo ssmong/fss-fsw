@@ -35,6 +35,11 @@ public:
     bool has_trajectory() const { return points_.size() >= 2; }
     const std::string& mode() const { return mode_; }
 
+    void hold_target(const Reference& target) {
+        mode_ = "target";
+        target_ = target;
+    }
+
     void set_mode(const std::string& mode) {
         if (mode != "target" && mode != "trajectory")
             throw std::invalid_argument("guidance.mode must be target or trajectory");

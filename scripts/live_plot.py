@@ -1,22 +1,9 @@
 #!/usr/bin/env python3
 """FSS 실시간 미션 관제 콘솔 (PySide6 + pyqtgraph).
 
-운용 판단에 필요한 정보 + 실험 제어를 한 화면에서 다룬다.
-
-- 제어 바: E-STOP / 모드 스테퍼(PRESSURIZE→READY→ACTIVE) / ABORT / RESET / 에어베어링 토글.
-  각 버튼은 FSM 허용 전이 + 준비도 충족 시에만 활성화된다 (준비 미충족 시 툴팁으로 사유 표시).
-- 서브시스템 준비도 등: Vicon / IMU / EKF·Nav / PLC·Valve / 에어베어링.
-- Vicon·EKF·기준 XY 궤적, 현재/목표/오차, 명령 렌치.
-
-상세 시계열, 추정 불확실도, 밸브 상태, 로그는 하단 탭에서 확인한다. 자동 스케일 플롯은 최소
-Y 스팬을 강제해 작은 신호에서 축이 확대돼 요동치는 것을 막는다.
-새 시계열은 ``Dashboard._build_detail_tabs()``에 ``SeriesSpec``을 추가하면 된다.
-
-사용법 (ROS2 DDS 네트워크에 연결된 노트북):
-    source /opt/ros/humble/setup.bash
-    source ~/fss-fsw/install/setup.bash
-    python3 scripts/live_plot.py
-
+FSS 연결, 기체별 XY 궤적, 밸브 명령 및 PID/LQR 선택을 제공한다.
+Windows: py scripts/live_plot.py
+ROS 환경: python3 scripts/live_plot.py
 옵션:
     --history-sec 60   표시할 이력 길이 [s]
     --fps 20           화면 갱신률
@@ -24,71 +11,93 @@ Y 스팬을 강제해 작은 신호에서 축이 확대돼 요동치는 것을 �
     --fullscreen       전체 화면으로 시작
 """
 
+from __future__ import annotations
+
 import argparse
 import html
 import math
-import os
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
+from pathlib import Path
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-import yaml
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QTransform
+from PySide6.QtCore import QCoreApplication, QEvent, QLocale, QRectF, QSettings, QTimer, Qt
+from PySide6.QtGui import QBrush, QColor, QFont, QFontDatabase, QFontMetricsF, QPainterPath, QTransform
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QInputDialog,
+    QLineEdit,
+    QMessageBox,
+    QStackedWidget,
+    QTabBar,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
-    QSplitter,
+    QLayout,
+    QScrollArea,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-import rclpy
-from rcl_interfaces.msg import Log
-from rclpy.node import Node
-from sensor_msgs.msg import Imu
-
-from fss_interfaces.msg import (
-    SpacecraftState,
-    SystemHealth,
-    SystemMode,
-    TrajectoryReference,
-    ValveStatus,
-)
-from fss_interfaces.srv import MainValveControl, SetSystemMode
+from mission_arm import JOINT_LABELS, encoder_model, feedback_source, joint_angles, link_points
+from mission_link import JetsonLink, PREFERRED_WORKSPACE
+from mission_recording import ExperimentRecorder
+from mission_terminal import TerminalView
+from mission_ros import open_node
 
 
 # ── 색상 팔레트 ───────────────────────────────────────────────────────────────
-C_BG = "#0b0f14"
-C_PANEL = "#141a22"
-C_PANEL_ALT = "#10161d"
-C_BORDER = "#27313d"
-C_TEXT = "#e6edf3"
-C_TEXT_DIM = "#a7b1bd"
-C_VICON = "#58a6ff"
-C_EKF = "#00d4aa"
-C_REFERENCE = "#f2cc60"
-C_WARN = "#f0883e"
-C_ERROR = "#f85149"
-C_OK = "#3fb950"
-C_INFO = "#00b8d9"
-C_IDLE = "#6e7681"
-C_GRID = "#25303b"
-C_WRENCH_POS = "#f0883e"
-C_WRENCH_NEG = "#58a6ff"
+C_BG = "#f5f5f7"
+C_PANEL = "#ffffff"
+C_PANEL_ALT = "#fafafc"
+C_BORDER = "#e0e0e0"
+C_TEXT = "#1d1d1f"
+C_TEXT_DIM = "#636368"
+C_INFO = "#0066cc"
+C_FOCUS = "#0071e3"
+C_IDLE = "#6e6e73"
+C_VICON = "#0066cc"
+C_ARM = "#087e74"
+C_EKF = "#15736c"
+C_REFERENCE = "#a35a10"
+C_WARN = "#945109"
+C_ERROR = "#b52b26"
+C_OK = "#216b41"
+LOG_LEVELS = {10: "DEBUG", 20: "INFO", 30: "WARNING", 40: "ERROR", 50: "FATAL"}
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    timestamp: str
+    level: int
+    message: str
+
+    def to_html(self):
+        color = C_ERROR if self.level >= 40 else C_WARN if self.level >= 30 else C_TEXT_DIM
+        level = LOG_LEVELS.get(self.level, str(self.level))
+        return (f'<span style="color:{color}">{self.timestamp} &nbsp;[{level}] '
+                f'{html.escape(self.message)}</span>')
 
 BODY_HALF_W = 0.15  # 우주선 반폭 [m]
 SOURCE_TIMEOUT_SEC = 2.5
+XY_TRAIL_SEC = 5.0
+ARM_TIMEOUT_SEC = 0.5
 
 MODE_COLORS = {
     "IDLE": C_IDLE,
@@ -99,19 +108,7 @@ MODE_COLORS = {
     "EMERGENCY_STOP": C_ERROR,
 }
 
-# SystemMode 상수 (msg와 동일)
-MODE_IDLE, MODE_PRESSURIZING, MODE_READY = 0, 1, 2
-MODE_ACTIVE, MODE_SAFE_HOLD, MODE_ESTOP = 3, 4, 5
-
-# FSM 허용 전이 (현재 모드명 → 허용 대상 모드값). mode_fsm._TRANSITIONS와 일치.
-ALLOWED_TRANSITIONS = {
-    "IDLE": {MODE_PRESSURIZING, MODE_ESTOP},
-    "PRESSURIZING": {MODE_READY, MODE_IDLE, MODE_ESTOP},
-    "READY": {MODE_ACTIVE, MODE_IDLE, MODE_ESTOP},
-    "ACTIVE": {MODE_SAFE_HOLD, MODE_READY, MODE_ESTOP},
-    "SAFE_HOLD": {MODE_READY, MODE_IDLE, MODE_ESTOP},
-    "EMERGENCY_STOP": {MODE_IDLE},
-}
+MODE_ESTOP = 5
 
 
 @dataclass(frozen=True)
@@ -142,7 +139,8 @@ def _style_plot(
     grid_x: bool = True,
     grid_y: bool = True,
 ) -> None:
-    """어두운 배경에서도 제목, 축, 눈금이 읽히도록 공통 스타일을 적용한다."""
+    """흰색 플롯에 축과 눈금의 공통 스타일을 적용한다."""
+    plot.setBackground(C_PANEL)
     plot.setTitle(title, color=C_TEXT, size="12pt")
     label_style = {"color": C_TEXT_DIM, "font-size": "11pt"}
     if x_label:
@@ -150,7 +148,8 @@ def _style_plot(
     if y_label:
         plot.setLabel("left", y_label, **label_style)
 
-    tick_font = QFont("sans-serif", 10)
+    tick_font = QFont(QApplication.font())
+    tick_font.setPointSize(9)
     for axis_name in ("bottom", "left"):
         axis = plot.getAxis(axis_name)
         axis.setTickFont(tick_font)
@@ -173,7 +172,7 @@ def _add_readable_legend(
         horSpacing=12,
         labelTextColor=C_TEXT,
         labelTextSize="10pt",
-        brush=pg.mkBrush(11, 15, 20, 220),
+        brush=pg.mkBrush(255, 255, 255, 235),
         pen=pg.mkPen(C_BORDER),
     )
 
@@ -183,83 +182,168 @@ def _wrap_angle_rad(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def _config_path(*parts: str) -> str:
-    """저장소의 config 파일 경로를 반환한다."""
-    return os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "config", *parts)
-    )
+class XYTrail:
+    def __init__(self):
+        self.samples = deque()
+
+    def append(self, x, y):
+        now = time.monotonic()
+        self._expire(now)
+        self.samples.append((now, x, y))
+
+    def _expire(self, now):
+        cutoff = now - XY_TRAIL_SEC
+        while self.samples and self.samples[0][0] <= cutoff:
+            self.samples.popleft()
+
+    def coordinates(self):
+        self._expire(time.monotonic())
+        return [p[1] for p in self.samples], [p[2] for p in self.samples]
 
 
-def _load_thruster_matrix() -> np.ndarray:
-    """추력기 형상 설정에서 3×8 B 행렬을 생성한다."""
-    path = _config_path("vehicle", "thruster_geometry.yaml")
-    try:
-        with open(path, encoding="utf-8") as stream:
-            data = yaml.safe_load(stream)
-        thrusters = data["thruster_geometry"]["thrusters"]
-        matrix = np.zeros((3, len(thrusters)))
-        for index, thruster in enumerate(thrusters):
-            direction = np.asarray(thruster["direction"], dtype=float)
-            position = np.asarray(thruster["position"], dtype=float)
-            matrix[0, index] = direction[0]
-            matrix[1, index] = direction[1]
-            matrix[2, index] = (
-                position[0] * direction[1] - position[1] * direction[0]
-            )
-        return matrix
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        print(
-            f"[live_plot] 추력기 B 행렬 로드 실패({exc!r}) — 렌치 표시는 0으로 유지",
-            file=sys.stderr,
-        )
-        return np.zeros((3, 8))
+class TablePlot(pg.PlotWidget):
+    """Fit the physical table to the window without changing its coordinates."""
+
+    LEFT_AXIS = 58
+    BOTTOM_AXIS = 44
+
+    def __init__(self):
+        super().__init__()
+        self.plotItem.layout.setContentsMargins(0, 0, 0, 0)
+        self.plotItem.layout.setSpacing(0)
+        self.getAxis("left").setWidth(self.LEFT_AXIS)
+        self.getAxis("bottom").setHeight(self.BOTTOM_AXIS)
+        for axis in ("left", "bottom"):
+            self.getAxis(axis).setTickSpacing(1.0, 0.5)
+            self.getAxis(axis).setStyle(hideOverlappingLabels=False)
+        self.setMouseEnabled(x=False, y=False)
+        self.plotItem.setMenuEnabled(False)
+        self.plotItem.hideButtons()
+        self.setLimits(xMin=0, xMax=3, yMin=0, yMax=4,
+                       minXRange=3, maxXRange=3, minYRange=4, maxYRange=4)
+        self.setRange(xRange=(0, 3), yRange=(0, 4), padding=0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.plotItem is None:
+            return
+        w, h = self.viewport().width(), self.viewport().height()
+        pixels_per_m = max(1.0, min((w - self.LEFT_AXIS - 16) / 3, (h - self.BOTTOM_AXIS - 16) / 4))
+        width = self.LEFT_AXIS + 3 * pixels_per_m
+        height = self.BOTTOM_AXIS + 4 * pixels_per_m
+        self.plotItem.setGeometry(QRectF((w - width) / 2, (h - height) / 2, width, height))
 
 
-def _load_plc_max_value() -> float:
-    """PLC 출력 최댓값을 설정에서 읽는다."""
-    path = _config_path("hardware", "plc.yaml")
-    try:
-        with open(path, encoding="utf-8") as stream:
-            data = yaml.safe_load(stream)
-        value_range = data["plc"]["value_range"]
-        maximum = float(value_range[1])
-        if maximum <= 0.0:
-            raise ValueError("PLC 출력 최댓값은 양수여야 함")
-        return maximum
-    except (FileNotFoundError, KeyError, IndexError, TypeError, ValueError) as exc:
-        print(
-            f"[live_plot] PLC 범위 로드 실패({exc!r}) — 기본값 4000 사용",
-            file=sys.stderr,
-        )
-        return 4000.0
+class VehicleBubble(pg.TextItem):
+    """Vehicle-local readout with screen-sized text on the fixed table map."""
+
+    def __init__(self):
+        super().__init__(color=C_TEXT)
+        font = QFont(QApplication.font())
+        font.setPointSize(8)
+        self.setFont(font)
+        self.setZValue(20)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        self.hide()
+
+    def paint(self, painter, *args):
+        super().paint(painter, *args)
+        painter.setRenderHint(painter.RenderHint.Antialiasing)
+        painter.setPen(pg.mkPen(134, 145, 157, 110))
+        painter.setBrush(pg.mkBrush(255, 255, 255, 206))
+        painter.drawRoundedRect(self.boundingRect(), 6, 6)
+
+    def show_vehicle(self, node, name=""):
+        pose = None
+        if node.x_v and node.source_age("vicon") < XY_TRAIL_SEC:
+            pose = node.x_v[-1], node.y_v[-1], node.th_v[-1]
+        elif node.arm_equipped and node.arm_table and node.source_age("arm_table") < XY_TRAIL_SEC:
+            pose = node.arm_table_origin
+        if pose is None or not all(math.isfinite(v) for v in pose):
+            self.hide()
+            return
+        x, y, yaw = pose
+        view = self.getViewBox()
+        metrics = QFontMetricsF(self.textItem.font())
+        max_width = max(1.0, view.sceneBoundingRect().width() - 2 * self.textItem.document().documentMargin() - 4)
+        lines = [metrics.elidedText(name, Qt.ElideRight, max_width)] if name else []
+        line = f"x {x:.2f}"
+        for field in (f"y {y:.2f}", f"yaw {yaw:.1f}°"):
+            candidate = line + "   " + field
+            if metrics.horizontalAdvance(candidate) > max_width:
+                lines.append(line)
+                line = field
+            else:
+                line = candidate
+        lines.append(line)
+        label = "\n".join(lines)
+        if self.toPlainText() != label:
+            self.setText(label)
+        # Grow toward the interior so labels remain readable at table edges.
+        right, top = x > 1.5, y > 2
+        self.setAnchor((int(right), int(not top)))
+        dx, dy = view.viewPixelSize()
+        bounds = self.boundingRect()
+        width = min(3.0, abs(dx) * bounds.width())
+        height = min(4.0, abs(dy) * bounds.height())
+        bx = x + (-0.16 if right else 0.16)
+        by = y + (-0.18 if top else 0.18)
+        bx = max(width if right else 0, min(3 if right else 3 - width, bx))
+        by = max(height if top else 0, min(4 if top else 4 - height, by))
+        self.setPos(bx, by)
+        self.show()
+
+    def avoid_other_bubbles(self, occupied):
+        if not self.isVisible():
+            return
+        box = self.sceneBoundingRect()
+        view = self.getViewBox()
+        bounds = view.sceneBoundingRect()
+        tops = [box.top()]
+        for other in occupied:
+            if box.right() > other.left() and box.left() < other.right():
+                tops.extend((other.top() - box.height() - 3, other.bottom() + 3))
+        best = (math.inf, math.inf)
+        placed = box
+        for top in tops:
+            top = max(bounds.top(), min(top, bounds.bottom() - box.height()))
+            candidate = box.translated(0, top - box.top())
+            overlap = 0
+            for other in occupied:
+                intersection = candidate.intersected(other)
+                overlap += intersection.width() * intersection.height()
+            score = (overlap, abs(candidate.top() - box.top()))
+            if score < best:
+                best, placed = score, candidate
+                if score == (0, 0):
+                    break
+        y_offset = (placed.top() - box.top()) * abs(view.viewPixelSize()[1])
+        self.setY(self.y() - y_offset)
+        occupied.append(placed)
 
 
-def _load_max_thrust() -> float:
-    """캘리브레이션 전 추정에 사용할 노즐당 최대 추력을 읽는다."""
-    path = _config_path("vehicle", "mass_properties.yaml")
-    try:
-        with open(path, encoding="utf-8") as stream:
-            data = yaml.safe_load(stream)
-        maximum = float(data["max_thrust_per_nozzle"])
-        if maximum <= 0.0:
-            raise ValueError("노즐 최대 추력은 양수여야 함")
-        return maximum
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        print(
-            f"[live_plot] 최대 추력 로드 실패({exc!r}) — 기본값 1.0 N 사용",
-            file=sys.stderr,
-        )
-        return 1.0
-
-
-class DashboardNode(Node):
+class DashboardNode:
     """대시보드에 필요한 ROS2 토픽을 수집한다."""
 
     def __init__(self, history_sec: float = 30.0) -> None:
-        super().__init__("dashboard_node")
+        self.request = None
+        self.recorder = ExperimentRecorder(self.recording_context)
+        self.arm_equipped = True
+        self.tracking_since = None
+        self.target_draft = ("PID", 0.0, 0.0, 0.0)
+        self.reported_recording_error = ""
         history_size = max(100, int(history_sec * 100.0))
 
         # Vicon 상태
+        self.vicon_trail = XYTrail()
+        self.reference_trail = XYTrail()
+        self.arm_tcp_trail = XYTrail()
+        self.arm_joints = self.arm_table = self.arm_base = self.arm_tcp = None
+        self.arm_table_origin = None
+        self.arm_table_stamp = self.arm_tcp_stamp = None
+        self.arm_gripper_pair = None
+        self.arm_local_cad = False
+        self.arm_source = "출처 미확인"
         self.t_v: deque[float] = deque(maxlen=history_size)
         self.x_v: deque[float] = deque(maxlen=history_size)
         self.y_v: deque[float] = deque(maxlen=history_size)
@@ -283,21 +367,18 @@ class DashboardNode(Node):
         self.ref_y: deque[float] = deque(maxlen=history_size)
         self.ref_th: deque[float] = deque(maxlen=history_size)
         self.latest_ref: tuple[float, float, float] | None = None
+        self.paper_plans = {}
+        self.paper_trial = ""
+        self.paper_elapsed = None
+        self.plan_choice = "auto"
 
         # 추종 오차
         self.t_err: deque[float] = deque(maxlen=history_size)
         self.pos_err: deque[float] = deque(maxlen=history_size)
         self.hdg_err: deque[float] = deque(maxlen=history_size)
 
-        # 밸브와 추정 렌치
+        # 밸브 명령
         self.valve_cmd = [0.0] * 8
-        self.valve_app = [0.0] * 8
-        self.valve_thrust = [0.0] * 8
-        self.wrench = np.zeros(3)
-        self._thruster_matrix = _load_thruster_matrix()
-        self._plc_max = _load_plc_max_value()
-        self._max_thrust = _load_max_thrust()
-
         # 시스템 상태
         self.mode_name = "NO DATA"
         self.navigation_ok = False
@@ -324,53 +405,35 @@ class DashboardNode(Node):
         self.last_command_msg = ""
 
         # ROS 로그
-        self.logs: deque[str] = deque(maxlen=200)
+        self.logs: deque[LogEntry] = deque(maxlen=200)
+        self.log_revision = 0
 
-        self.create_subscription(
-            SpacecraftState, "/sensors/vicon_state", self._cb_vicon, 10
-        )
-        self.create_subscription(
-            SpacecraftState, "/navigation/state", self._cb_ekf, 10
-        )
-        self.create_subscription(
-            ValveStatus, "/actuators/valve_status", self._cb_valve, 10
-        )
-        self.create_subscription(
-            TrajectoryReference, "/gnc/trajectory_ref", self._cb_ref, 10
-        )
-        self.create_subscription(SystemMode, "/system/mode", self._cb_mode, 10)
-        self.create_subscription(SystemHealth, "/system/health", self._cb_health, 10)
-        self.create_subscription(Imu, "/sensors/imu", self._cb_imu, 20)
-        self.create_subscription(Log, "/rosout", self._cb_log, 50)
-        self.create_timer(1.0, self._tick_hz)
+    def recording_context(self):
+        return {"arm_equipped": self.arm_equipped, "selected_plan": self.plan_choice,
+                "active_plan_id": self.paper_trial, "plans": self.paper_plans}
 
-        # 제어 서비스 클라이언트 (E-STOP/RESET/모드/메인밸브 버튼)
-        self._set_mode_cli = self.create_client(SetSystemMode, "/system/set_mode")
-        self._main_valve_cli = self.create_client(MainValveControl, "/actuators/main_valve")
+    def receive(self, name, msg):
+        if self.recorder.active:
+            payload = msg
+            if name == "valve":
+                payload = {"commanded_duty_cycles": list(msg.commanded_duty_cycles),
+                           "main_valve_open": msg.main_valve_open, "modbus_rtt_ms": msg.modbus_rtt_ms}
+                if hasattr(msg, "header"):
+                    payload["header"] = msg.header
+            self.recorder.record(name, payload)
+        if name != "paper_status":
+            getattr(self, "_cb_" + name)(msg)
+
+    def send_command(self, name, value):
+        if self.request:
+            self.recorder.record("command", {"name": name, "value": value})
+            self.request(name, value)
 
     def request_mode(self, mode: int) -> None:
-        """모드 전이 서비스를 비동기 호출한다 (응답은 상태줄에 표시)."""
-        if not self._set_mode_cli.service_is_ready():
-            self.last_command_msg = "set_mode 서비스 미연결 — manager 실행 확인"
-            return
-        request = SetSystemMode.Request()
-        request.requested_mode = mode
-        self._set_mode_cli.call_async(request).add_done_callback(self._on_service_done)
+        self.send_command("mode", mode)
 
     def request_main_valve(self, open_valve: bool) -> None:
-        """메인 밸브(에어베어링) 서비스를 비동기 호출한다."""
-        if not self._main_valve_cli.service_is_ready():
-            self.last_command_msg = "main_valve 서비스 미연결 — valve_driver 실행 확인"
-            return
-        request = MainValveControl.Request()
-        request.open = open_valve
-        self._main_valve_cli.call_async(request).add_done_callback(self._on_service_done)
-
-    def _on_service_done(self, future) -> None:
-        try:
-            self.last_command_msg = future.result().message
-        except Exception as exc:  # noqa: BLE001 — 서비스 실패를 UI에 표시
-            self.last_command_msg = f"서비스 호출 실패: {exc}"
+        self.send_command("valve", open_valve)
 
     def readiness(self) -> dict[str, bool]:
         """서브시스템 준비도 (health + 신선도에서 유도 — manager 게이팅과 동일 기준)."""
@@ -393,13 +456,32 @@ class DashboardNode(Node):
     def _mark_rx(self, source: str) -> None:
         self._last_rx[source] = time.monotonic()
 
+    def tracking_age(self):
+        age = self.source_age("vicon")
+        if self.arm_equipped and self.arm_table is not None:
+            age = min(age, self.source_age("arm_table"))
+        return age
+
+    def tracking_status(self):
+        if self.tracking_since is None:
+            self.tracking_since = time.monotonic()
+        age = self.tracking_age()
+        if age < XY_TRAIL_SEC:
+            return "Online"
+        if math.isinf(age) and time.monotonic() - self.tracking_since < XY_TRAIL_SEC:
+            return "수신 대기"
+        return "Missing"
+
     def _relative_time(self, stamp) -> float:
         timestamp = stamp.sec + stamp.nanosec * 1e-9
         if self._t0 is None:
             self._t0 = timestamp
         return timestamp - self._t0
 
-    def _cb_vicon(self, msg: SpacecraftState) -> None:
+    def _cb_vicon(self, msg) -> None:
+        if not all(math.isfinite(value) for value in (msg.x, msg.y, msg.theta)):
+            return
+        self.vicon_trail.append(msg.x, msg.y)
         timestamp = self._relative_time(msg.header.stamp)
         self.t_v.append(timestamp)
         self.x_v.append(msg.x)
@@ -408,7 +490,58 @@ class DashboardNode(Node):
         self._vicon_count += 1
         self._mark_rx("vicon")
 
-    def _cb_ekf(self, msg: SpacecraftState) -> None:
+    def _cb_arm_joints(self, msg):
+        if (sample := joint_angles(msg)) is not None:
+            self.arm_joints = sample
+            self._mark_rx("arm_joints")
+
+    def _cb_arm_driver(self, msg):
+        source = feedback_source(msg.data)
+        if self.arm_source != "출처 미확인" and self.arm_source != source:
+            self.arm_tcp_trail.samples.clear()
+            self.arm_joints = self.arm_table = self.arm_base = self.arm_tcp = None
+            self.arm_table_origin = self.arm_table_stamp = self.arm_tcp_stamp = None
+            self.arm_gripper_pair = None
+        self.arm_source = source
+        self._mark_rx("arm_driver")
+
+    def _cb_arm_table(self, msg):
+        if (sample := link_points(msg, "table")) is not None:
+            self.arm_table = sample
+            stamp = getattr(msg.header, "stamp", None)
+            self.arm_table_stamp = (stamp.sec, stamp.nanosec) if stamp else None
+            q = msg.poses[0].orientation
+            self.arm_table_origin = None
+            if math.isfinite(q.z) and math.isfinite(q.w) and math.hypot(q.z, q.w) > 1e-9:
+                self.arm_table_origin = (*sample[0][0], math.degrees(_wrap_angle_rad(2 * math.atan2(q.z, q.w))))
+            self._mark_rx("arm_table")
+            self._pair_gripper_sample()
+
+    def _cb_arm_base(self, msg):
+        if (sample := link_points(msg, "base_link")) is not None:
+            self.arm_base = sample
+            self._mark_rx("arm_base")
+
+    def _cb_arm_tcp(self, msg):
+        p = msg.pose.position
+        if msg.header.frame_id != "table" or not all(math.isfinite(v) for v in (p.x, p.y)):
+            return
+        age = self.source_age("arm_tcp")
+        if ARM_TIMEOUT_SEC < age < XY_TRAIL_SEC:
+            self.arm_tcp_trail.append(math.nan, math.nan)
+        self.arm_tcp_trail.append(p.x, p.y)
+        self.arm_tcp = (p.x, p.y)
+        stamp = getattr(msg.header, "stamp", None)
+        self.arm_tcp_stamp = (stamp.sec, stamp.nanosec) if stamp else None
+        self._mark_rx("arm_tcp")
+        self._pair_gripper_sample()
+
+    def _pair_gripper_sample(self):
+        if self.arm_tcp_stamp is not None and self.arm_table_stamp == self.arm_tcp_stamp:
+            self.arm_gripper_pair = self.arm_table, self.arm_tcp
+            self._mark_rx("arm_pair")
+
+    def _cb_ekf(self, msg) -> None:
         timestamp = self._relative_time(msg.header.stamp)
         self.t_e.append(timestamp)
         self.x_e.append(msg.x)
@@ -432,28 +565,14 @@ class DashboardNode(Node):
         self._ekf_count += 1
         self._mark_rx("ekf")
 
-    def _cb_valve(self, msg: ValveStatus) -> None:
+    def _cb_valve(self, msg) -> None:
         self.valve_cmd = list(msg.commanded_duty_cycles)
-        self.valve_app = [
-            max(0.0, min(1.0, float(value) / self._plc_max))
-            for value in msg.applied_values
-        ]
-        estimated_thrust = list(msg.estimated_thrust)
-        # 캘리브레이션 모델이 아직 0만 발행하면 PLC 적용값으로 선형 추정한다.
-        if any(abs(value) > 1e-12 for value in estimated_thrust):
-            self.valve_thrust = estimated_thrust
-        else:
-            self.valve_thrust = [
-                value * self._max_thrust for value in self.valve_app
-            ]
-        thrust = np.asarray(self.valve_thrust, dtype=float)
-        if thrust.shape == (self._thruster_matrix.shape[1],):
-            self.wrench = self._thruster_matrix @ thrust
         self.main_valve_open = msg.main_valve_open
         self.modbus_rtt_ms = msg.modbus_rtt_ms
         self._mark_rx("valve")
 
-    def _cb_ref(self, msg: TrajectoryReference) -> None:
+    def _cb_ref(self, msg) -> None:
+        self.reference_trail.append(msg.x_ref, msg.y_ref)
         timestamp = self._relative_time(msg.header.stamp)
         self.t_r.append(timestamp)
         self.ref_x.append(msg.x_ref)
@@ -462,15 +581,31 @@ class DashboardNode(Node):
         self.latest_ref = (msg.x_ref, msg.y_ref, msg.theta_ref)
         self._mark_rx("reference")
 
-    def _cb_imu(self, msg: Imu) -> None:
+    def _cb_plans(self, entries) -> None:
+        self.paper_plans = {key: (plan_id, np.asarray(xy), np.asarray(times))
+                            for key, plan_id, xy, times in entries}
+        if self.plan_choice not in ("auto", "off") and self.plan_choice not in self.paper_plans:
+            self.plan_choice = "auto"
+
+    def _cb_paper_trial(self, status) -> None:
+        self.paper_trial, self.paper_elapsed = status
+        self._mark_rx("paper_trial")
+
+    def active_plan_key(self):
+        if not self.paper_trial or self.source_age("paper_trial") > SOURCE_TIMEOUT_SEC:
+            return None
+        matches = [key for key, (plan_id, _, _) in self.paper_plans.items() if plan_id == self.paper_trial]
+        return matches[0] if len(matches) == 1 else None
+
+    def _cb_imu(self, msg) -> None:
         self._imu_count += 1
         self._mark_rx("imu")
 
-    def _cb_mode(self, msg: SystemMode) -> None:
+    def _cb_mode(self, msg) -> None:
         self.mode_name = msg.mode_name or f"MODE {msg.mode}"
         self._mark_rx("mode")
 
-    def _cb_health(self, msg: SystemHealth) -> None:
+    def _cb_health(self, msg) -> None:
         self.navigation_ok = msg.navigation_ok
         self.actuators_ok = msg.actuators_ok
         self.main_valve_open = msg.main_valve_open
@@ -482,19 +617,19 @@ class DashboardNode(Node):
         self.errors = list(msg.errors)
         self._mark_rx("health")
 
-    _LOG_LEVELS = {10: "DBG", 20: "INF", 30: "WRN", 40: "ERR", 50: "FTL"}
+    def _cb_log(self, msg) -> None:
+        self.append_log(f"{msg.name}: {msg.msg}", msg.level)
 
-    def _cb_log(self, msg: Log) -> None:
-        if msg.level < 20:
-            return
-        level = self._LOG_LEVELS.get(msg.level, "?")
-        node_name = msg.name.split(".")[-1] if "." in msg.name else msg.name
-        color = C_ERROR if msg.level >= 40 else C_WARN if msg.level >= 30 else C_TEXT_DIM
-        safe_name = html.escape(node_name)
-        safe_message = html.escape(msg.msg[:160])
-        self.logs.append(
-            f'<span style="color:{color}">[{level}] {safe_name}: {safe_message}</span>'
-        )
+    def append_log(self, message, level=20):
+        self.recorder.log(LOG_LEVELS.get(level, str(level)), message)
+        stamp = time.strftime("%H:%M:%S")
+        self.logs.append(LogEntry(stamp, level, message))
+        self.log_revision += 1
+
+    def set_command_result(self, message, level=20):
+        self.recorder.record("command_result", {"level": level, "message": message})
+        self.last_command_msg = message
+        self.append_log(message, level)
 
     def _tick_hz(self) -> None:
         self.vicon_hz = float(self._vicon_count)
@@ -522,7 +657,7 @@ class StatusCard(QFrame):
             f"color:{C_TEXT_DIM}; font-size:11pt; font-weight:600; border:none;"
         )
         self._value = QLabel("—")
-        self._value.setFont(QFont("sans-serif", 22, QFont.Bold))
+        self._value.setFont(QFont(QApplication.font().family(), 22, QFont.Bold))
         self._value.setStyleSheet(f"color:{C_TEXT}; border:none;")
         self._detail = QLabel("데이터 대기 중")
         self._detail.setStyleSheet(f"color:{C_TEXT_DIM}; font-size:11pt; border:none;")
@@ -538,7 +673,7 @@ class StatusCard(QFrame):
         self._detail.setText(detail)
         self.setStyleSheet(
             f"QFrame#statusCard {{ background:{C_PANEL}; border:1px solid {C_BORDER}; "
-            f"border-left:4px solid {color}; border-radius:7px; }}"
+            "border-radius:18px; }"
         )
 
 
@@ -556,7 +691,7 @@ class ReadinessLight(QFrame):
             f"color:{C_TEXT_DIM}; font-size:11pt; font-weight:600; border:none;"
         )
         self._value = QLabel("—")
-        self._value.setFont(QFont("monospace", 13, QFont.Bold))
+        self._value.setFont(QFont(QApplication.font().family(), 13, QFont.Bold))
         self._value.setStyleSheet(f"color:{C_TEXT}; border:none;")
         layout.addWidget(name_label)
         layout.addWidget(self._value)
@@ -567,106 +702,513 @@ class ReadinessLight(QFrame):
         self._value.setStyleSheet(f"color:{color}; border:none;")
         self.setStyleSheet(
             f"QFrame#readyLight {{ background:{C_PANEL}; border:1px solid {C_BORDER}; "
-            f"border-left:5px solid {color}; border-radius:6px; }}"
+            "border-radius:11px; }"
         )
 
 
-def _make_button(text: str, color: str, *, big: bool = False) -> QPushButton:
-    """관제 콘솔용 버튼. 비활성 시 흐리게 표시된다."""
-    button = QPushButton(text)
-    button.setCursor(Qt.PointingHandCursor)
-    height = 64 if big else 44
-    font_size = 20 if big else 13
-    button.setMinimumHeight(height)
-    button.setStyleSheet(
-        f"""
-        QPushButton {{ background:{color}; color:#0b0f14; border:none; border-radius:7px;
-                       font-size:{font_size}pt; font-weight:700; padding:4px 10px; }}
-        QPushButton:hover {{ background:{color}; }}
-        QPushButton:disabled {{ background:{C_PANEL}; color:{C_IDLE};
-                                border:1px solid {C_BORDER}; }}
-        """
-    )
-    return button
+class TargetCoordinate(QDoubleSpinBox):
+    """Select the previous coordinate on the first click; later clicks move the cursor."""
+
+    def __init__(self):
+        super().__init__()
+        self._first_click = False
+        self.setLocale(QLocale.c())
+        self.setKeyboardTracking(False)
+        self.lineEdit().installEventFilter(self)
+
+    def focusInEvent(self, event):
+        self._first_click = event.reason() == Qt.MouseFocusReason
+        super().focusInEvent(event)
+
+    def eventFilter(self, watched, event):
+        handled = super().eventFilter(watched, event)
+        if (self._first_click and event.type() == QEvent.MouseButtonRelease
+                and event.button() == Qt.LeftButton):
+            self._first_click = False
+            if not self.lineEdit().hasSelectedText():
+                self.selectAll()
+        return handled
 
 
 class Dashboard(QMainWindow):
     """FSS 미션 관제용 실시간 대시보드."""
 
-    def __init__(self, node: DashboardNode, fps: int = 30) -> None:
+    def __init__(self, node: DashboardNode, fps: int = 30, history_sec: float = 30) -> None:
+        app = QApplication.instance()
+        if not app.property("fssFontLoaded"):
+            # Official desktop variable font from orioncactus/pretendard v1.3.9.
+            path = Path(__file__).parent / "assets" / "pretendard" / "PretendardVariable.ttf"
+            families = QFontDatabase.applicationFontFamilies(QFontDatabase.addApplicationFont(str(path)))
+            if families:
+                font = QFont(app.font())
+                font.setFamilies(families)
+                app.setFont(font)
+                app.setProperty("fssFontLoaded", True)
         super().__init__()
-        self._node = node
+        self._node = self._default_node = node
+        self._history_sec = history_sec
+        self._experiment_root = Path(__file__).resolve().parents[1] / "experiments"
+        self._links = {}
+        self._vehicle_settings = QSettings("FSS", "Mission Control")
+        self._trails = {}
+        self._link_errors = {}
+        self._last_rate = time.monotonic()
         self._series_bindings: list[tuple[pg.PlotDataItem, str, str]] = []
-        self._last_log_count = -1
+        self._log_view_key = None
 
         self.setWindowTitle("FSS Mission Control")
-        self.resize(1720, 1000)
-        self.setMinimumSize(1320, 820)
+        self.resize(1200, 760)
+        self.setMinimumSize(840, 520)
         self.setStyleSheet(
             f"""
-            QMainWindow, QWidget {{ background-color:{C_BG}; color:{C_TEXT}; }}
-            QLabel {{ color:{C_TEXT}; }}
+            QWidget {{ color:{C_TEXT}; font-size:14px; }}
+            QMainWindow, QDialog {{ background:{C_BG}; }}
+            QLabel {{ background:transparent; }}
             QFrame#panel {{ background:{C_PANEL}; border:1px solid {C_BORDER};
-                            border-radius:7px; }}
-            QTabWidget::pane {{ border:1px solid {C_BORDER}; background:{C_PANEL};
-                            border-radius:6px; }}
-            QTabBar::tab {{ background:{C_BG}; color:{C_TEXT_DIM}; padding:9px 20px;
-                            border:1px solid {C_BORDER}; border-bottom:none;
-                            font-size:12pt; font-weight:600; min-height:22px; }}
-            QTabBar::tab:selected {{ background:{C_PANEL}; color:{C_INFO};
-                                     border-bottom:2px solid {C_INFO}; }}
-            QTextEdit {{ background:{C_PANEL_ALT}; color:{C_TEXT};
-                         border:1px solid {C_BORDER}; font-family:monospace;
-                         font-size:10pt; padding:6px; }}
-            QSplitter::handle {{ background:{C_BG}; }}
+                            border-radius:18px; }}
+            QTabWidget::pane {{ background:{C_PANEL}; border:1px solid {C_BORDER};
+                               border-radius:11px; top:2px; }}
+            QTabBar::tab {{ color:{C_TEXT_DIM}; background:transparent; border:1px solid transparent;
+                            padding:7px 14px; margin:0px 3px 4px 0px; border-radius:15px; }}
+            QTabBar::tab:selected {{ color:{C_TEXT}; background:{C_PANEL}; border-color:{C_BORDER};
+                                     font-weight:600; }}
+            QTabBar::tab:hover:!selected {{ color:{C_INFO}; }}
+            QTabBar#vehicleSelector::tab {{ background:{C_PANEL}; color:{C_TEXT};
+                border:1px solid {C_BORDER}; border-radius:15px; margin:0 3px; padding:6px 13px; }}
+            QTabBar#vehicleSelector::tab:selected {{ background:{C_INFO}; border-color:{C_INFO};
+                color:{C_PANEL}; font-weight:600; }}
+            QTabBar#vehicleSelector::tab:hover:!selected {{ border-color:{C_FOCUS}; color:{C_INFO}; }}
+            QTextEdit {{ background:{C_PANEL_ALT}; color:{C_TEXT}; border:1px solid {C_BORDER};
+                         border-radius:8px; font-size:13px; padding:10px; }}
+            QPushButton, QLineEdit, QDoubleSpinBox, QComboBox {{
+                color:{C_TEXT}; background:{C_PANEL}; border:1px solid {C_BORDER};
+                border-radius:13px; min-height:22px; padding:4px 10px; }}
+            QComboBox::drop-down {{ width:22px; border:none; }}
+            QPushButton {{ color:{C_INFO}; border-radius:15px; padding:4px 13px; }}
+            QPushButton:hover {{ border-color:{C_INFO}; }}
+            QPushButton:focus, QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+                border:2px solid {C_FOCUS}; }}
+            QDoubleSpinBox QLineEdit {{
+                background:transparent; border:none; padding:0; min-height:0; }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                width:0; height:0; border:none; }}
+            QPushButton:pressed {{ background:{C_BG}; }}
+            QPushButton:checked, QPushButton#sendTarget {{ background:{C_INFO}; border-color:{C_INFO};
+                                         color:{C_PANEL}; font-weight:600; }}
+            QPushButton#emergencyStop {{ color:{C_ERROR}; border-color:{C_ERROR}; font-weight:600; }}
+            QPushButton#emergencyStop:pressed {{ background:{C_ERROR}; color:{C_PANEL}; }}
+            QPushButton:disabled, QPushButton#sendTarget:disabled, QPushButton#emergencyStop:disabled {{
+                background:{C_PANEL_ALT}; color:{C_IDLE}; border-color:{C_BORDER}; }}
+            QAbstractItemView {{ background:{C_PANEL}; color:{C_TEXT};
+                                 selection-background-color:{C_INFO}; selection-color:{C_PANEL}; }}
             """
         )
 
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(17, 12, 17, 17)
+        root.setSpacing(12)
 
-        root.addLayout(self._build_header())
-        root.addWidget(self._build_control_bar())
-
-        top_splitter = QSplitter(Qt.Horizontal)
-        top_splitter.setChildrenCollapsible(False)
-        top_splitter.addWidget(self._build_trajectory_panel())
-        top_splitter.addWidget(self._build_right_column())
-        top_splitter.setStretchFactor(0, 7)
-        top_splitter.setStretchFactor(1, 3)
-        root.addWidget(top_splitter, stretch=3)
-
+        root.addLayout(self._build_connections())
+        views = QStackedWidget()
+        overview = QWidget()
+        panels = QHBoxLayout(overview)
+        panels.setContentsMargins(12, 12, 12, 12)
+        panels.setSpacing(12)
+        panels.addWidget(self._build_trajectory_panel(), stretch=1)
+        sidebar = QVBoxLayout()
+        tools = QWidget()
+        tool_layout = QVBoxLayout(tools)
+        tool_layout.setSizeConstraint(QLayout.SetMinAndMaxSize)
+        tool_layout.setContentsMargins(0, 0, 0, 0)
+        self._controls = self._build_control_bar()
+        tool_layout.addWidget(self._controls)
+        tool_layout.addWidget(self._build_valve_plot())
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setSizeAdjustPolicy(QScrollArea.AdjustToContents)
+        scroll.setWidget(tools)
+        scroll.setMaximumHeight(tool_layout.sizeHint().height())
+        sidebar.addWidget(scroll, stretch=1)
+        console_row = QHBoxLayout()
+        self._console_tabs = QTabBar()
+        self._console_tabs.setExpanding(False)
+        self._console_tabs.setDrawBase(False)
+        self._console_tabs.currentChanged.connect(self._select_console)
+        console_row.addWidget(self._console_tabs, stretch=1)
+        self._add_shell = QPushButton("+")
+        self._add_shell.setToolTip("새 SSH 터미널")
+        self._add_shell.setAccessibleName("새 SSH 터미널")
+        self._add_shell.clicked.connect(self._new_terminal)
+        console_row.addWidget(self._add_shell)
+        self._close_shell = QPushButton("셸 닫기")
+        self._close_shell.clicked.connect(self._close_terminal)
+        console_row.addWidget(self._close_shell)
+        sidebar.addLayout(console_row)
+        self._console = QStackedWidget()
+        self._terminal = TerminalView()
+        self._console.addWidget(self._terminal)
+        sidebar.addWidget(self._console, stretch=2)
+        panels.addLayout(sidebar, stretch=1)
+        views.addWidget(overview)
         self._tabs = self._build_detail_tabs()
-        root.addWidget(self._tabs, stretch=2)
+        self._arm_tab = self._tabs.addTab(self._build_arm_detail(), "로봇팔")
+        self._log_panel = QWidget()
+        log_layout = QVBoxLayout(self._log_panel)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("최소 레벨"))
+        self._log_level = QComboBox()
+        self._log_level.setAccessibleName("로그 최소 레벨")
+        for level, label in LOG_LEVELS.items():
+            self._log_level.addItem(label, level)
+        self._log_level.setCurrentIndex(self._log_level.findData(20))
+        filter_row.addWidget(self._log_level)
+        filter_row.addStretch()
+        log_layout.addLayout(filter_row)
+        self._log_text = QTextEdit()
+        self._log_text.setReadOnly(True)
+        log_layout.addWidget(self._log_text)
+        self._log_level.currentIndexChanged.connect(self._update_logs)
+        self._console.addWidget(self._log_panel)
+        self._local_console = "log" if self._default_node.request else 1
+        self._bind_console(None)
+        diagnostics = QWidget()
+        details = QVBoxLayout(diagnostics)
+        details.addLayout(self._build_header())
+        detail_row = QHBoxLayout()
+        detail_row.addWidget(self._build_readiness_panel())
+        detail_row.addWidget(self._build_summary_panel())
+        details.addLayout(detail_row)
+        self._tabs.addTab(diagnostics, "상태")
+        views.addWidget(self._tabs)
+        root.addWidget(views)
+
+        footer = QHBoxLayout()
+        self._position_summary = QLabel()
+        footer.addWidget(self._position_summary)
+        footer.addStretch()
+        self._experiment_button = QPushButton("실험 시작")
+        self._experiment_button.setToolTip("선택한 FSS 데이터 기록")
+        self._experiment_button.clicked.connect(self._toggle_experiment)
+        footer.addWidget(self._experiment_button)
+        self._sensors = QLabel()
+        footer.addWidget(self._sensors)
+        detail_button = QPushButton("상세")
+        detail_button.setCheckable(True)
+        detail_button.toggled.connect(lambda show: views.setCurrentIndex(int(show)))
+        detail_button.toggled.connect(lambda show: detail_button.setText("관제로" if show else "상세"))
+        footer.addWidget(detail_button)
+        root.addLayout(footer)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._update)
         self._timer.start(max(16, round(1000 / max(1, fps))))
 
+    def _bind_console(self, link):
+        self._console_link = link
+        sessions = link.shells.sessions if link else {1: None}
+        selected = link.shells.selected if link else self._local_console
+        tabs = self._console_tabs
+        tabs.blockSignals(True)
+        while tabs.count():
+            tabs.removeTab(0)
+        for key in [*sessions, "log"]:
+            title = "로그" if key == "log" else ("SSH" if key == 1 else f"SSH {key}")
+            index = tabs.addTab(title)
+            tabs.setTabData(index, key)
+            if key == selected:
+                tabs.setCurrentIndex(index)
+        tabs.blockSignals(False)
+        self._select_console(tabs.currentIndex())
+
+    def _select_console(self, index):
+        link = self._console_link
+        key = self._console_tabs.tabData(index)
+        if link:
+            link.shells.selected = key
+        else:
+            self._local_console = key
+        self._console.setCurrentWidget(self._log_panel if key == "log" else self._terminal)
+        self._terminal.bind(link.shells.sessions.get(key) if link else None)
+        self._add_shell.setEnabled(link is not None and not link.stopped.is_set())
+        self._close_shell.setVisible(link is not None and isinstance(key, int) and key > 1)
+
+    def _new_terminal(self):
+        link = self._console_link
+        if link and link.shells.add() is not None:
+            self._bind_console(link)
+            self._terminal.setFocus()
+
+    def _close_terminal(self):
+        link = self._console_link
+        if link:
+            link.shells.remove(link.shells.selected)
+            self._bind_console(link)
+
+    def _build_connections(self):
+        row = QHBoxLayout()
+        self._vehicles = QTabBar()
+        self._vehicles.setObjectName("vehicleSelector")
+        self._vehicles.setExpanding(False)
+        self._vehicles.setDrawBase(False)
+        self._disconnect_button = QPushButton("연결 해제")
+        self._disconnect_button.hide()
+        self._disconnect_button.clicked.connect(lambda: self._disconnect_jetson(self._vehicles.currentIndex()))
+        self._vehicles.currentChanged.connect(self._select_vehicle)
+        if self._default_node.request:
+            self._vehicles.addTab("로컬 ROS")
+        add = QPushButton("+ FSS 연결")
+        add.clicked.connect(self._connect_dialog)
+        row.addWidget(add)
+        row.addWidget(self._vehicles)
+        row.addWidget(self._disconnect_button)
+        row.addStretch()
+        self._release_estop = QPushButton("정지 해제")
+        self._release_estop.clicked.connect(self._reset_estop)
+        self._release_estop.hide()
+        row.addWidget(self._release_estop)
+        self._btn_estop = QPushButton("비상 정지")
+        self._btn_estop.setObjectName("emergencyStop")
+        self._btn_estop.clicked.connect(lambda: self._node.request_mode(MODE_ESTOP))
+        row.addWidget(self._btn_estop)
+        return row
+
+    def _reset_estop(self):
+        if self._node.mode_name == "EMERGENCY_STOP" and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC:
+            self._node.request_mode(MODE_IDLE)
+
+    def _read_target(self):
+        for editor in (self._target_x, self._target_y, self._target_yaw):
+            editor.interpretText()
+        return (self._controller.checkedButton().text(), self._target_x.value(),
+                self._target_y.value(), self._target_yaw.value())
+
+    def _send_target(self):
+        if self._node.request and self._send_target_button.isEnabled():
+            controller, x, y, yaw = self._read_target()
+            self._node.send_command("target", [controller.lower(), x, y, math.radians(yaw)])
+
+    def _selected_can_record(self):
+        endpoint = self._vehicles.tabData(self._vehicles.currentIndex())
+        link = self._links.get(endpoint)
+        return link.ready and not link.stopped.is_set() if link else self._default_node.request is not None
+
+    def _toggle_experiment(self):
+        node = self._node
+        endpoint = self._vehicles.tabData(self._vehicles.currentIndex())
+        link = self._links.get(endpoint)
+        if node.recorder.active:
+            if link:
+                link.drain()
+            self._stop_experiment(node, "operator")
+        elif self._selected_can_record():
+            last = self._vehicle_settings.value("experiments/last_name", "default", type=str)
+            name, accepted = QInputDialog.getText(self, "실험 시작", "실험 이름", text=last)
+            if not accepted or node is not self._node:
+                return
+            if link:
+                link.drain()
+            if not self._selected_can_record():
+                return
+            vehicle = (link.display_id or endpoint) if link else "local"
+            try:
+                directory = node.recorder.start(self._experiment_root, name.strip(), vehicle)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "실험 기록", str(exc))
+                return
+            self._vehicle_settings.setValue("experiments/last_name", name.strip())
+            node.reported_recording_error = ""
+            node.append_log(f"실험 기록 시작 · {directory}")
+        self._update()
+
+    @staticmethod
+    def _stop_experiment(node, reason):
+        if node.recorder.active:
+            try:
+                directory = node.recorder.stop(reason)
+            except OSError as exc:
+                node.reported_recording_error = node.recorder.error
+                node.set_command_result(f"실험 저장 실패 · {exc}", 40)
+            else:
+                node.append_log(f"실험 저장 · {directory}")
+
+    @staticmethod
+    def _report_recording_error(node):
+        if node.recorder.error and node.reported_recording_error != node.recorder.error:
+            node.reported_recording_error = node.recorder.error
+            node.set_command_result(f"실험 저장 실패 · {node.recorder.error}", 40)
+
+    def _connect_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("FSS 연결")
+        form = QFormLayout(dialog)
+        host = QLineEdit("192.168.0.9")
+        display_id = QLineEdit()
+        display_id.setPlaceholderText("예: FSS-1")
+        display_id.setMaxLength(32)
+        arm = QCheckBox("로봇팔 장착")
+
+        def load_profile(address):
+            endpoint = address.strip()
+            display_id.setText(self._vehicle_settings.value(f"ids/{endpoint}", "", type=str))
+            arm.setChecked(self._vehicle_settings.value(f"arm_equipped/{endpoint}", True, type=bool))
+
+        host.textEdited.connect(load_profile)
+        load_profile(host.text())
+        user = QLineEdit("smrl")
+        password = QLineEdit()
+        password.setEchoMode(QLineEdit.Password)
+        for label, field in (("SSH 주소", host), ("FSS ID (선택)", display_id),
+                             ("SSH 계정", user), ("암호", password)):
+            form.addRow(label, field)
+        monitor = QCheckBox("모니터링만")
+        form.addRow("", arm)
+        form.addRow("", monitor)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("연결")
+        buttons.button(QDialogButtonBox.Cancel).setText("취소")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        password.setFocus()
+        if dialog.exec() and host.text().strip() and user.text().strip():
+            self.add_jetson(host.text().strip(), user.text().strip(), None, password.text(),
+                            display_id.text(), monitor_only=monitor.isChecked(), arm_equipped=arm.isChecked())
+
+    def add_jetson(self, host, user, domain, password, display_id=None, monitor_only=False, arm_equipped=None):
+        endpoint = host if domain is None else f"{host} / {domain}"
+        arm_key = f"arm_equipped/{endpoint}"
+        if arm_equipped is None:
+            arm_equipped = self._vehicle_settings.value(arm_key, True, type=bool)
+        else:
+            self._vehicle_settings.setValue(arm_key, arm_equipped)
+        key = f"ids/{endpoint}"
+        if display_id is None:
+            display_id = self._vehicle_settings.value(key, "", type=str)
+        else:
+            display_id = display_id.strip()
+            if display_id:
+                self._vehicle_settings.setValue(key, display_id)
+            else:
+                self._vehicle_settings.remove(key)
+        for i in range(self._vehicles.count()):
+            if self._vehicles.tabData(i) == endpoint:
+                self._vehicles.setCurrentIndex(i)
+                existing = self._links[endpoint]
+                profile_changed = existing.display_id != display_id or existing.data.arm_equipped != arm_equipped
+                existing.display_id = display_id
+                existing.data.arm_equipped = arm_equipped
+                shells_finished = all(shell.finished for shell in existing.shells.sessions.values())
+                if (existing.ssh_user == user and existing.monitor_only == monitor_only
+                        and endpoint not in self._link_errors
+                        and (profile_changed or not (existing.bridge_error or shells_finished
+                                             or (existing.read_only and not monitor_only)))):
+                    self._update()
+                    return
+                self._disconnect_jetson(i)
+                break
+        link = JetsonLink(DashboardNode(self._history_sec), monitor_only=monitor_only)
+        link.ssh_user = user
+        link.display_id = display_id
+        link.data.arm_equipped = arm_equipped
+        link.data.append_log(f"{host} 연결 중")
+        self._links[endpoint] = link
+        link.data.request = link.request
+        link.trust.connect(self._confirm_key)
+        link.changed.connect(self._connection_error)
+        index = self._vehicles.addTab(endpoint)
+        self._vehicles.setTabData(index, endpoint)
+        self._vehicles.setCurrentIndex(index)
+        self._select_vehicle(index)
+        colors = [C_EKF, C_WARN, C_VICON, "#7048a2", "#a7376d"]
+        color = colors[(len(self._links) - 1) % len(colors)]
+        trail = self._xy_plot.plot(pen=pg.mkPen(color, width=2))
+        marker = VehicleBubble()
+        self._xy_plot.addItem(marker)
+        self._trails[endpoint] = trail, marker
+        link.start(host, user, domain, password)
+
+    def _confirm_key(self, link, host, fingerprint):
+        if not link.stopped.is_set():
+            link.accepted = QMessageBox.question(
+                self, "처음 연결하는 FSS", f"{host}의 SSH 키를 신뢰할까요?\nSHA256:{fingerprint}"
+            ) == QMessageBox.Yes
+        link.decision.set()
+
+    def _connection_error(self, message):
+        link = self.sender()
+        for endpoint, candidate in self._links.items():
+            if candidate is link:
+                self._link_errors[endpoint] = message
+                link.drain()
+                self._stop_experiment(link.data, "connection_error")
+                link.close()
+                for shell in link.shells.sessions.values():
+                    if not shell.finished:
+                        shell.status = f"SSH: {message}"
+                if self._console_link is link:
+                    self._add_shell.setEnabled(False)
+                link.data.set_command_result(message, 40)
+                break
+
+    def _select_vehicle(self, index):
+        link = self._links.get(self._vehicles.tabData(index)) if index >= 0 else None
+        self._disconnect_button.setVisible(link is not None)
+        chosen = link.data if link else self._default_node
+        changed = chosen is not self._node
+        if changed and hasattr(self, "_target_x"):
+            self._node.target_draft = self._read_target()
+        self._node = chosen
+        if hasattr(self, "_log_panel"):
+            self._bind_console(link)
+        if changed and hasattr(self, "_target_x"):
+            controller, x, y, yaw = self._node.target_draft
+            self._controller.button(0 if controller == "PID" else 1).setChecked(True)
+            for field, value in ((self._target_x, x), (self._target_y, y), (self._target_yaw, yaw)):
+                field.setValue(value)
+        self._log_view_key = None
+        if hasattr(self, "_command_status"):
+            self._log_text.clear()
+            self._command_status.setText(self._node.last_command_msg)
+            for curve in (self._vicon_curve, self._ref_curve, self._position_dot, self._target_dot):
+                curve.setData([], [])
+            for curve, _, _ in self._series_bindings:
+                curve.setData([], [])
+            self._update()
+
+    def _disconnect_jetson(self, index):
+        endpoint = self._vehicles.tabData(index)
+        link = self._links.pop(endpoint, None)
+        if link:
+            link.drain()
+            self._stop_experiment(link.data, "disconnect")
+            link.close()
+            self._link_errors.pop(endpoint, None)
+            for item in self._trails.pop(endpoint):
+                self._xy_plot.removeItem(item)
+            self._vehicles.removeTab(index)
+            self._select_vehicle(self._vehicles.currentIndex())
+
+    def closeEvent(self, event):
+        self._stop_experiment(self._default_node, "window_closed")
+        for link in self._links.values():
+            link.drain()
+            self._stop_experiment(link.data, "window_closed")
+            link.close()
+        super().closeEvent(event)
+
     def _build_header(self) -> QHBoxLayout:
         layout = QHBoxLayout()
         layout.setSpacing(8)
 
-        title_box = QVBoxLayout()
-        title = QLabel("FSS")
-        title.setFont(QFont("sans-serif", 28, QFont.Bold))
-        title.setStyleSheet(f"color:{C_TEXT};")
-        subtitle = QLabel("MISSION CONTROL")
-        subtitle.setStyleSheet(
-            f"color:{C_TEXT_DIM}; font-size:11pt; font-weight:600; letter-spacing:2px;"
-        )
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        title_box.addStretch()
-        layout.addLayout(title_box, stretch=2)
-
         self._card_mode = StatusCard("Mode")
         self._card_nav = StatusCard("Navigation")
         self._card_act = StatusCard("Actuators")
-        self._card_main = StatusCard("Main valve")
+        self._card_main = StatusCard("에어베어링")
         self._card_timing = StatusCard("Data link")
         for card in (
             self._card_mode,
@@ -679,59 +1221,79 @@ class Dashboard(QMainWindow):
         return layout
 
     def _build_control_bar(self) -> QWidget:
-        """E-STOP + 모드 스테퍼 + RESET + 에어베어링 토글 + 명령 상태."""
         bar = QFrame()
         bar.setObjectName("panel")
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(10)
-
-        self._btn_estop = _make_button("E-STOP", C_ERROR, big=True)
-        self._btn_estop.setMinimumWidth(190)
-        self._btn_estop.clicked.connect(lambda: self._node.request_mode(MODE_ESTOP))
-        layout.addWidget(self._btn_estop)
-
-        # 모드 스테퍼 (준비도 미충족 시 비활성)
-        self._btn_pressurize = _make_button("① PRESSURIZE", C_WARN)
-        self._btn_pressurize.clicked.connect(lambda: self._node.request_mode(MODE_PRESSURIZING))
-        self._btn_ready = _make_button("② READY", C_INFO)
-        self._btn_ready.clicked.connect(lambda: self._node.request_mode(MODE_READY))
-        self._btn_active = _make_button("③ ACTIVE", C_OK)
-        self._btn_active.clicked.connect(lambda: self._node.request_mode(MODE_ACTIVE))
-        self._btn_abort = _make_button("ABORT → HOLD", C_WARN)
-        self._btn_abort.clicked.connect(lambda: self._node.request_mode(MODE_SAFE_HOLD))
-        self._btn_reset = _make_button("RESET → IDLE", C_INFO)
-        self._btn_reset.clicked.connect(lambda: self._node.request_mode(MODE_IDLE))
-        for button in (
-            self._btn_pressurize, self._btn_ready, self._btn_active,
-            self._btn_abort, self._btn_reset,
-        ):
-            layout.addWidget(button)
-
-        # 에어베어링(메인 밸브) 토글
-        self._btn_air_on = _make_button("AIR ON", C_OK)
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(3)
+        bar.setStyleSheet("QPushButton {padding: 2px 7px;} QDoubleSpinBox {padding: 2px 4px;}")
+        commands = QHBoxLayout()
+        commands.setSpacing(3)
+        commands.addWidget(QLabel("제어기"))
+        self._controller = QButtonGroup(bar)
+        for index, label in enumerate(("PID", "LQR")):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            self._controller.addButton(button, index)
+            button.setChecked(index == 0)
+            commands.addWidget(button)
+        commands.addStretch()
+        commands.addWidget(QLabel("에어베어링"))
+        self._btn_air_on = QPushButton("ON")
+        self._btn_air_off = QPushButton("OFF")
         self._btn_air_on.clicked.connect(lambda: self._node.request_main_valve(True))
-        self._btn_air_off = _make_button("AIR OFF", C_TEXT_DIM)
         self._btn_air_off.clicked.connect(lambda: self._node.request_main_valve(False))
-        layout.addWidget(self._btn_air_on)
-        layout.addWidget(self._btn_air_off)
+        commands.addWidget(self._btn_air_on)
+        commands.addWidget(self._btn_air_off)
+        layout.addLayout(commands)
 
-        layout.addStretch()
+        targets = QGridLayout()
+        targets.setVerticalSpacing(0)
+        targets.setHorizontalSpacing(3)
+        self._target_x, self._target_y, self._target_yaw = (TargetCoordinate() for _ in range(3))
+        for col, (field, label, low, high, decimals, step) in enumerate((
+            (self._target_x, "X (m)", 0, 3, 3, 0.01),
+            (self._target_y, "Y (m)", 0, 4, 3, 0.01),
+            (self._target_yaw, "Yaw (°)", -180, 180, 1, 1),
+        )):
+            field.setRange(low, high)
+            field.setDecimals(decimals)
+            field.setSingleStep(step)
+            field.lineEdit().setTextMargins(2, 0, 2, 0)
+            field.setAccessibleName(label)
+            caption = QLabel(label)
+            caption.setBuddy(field)
+            targets.addWidget(caption, 0, col)
+            targets.addWidget(field, 1, col)
+        self._send_target_button = QPushButton("목표 전송")
+        self._send_target_button.setObjectName("sendTarget")
+        self._send_target_button.clicked.connect(self._send_target)
+        targets.addWidget(self._send_target_button, 1, 3)
+        layout.addLayout(targets)
         self._command_status = QLabel("")
         self._command_status.setWordWrap(True)
-        self._command_status.setMinimumWidth(240)
-        self._command_status.setStyleSheet(f"color:{C_TEXT_DIM}; font-size:11pt; border:none;")
+        self._command_status.hide()
         layout.addWidget(self._command_status)
         return bar
 
-    def _build_right_column(self) -> QWidget:
-        column = QWidget()
-        layout = QVBoxLayout(column)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        layout.addWidget(self._build_readiness_panel())
-        layout.addWidget(self._build_summary_panel(), stretch=1)
-        return column
+    def _build_valve_plot(self):
+        plot = pg.PlotWidget()
+        plot.setMaximumHeight(155)
+        plot.setMinimumHeight(105)
+        plot.setXRange(0.5, 8.5, padding=0)
+        plot.setYRange(0, 1, padding=0)
+        plot.setMouseEnabled(x=False, y=False)
+        plot.hideButtons()
+        _style_plot(plot, "밸브 명령", grid_x=False, grid_y=False)
+        plot.getAxis("left").setStyle(hideOverlappingLabels=False)
+        for value in (0.5, 1):
+            plot.addLine(y=value, pen=pg.mkPen(C_BORDER))
+        plot.getAxis("left").setTicks([[(0, "0"), (0.5, "0.5"), (1, "1")]])
+        channels = np.arange(1, 9)
+        plot.getAxis("bottom").setTicks([[(int(ch), str(ch)) for ch in channels]])
+        self._valve_cmd_bar = pg.BarGraphItem(x=channels, height=np.zeros(8), width=0.65, brush=C_INFO, pen=pg.mkPen(None))
+        plot.addItem(self._valve_cmd_bar)
+        return plot
 
     def _build_readiness_panel(self) -> QWidget:
         panel = QFrame()
@@ -740,8 +1302,8 @@ class Dashboard(QMainWindow):
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(8)
         title = QLabel("서브시스템 준비도")
-        title.setFont(QFont("sans-serif", 14, QFont.Bold))
-        title.setStyleSheet(f"color:{C_INFO}; border:none;")
+        title.setFont(QFont(QApplication.font().family(), 14, QFont.Bold))
+        title.setStyleSheet(f"color:{C_TEXT}; border:none;")
         layout.addWidget(title)
 
         grid = QGridLayout()
@@ -765,53 +1327,175 @@ class Dashboard(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        self._xy_plot = pg.PlotWidget()
-        self._xy_plot.setAspectLocked(True)
-        self._xy_plot.setXRange(-2.0, 2.0)
-        self._xy_plot.setYRange(-1.5, 1.5)
+        self._xy_plot = TablePlot()
+        self._plan_picker = QComboBox()
+        self._plan_picker.setAccessibleName("실험 기준 경로")
+        self._plan_picker.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._plan_picker.setMinimumContentsLength(14)
+        self._plan_picker.activated.connect(self._choose_plan)
+        self._plan_picker.hide()
+        layout.addWidget(self._plan_picker)
+        self._picker_catalog = None
+        self._drawn_plan = None
+        self._drawn_elapsed = None
         _style_plot(
             self._xy_plot,
-            "XY 궤적",
+            "",
             x_label="X [m]",
             y_label="Y [m]",
+            grid_x=False,
+            grid_y=False,
         )
-        _add_readable_legend(self._xy_plot, (10, 10))
+        grid_pen = pg.mkPen(C_BORDER)
+        for x in (0.5, 1, 1.5, 2, 2.5, 3):
+            self._xy_plot.addLine(x=x, pen=grid_pen).setZValue(-2)
+        for y in (0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4):
+            self._xy_plot.addLine(y=y, pen=grid_pen).setZValue(-2)
+        corners = QPainterPath()
+        for x, dx in ((0, 0.18), (3, -0.18)):
+            for y, dy in ((0, 0.18), (4, -0.18)):
+                corners.moveTo(x + dx, y)
+                corners.lineTo(x, y)
+                corners.lineTo(x, y + dy)
+        self._table_corners = pg.QtWidgets.QGraphicsPathItem(corners)
+        self._table_corners.setPen(pg.mkPen(C_TEXT_DIM, width=8))
+        self._table_corners.setZValue(-1)
+        self._xy_plot.addItem(self._table_corners, ignoreBounds=True)
+        self._xy_plot.setTitle(None)
+        self._plan_curve = self._xy_plot.plot(pen=pg.mkPen("#b9b9c0", width=1.5, style=Qt.DashLine))
+        self._elapsed_plan_curve = self._xy_plot.plot(pen=pg.mkPen("#cc302d", width=2.4, style=Qt.DashLine))
 
         self._vicon_curve = self._xy_plot.plot(
-            pen=None,
+            pen=pg.mkPen(C_VICON, width=1.5),
             symbol="o",
-            symbolSize=4,
+            symbolSize=3,
             symbolBrush=C_VICON,
             symbolPen=None,
-            name="Vicon",
-        )
-        self._ekf_curve = self._xy_plot.plot(
-            pen=pg.mkPen(C_EKF, width=2.6), name="EKF"
         )
         self._ref_curve = self._xy_plot.plot(
-            pen=pg.mkPen(C_REFERENCE, width=2.2, style=Qt.DashLine), name="Reference"
+            pen=pg.mkPen(C_REFERENCE, width=2.2, style=Qt.DashLine)
         )
+
+        self._target_dot = self._xy_plot.plot(pen=None, symbol="+", symbolSize=16, symbolBrush=C_REFERENCE)
 
         self._spacecraft_body = pg.QtWidgets.QGraphicsRectItem(
             -BODY_HALF_W, -BODY_HALF_W, BODY_HALF_W * 2, BODY_HALF_W * 2
         )
         self._spacecraft_body.setPen(pg.mkPen(C_TEXT_DIM, width=1.5))
-        self._spacecraft_body.setBrush(QBrush(QColor(48, 54, 61, 150)))
+        self._spacecraft_body.setBrush(QBrush(QColor(29, 29, 31, 45)))
         self._xy_plot.addItem(self._spacecraft_body)
 
         self._spacecraft_front = pg.QtWidgets.QGraphicsLineItem(0, 0, 0, 0)
-        self._spacecraft_front.setPen(pg.mkPen(C_ERROR, width=3))
+        self._spacecraft_front.setPen(pg.mkPen(C_TEXT, width=3))
         self._xy_plot.addItem(self._spacecraft_front)
         self._position_dot = self._xy_plot.plot(
             pen=None,
             symbol="o",
             symbolSize=10,
-            symbolBrush=C_EKF,
+            symbolBrush=C_VICON,
             symbolPen=pg.mkPen("#ffffff", width=1),
         )
 
+        self._arm_links = self._arm_curve(self._xy_plot)
+        self._gripper_link = self._xy_plot.plot(pen=pg.mkPen(C_ARM, width=3))
+        self._arm_trace = self._xy_plot.plot(pen=pg.mkPen(C_ARM, width=2, style=Qt.DashLine), connect="finite")
+        self._arm_tip = self._xy_plot.plot(pen=None, symbol="d", symbolSize=8, symbolBrush=C_ARM)
+        self._local_bubble = VehicleBubble()
+        self._xy_plot.addItem(self._local_bubble, ignoreBounds=True)
         layout.addWidget(self._xy_plot)
         return panel
+
+    @staticmethod
+    def _arm_curve(plot):
+        return plot.plot(pen=pg.mkPen(C_ARM, width=3), symbol="o", symbolSize=6,
+                         symbolBrush=C_ARM, symbolPen=pg.mkPen("#ffffff"))
+
+    def _build_arm_detail(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        self._arm_readout = QLabel("관절 데이터 대기")
+        self._arm_readout.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._arm_readout)
+        self._cad_choice = QCheckBox("fss-fsw CAD (+X) · 관절각으로 보기")
+        self._cad_choice.clicked.connect(self._select_arm_cad)
+        layout.addWidget(self._cad_choice, alignment=Qt.AlignCenter)
+        plot = pg.PlotWidget()
+        _style_plot(plot, "본체 기준", x_label="X [m]", y_label="Y [m]")
+        plot.setAspectLocked()
+        plot.setRange(xRange=(-0.65, 0.65), yRange=(-0.65, 0.65), padding=0)
+        self._arm_model = self._arm_curve(plot)
+        self._wrist_direction = pg.ArrowItem(brush=C_ARM, pen=None, headLen=13)
+        plot.addItem(self._wrist_direction)
+        layout.addWidget(plot)
+        return panel
+
+    def _select_arm_cad(self, checked):
+        self._node.arm_local_cad = checked
+        self._update_arm()
+
+    @staticmethod
+    def _draw_arm(curve, shape, age):
+        xs, ys = zip(*shape[0]) if shape else ([], [])
+        color = C_IDLE if age > ARM_TIMEOUT_SEC else C_ARM
+        curve.setData(xs, ys, pen=pg.mkPen(color, width=3), symbolBrush=color)
+
+    def _update_arm(self):
+        node = self._node
+        if node is self._default_node:
+            self._local_bubble.show_vehicle(node)
+        else:
+            self._local_bubble.hide()
+        age_table = node.source_age("arm_table")
+        age_tcp = node.source_age("arm_tcp")
+        age_joints = node.source_age("arm_joints")
+        age_base = node.source_age("arm_base")
+        joints = node.arm_joints if age_joints < XY_TRAIL_SEC else None
+        table = node.arm_table if age_table < XY_TRAIL_SEC else None
+        base = node.arm_base if age_base < XY_TRAIL_SEC else None
+        tip = node.arm_tcp if age_tcp < XY_TRAIL_SEC else None
+        shown = node.arm_equipped and bool(self._links or node.request or joints or base or table or tip)
+        self._tabs.setTabVisible(self._arm_tab, shown)
+        trace = node.arm_tcp_trail.coordinates() if shown else ([], [])
+        self._arm_trace.setData(*trace)
+        if not shown:
+            tip = table = joints = base = None
+        paired = False
+        if tip and table and node.arm_gripper_pair is not None:
+            # The two standard ROS messages can straddle a GUI redraw.
+            aligned = node.arm_tcp_stamp is not None and node.arm_tcp_stamp == node.arm_table_stamp
+            paired = aligned or node.source_age("arm_pair") < 0.15
+            if paired:
+                table, tip = node.arm_gripper_pair
+        tip_color = C_IDLE if age_tcp > ARM_TIMEOUT_SEC else C_ARM
+        self._arm_tip.setData([tip[0]] if tip else [], [tip[1]] if tip else [],
+                              symbolBrush=tip_color, symbolPen=tip_color)
+        self._draw_arm(self._arm_links, table, age_table)
+        xs, ys = zip(table[0][-1], tip) if paired else ([], [])
+        self._gripper_link.setData(xs, ys, pen=pg.mkPen(tip_color, width=3))
+        selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
+        workspace = (selected.workspace or PREFERRED_WORKSPACE) if selected else PREFERRED_WORKSPACE
+        legacy = workspace == "FSS_FSW" or bool(selected and "hardware_runtime" in selected.read_only)
+        self._cad_choice.setVisible(bool(joints and not base and not legacy))
+        self._cad_choice.setChecked(node.arm_local_cad)
+        use_cad = joints and node.arm_local_cad and not legacy
+        detail = base or (encoder_model(joints) if use_cad else None)
+        age_detail = age_base if base else age_joints
+        self._draw_arm(self._arm_model, detail, age_detail)
+        if joints:
+            angle_text = "   ".join(f"{label} {math.degrees(q):.1f}°" for label, q in zip(JOINT_LABELS, joints))
+        else:
+            angle_text = ""
+        frame = "본체 기준" if base else "fss-fsw CAD (+X)" if detail else "자세 대기"
+        source = f" · {node.arm_source}" if joints or table or base or tip else ""
+        def held(age):
+            return f" · 마지막 수신 {age:.0f}초 전" if math.isfinite(age) and age > ARM_TIMEOUT_SEC else ""
+        self._arm_readout.setText(f"{frame}{source}{held(age_detail) if detail else ''}   {angle_text}".strip())
+        self._wrist_direction.setVisible(bool(detail))
+        if detail:
+            points, heading = detail
+            self._wrist_direction.setPos(*points[-1])
+            self._wrist_direction.setStyle(angle=180 - math.degrees(heading),
+                                           brush=C_IDLE if age_detail > ARM_TIMEOUT_SEC else C_ARM)
 
     def _build_summary_panel(self) -> QWidget:
         panel = QFrame()
@@ -823,8 +1507,8 @@ class Dashboard(QMainWindow):
         layout.setSpacing(8)
 
         title = QLabel("현재 / 목표 / 오차")
-        title.setFont(QFont("sans-serif", 15, QFont.Bold))
-        title.setStyleSheet(f"color:{C_INFO}; border:none;")
+        title.setFont(QFont(QApplication.font().family(), 15, QFont.Bold))
+        title.setStyleSheet(f"color:{C_TEXT}; border:none;")
         layout.addWidget(title)
 
         grid = QGridLayout()
@@ -839,13 +1523,12 @@ class Dashboard(QMainWindow):
             ("목표 방향", "target_heading"),
             ("방향 오차", "heading_error"),
             ("속도", "velocity"),
-            ("명령 렌치", "wrench"),
         ]
         for row, (name, key) in enumerate(rows):
             name_label = QLabel(name)
             name_label.setStyleSheet(f"color:{C_TEXT_DIM}; font-size:12pt; border:none;")
             value_label = QLabel("—")
-            value_label.setFont(QFont("monospace", 16, QFont.Bold))
+            value_label.setFont(QFont(QApplication.font().family(), 16, QFont.Bold))
             value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             value_label.setStyleSheet(f"color:{C_TEXT}; border:none;")
             grid.addWidget(name_label, row, 0)
@@ -978,8 +1661,8 @@ class Dashboard(QMainWindow):
             self._make_plot(
                 "테이블 프레임 속도",
                 [
-                    SeriesSpec("t_e", "vx_e", "vx", "#ff7b72"),
-                    SeriesSpec("t_e", "vy_e", "vy", "#d2a8ff"),
+                    SeriesSpec("t_e", "vx_e", "vx", C_ERROR),
+                    SeriesSpec("t_e", "vy_e", "vy", "#7048a2"),
                 ],
                 "m/s",
                 min_y_span=0.1,
@@ -1029,64 +1712,6 @@ class Dashboard(QMainWindow):
         )
         tabs.addTab(quality_tab, "추정 품질")
 
-        valve_tab = QWidget()
-        valve_layout = QHBoxLayout(valve_tab)
-        valve_layout.setContentsMargins(6, 6, 6, 6)
-
-        self._valve_plot = pg.PlotWidget()
-        self._valve_plot.setYRange(0.0, 1.05)
-        _style_plot(
-            self._valve_plot,
-            "밸브 명령 / 적용값",
-            y_label="정규화 값",
-            grid_x=False,
-        )
-        _add_readable_legend(self._valve_plot, (8, 8), 2)
-        valve_labels = ["+X₁", "+X₂", "−X₁", "−X₂", "+Y₁", "+Y₂", "−Y₁", "−Y₂"]
-        self._valve_plot.getAxis("bottom").setTicks(
-            [[(index, label) for index, label in enumerate(valve_labels)]]
-        )
-        self._valve_cmd_bar = pg.BarGraphItem(
-            x=np.arange(8) - 0.18,
-            height=self._node.valve_cmd,
-            width=0.32,
-            brush=C_WRENCH_POS,
-            name="명령",
-        )
-        self._valve_app_bar = pg.BarGraphItem(
-            x=np.arange(8) + 0.18,
-            height=self._node.valve_app,
-            width=0.32,
-            brush=C_EKF,
-            name="PLC 적용",
-        )
-        self._valve_plot.addItem(self._valve_cmd_bar)
-        self._valve_plot.addItem(self._valve_app_bar)
-        valve_layout.addWidget(self._valve_plot, stretch=3)
-
-        self._thrust_plot = pg.PlotWidget()
-        _style_plot(
-            self._thrust_plot,
-            "밸브별 추정 추력",
-            y_label="N",
-            grid_x=False,
-        )
-        self._thrust_plot.getAxis("bottom").setTicks(
-            [[(index, label) for index, label in enumerate(valve_labels)]]
-        )
-        self._thrust_bar = pg.BarGraphItem(
-            x=np.arange(8),
-            height=self._node.valve_thrust,
-            width=0.58,
-            brush=C_INFO,
-        )
-        self._thrust_plot.addItem(self._thrust_bar)
-        valve_layout.addWidget(self._thrust_plot, stretch=2)
-        tabs.addTab(valve_tab, "밸브")
-
-        self._log_text = QTextEdit()
-        self._log_text.setReadOnly(True)
-        tabs.addTab(self._log_text, "로그")
         return tabs
 
     def _set_summary_value(self, key: str, text: str, color: str = C_TEXT) -> None:
@@ -1130,10 +1755,10 @@ class Dashboard(QMainWindow):
         if not valve_fresh:
             self._card_main.set_status("NO DATA", "밸브 상태 미수신", C_ERROR)
         elif node.main_valve_open:
-            self._card_main.set_status("OPEN", "에어베어링 공급", C_OK)
+            self._card_main.set_status("ON", "에어베어링 공급", C_OK)
         else:
             color = C_ERROR if node.mode_name in ("READY", "ACTIVE") else C_IDLE
-            self._card_main.set_status("CLOSED", "에어베어링 차단", color)
+            self._card_main.set_status("OFF", "에어베어링 차단", color)
 
         if not health_fresh:
             self._card_timing.set_status("NO DATA", "/system/health", C_ERROR)
@@ -1183,11 +1808,6 @@ class Dashboard(QMainWindow):
             self._set_summary_value("position_error", "—", C_TEXT_DIM)
             self._set_summary_value("heading_error", "—", C_TEXT_DIM)
 
-        self._set_summary_value(
-            "wrench",
-            f"{node.wrench[0]:+.2f}, {node.wrench[1]:+.2f}, {node.wrench[2]:+.2f}",
-        )
-
         if node.errors:
             self._alert.setText("ERROR  " + "\n".join(node.errors[:3]))
             self._alert.setStyleSheet(
@@ -1213,14 +1833,73 @@ class Dashboard(QMainWindow):
                 "border-radius:5px; padding:8px; font-size:10pt;"
             )
 
+    def _choose_plan(self, index):
+        self._node.plan_choice = self._plan_picker.itemData(index)
+        self._update_plan_curve()
+
+    def _update_plan_curve(self):
+        node = self._node
+        if self._picker_catalog is not node.paper_plans:
+            self._picker_catalog = node.paper_plans
+            self._drawn_plan = None
+            self._plan_curve.clear()
+            self._drawn_elapsed = None
+            self._elapsed_plan_curve.clear()
+            self._plan_picker.clear()
+            self._plan_picker.addItem("계획 경로 · 자동", "auto")
+            self._plan_picker.addItem("계획 경로 숨기기", "off")
+            for key in node.paper_plans:
+                experiment, method = key.rsplit("/", 1)
+                self._plan_picker.addItem(f"{method}  ·  {experiment}", key)
+            self._plan_picker.setCurrentIndex(self._plan_picker.findData(node.plan_choice))
+            self._plan_picker.setVisible(bool(node.paper_plans))
+        active = node.active_plan_key()
+        key = active if node.plan_choice == "auto" else node.plan_choice
+        if key not in node.paper_plans:
+            key = None
+        if key != self._drawn_plan:
+            self._drawn_plan = key
+            self._drawn_elapsed = None
+            self._elapsed_plan_curve.clear()
+            if key is None:
+                self._plan_curve.clear()
+            else:
+                xy = node.paper_plans[key][1]
+                self._plan_curve.setData(xy[:, 0], xy[:, 1])
+        elapsed = node.paper_elapsed if key is not None and key == active else None
+        if elapsed != self._drawn_elapsed:
+            self._drawn_elapsed = elapsed
+            if elapsed is None:
+                self._elapsed_plan_curve.clear()
+            else:
+                _, xy, times = node.paper_plans[key]
+                n = times.searchsorted(elapsed, side="right")
+                reached = xy[:n]
+                if 0 < n < len(times) and elapsed > times[n - 1]:
+                    fraction = (elapsed - times[n - 1]) / (times[n] - times[n - 1])
+                    reached = np.vstack((reached, xy[n - 1] + fraction * (xy[n] - xy[n - 1])))
+                self._elapsed_plan_curve.setData(reached[:, 0], reached[:, 1])
+        auto_label = "계획 경로 · 자동"
+        if node.plan_choice == "auto" and key:
+            auto_label += " · " + key.rsplit("/", 1)[-1]
+        if self._plan_picker.itemText(0) != auto_label:
+            self._plan_picker.setItemText(0, auto_label)
+        self._plan_picker.setToolTip(f"{key}\n회색 · 전체 계획   빨강 · 실험 경과 구간" if key
+                                     else "실험별 본체 계획 경로 [m]")
+
     def _update_trajectory(self) -> None:
         node = self._node
-        if node.x_v:
-            self._vicon_curve.setData(list(node.x_v), list(node.y_v))
-        if node.x_e:
-            self._ekf_curve.setData(list(node.x_e), list(node.y_e))
-            x, y = node.x_e[-1], node.y_e[-1]
-            heading = math.radians(node.th_e[-1])
+        self._update_plan_curve()
+        current = node.source_age("vicon") < XY_TRAIL_SEC
+        self._spacecraft_body.setVisible(current)
+        self._spacecraft_front.setVisible(current)
+        self._position_dot.setVisible(current)
+        self._target_dot.setVisible(node.source_age("reference") < XY_TRAIL_SEC)
+        self._vicon_curve.setData(*node.vicon_trail.coordinates())
+        self._ref_curve.setData(*node.reference_trail.coordinates())
+        if current:
+            x, y = node.x_v[-1], node.y_v[-1]
+            heading = math.radians(node.th_v[-1])
 
             transform = QTransform()
             transform.translate(x, y)
@@ -1236,7 +1915,7 @@ class Dashboard(QMainWindow):
             self._spacecraft_front.setLine(x1, y1, x2, y2)
             self._position_dot.setData([x], [y])
         if node.ref_x:
-            self._ref_curve.setData(list(node.ref_x), list(node.ref_y))
+            self._target_dot.setData([node.ref_x[-1]], [node.ref_y[-1]])
 
     def _update_detail_plots(self) -> None:
         node = self._node
@@ -1247,20 +1926,28 @@ class Dashboard(QMainWindow):
                 curve.setData(list(times), list(values))
 
         self._valve_cmd_bar.setOpts(height=node.valve_cmd)
-        self._valve_app_bar.setOpts(height=node.valve_app)
-        self._thrust_bar.setOpts(height=node.valve_thrust)
+        self._valve_cmd_bar.setVisible(node.source_age("valve") <= SOURCE_TIMEOUT_SEC)
 
-        if len(node.logs) != self._last_log_count:
-            self._last_log_count = len(node.logs)
-            self._log_text.setHtml("<br>".join(node.logs))
-            scrollbar = self._log_text.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+        self._update_logs()
 
-    def _update_controls(self) -> None:
+    def _update_logs(self):
+        minimum = self._log_level.currentData()
+        key = (self._node.log_revision, minimum)
+        if self._log_view_key == key:
+            return
+        self._log_view_key = key
+        scrollbar = self._log_text.verticalScrollBar()
+        old_position = scrollbar.value()
+        follow = old_position >= scrollbar.maximum() - 1
+        visible = (entry.to_html() for entry in self._node.logs if entry.level >= minimum)
+        self._log_text.setHtml("<br>".join(visible))
+        scrollbar.setValue(scrollbar.maximum() if follow else old_position)
+
+    def _update_controls(self, writable: bool) -> None:
         """준비도 등 + 버튼 활성/비활성 + 명령 상태를 갱신한다."""
         node = self._node
         ready = node.readiness()
-        allowed = ALLOWED_TRANSITIONS.get(node.mode_name, set())
+        mode_fresh = node.source_age("mode") <= SOURCE_TIMEOUT_SEC
 
         # ── 준비도 등 ──
         self._lights["vicon"].set_state(
@@ -1285,39 +1972,114 @@ class Dashboard(QMainWindow):
             self._lights["act"].set_state(C_ERROR, "미수신")
         armed_mode = node.mode_name in ("READY", "ACTIVE")
         if node.main_valve_open:
-            self._lights["main_valve"].set_state(C_OK, "OPEN")
+            self._lights["main_valve"].set_state(C_OK, "ON")
         else:
             self._lights["main_valve"].set_state(
-                C_ERROR if armed_mode else C_IDLE, "CLOSED"
+                C_ERROR if armed_mode else C_IDLE, "OFF"
             )
 
-        # ── 버튼 활성/비활성 (FSM 허용 전이 AND 준비도) ──
-        def gate(button: QPushButton, target: int, ok: bool, why: str) -> None:
-            allowed_now = target in allowed
-            button.setEnabled(allowed_now and ok)
-            button.setToolTip("" if (allowed_now and ok) else (why if allowed_now else "현재 모드에서 불가"))
-
-        gate(self._btn_pressurize, MODE_PRESSURIZING, ready["act"], "PLC/밸브 미수신")
-        gate(self._btn_ready, MODE_READY, ready["act"] and ready["main_valve"],
-             "PLC 미수신 또는 에어베어링 미개방")
-        gate(self._btn_active, MODE_ACTIVE,
-             ready["nav"] and ready["vicon"] and ready["main_valve"],
-             "항법 미수렴/Vicon 미수신 또는 에어베어링 미개방")
-        gate(self._btn_abort, MODE_SAFE_HOLD, True, "")
-        gate(self._btn_reset, MODE_IDLE, True, "")
-        # 메인 밸브: E-STOP/SAFE_HOLD에선 열기 금지 (밸브드라이버 게이팅 미러)
-        self._btn_air_on.setEnabled(node.mode_name not in ("EMERGENCY_STOP", "SAFE_HOLD", "NO DATA"))
-        self._btn_air_off.setEnabled(node.mode_name != "NO DATA")
+        self._btn_air_on.setEnabled(writable and mode_fresh and node.mode_name not in ("EMERGENCY_STOP", "SAFE_HOLD", "NO DATA"))
+        self._btn_air_off.setEnabled(writable and node.mode_name != "NO DATA")
 
         if node.last_command_msg:
             self._command_status.setText(node.last_command_msg)
 
     def _update(self) -> None:
         """전체 대시보드를 갱신한다."""
+        rate_due = time.monotonic() - self._last_rate >= 1
+        if rate_due:
+            self._last_rate = time.monotonic()
+        names = Counter((link.display_id or endpoint).casefold() for endpoint, link in self._links.items())
+        for i in range(self._vehicles.count()):
+            endpoint = self._vehicles.tabData(i)
+            link = self._links.get(endpoint)
+            if not link:
+                local = self._default_node
+                self._vehicles.setTabText(i, f"로컬 ROS · {local.tracking_status()}")
+                continue
+            link.drain()
+            data = link.data
+            if link.bridge_error:
+                self._stop_experiment(data, "telemetry_disconnected")
+            self._report_recording_error(data)
+            if rate_due:
+                data._tick_hz()
+            if endpoint in self._link_errors:
+                status = "Missing" if data.tracking_since is not None else "연결 오류"
+            elif link.bridge_error:
+                status = "Missing" if data.tracking_since is not None else "ROS 미연결"
+            elif not link.ready:
+                status = "연결 중"
+            else:
+                status = data.tracking_status()
+            label = link.display_id or endpoint
+            if names[label.casefold()] > 1:
+                label = f"{label} ({endpoint})"
+            detail = self._link_errors.get(endpoint) or link.bridge_error or link.read_only
+            tooltip = f"{link.ssh_user}@{endpoint}"
+            if status == "Missing" and link.ready:
+                tooltip += "\n기체 위치 미수신 (5초)"
+            self._vehicles.setTabToolTip(i, f"{tooltip}\n{detail}" if detail else tooltip)
+            self._vehicles.setTabText(i, f"{label} · {status}".replace("&", "&&"))
+            if endpoint in self._trails:
+                trail, marker = self._trails[endpoint]
+                xs, ys = data.vicon_trail.coordinates()
+                trail.setVisible(bool(xs) and not link.stopped.is_set() and data is not self._node)
+                trail.setData(xs, ys)
+                if link.stopped.is_set():
+                    marker.hide()
+                else:
+                    marker.show_vehicle(data, label if len(self._links) > 1 else "")
+        self._terminal.refresh()
+        selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
+        enabled = selected.ready and not selected.read_only and not selected.stopped.is_set() if selected else bool(self._node.request)
+        shared_domain = selected and any(
+            other is not selected and not other.stopped.is_set()
+            and (other.observer in selected.peers or selected.observer in other.peers)
+            for other in self._links.values()
+        )
+        if shared_domain:
+            enabled = False
+        self._btn_estop.setEnabled(enabled)
+        self._release_estop.setVisible(enabled and self._node.mode_name == "EMERGENCY_STOP"
+                                       and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC)
+        self._send_target_button.setEnabled(enabled)
+        recorder = self._node.recorder
+        self._report_recording_error(self._default_node)
+        self._experiment_button.setEnabled(recorder.active or self._selected_can_record())
+        self._experiment_button.setText("실험 종료" if recorder.active else "실험 시작")
+        self._experiment_button.setToolTip(str(recorder.directory) if recorder.directory else "선택한 FSS 데이터 기록")
+        node = self._node
+        target = node.source_age("reference") < XY_TRAIL_SEC
+        if target:
+            summary = f"목표  {node.ref_x[-1]:.2f}, {node.ref_y[-1]:.2f} m"
+            if node.source_age("vicon") < XY_TRAIL_SEC:
+                error = math.hypot(node.x_v[-1] - node.ref_x[-1], node.y_v[-1] - node.ref_y[-1])
+                summary += f"    거리 차  {error:.3f} m"
+            self._position_summary.setText(summary)
+        self._position_summary.setVisible(target)
+        ready = node.readiness()
+        self._sensors.setText(" &nbsp; ".join(
+            f'<span style="color:{C_OK if ready[key] else C_IDLE}">●</span> {label}'
+            for key, label in (("vicon", "Vicon"), ("imu", "IMU"), ("nav", "항법"))
+        ))
         self._update_status_cards()
-        self._update_controls()
+        self._update_controls(enabled)
+        if shared_domain:
+            self._command_status.setText("공유 ROS 도메인 · 기체별 도메인을 지정하세요")
+        elif not self._node.last_command_msg:
+            self._command_status.clear()
+        self._command_status.setVisible(bool(self._command_status.text()))
         self._update_summary()
         self._update_trajectory()
+        self._update_arm()
+        occupied = []
+        if selected and (key := self._vehicles.tabData(self._vehicles.currentIndex())) in self._trails:
+            self._trails[key][1].avoid_other_bubbles(occupied)
+        self._local_bubble.avoid_other_bubbles(occupied)
+        for key, (_, bubble) in self._trails.items():
+            if self._links.get(key) is not selected:
+                bubble.avoid_other_bubbles(occupied)
         self._update_detail_plots()
 
 
@@ -1350,16 +2112,29 @@ def main() -> None:
         useOpenGL=args.opengl,
     )
 
-    rclpy.init(args=ros_args)
     app = QApplication(sys.argv[:1])
     app.setStyle("Fusion")
-    node = DashboardNode(history_sec=args.history_sec)
-    window = Dashboard(node, fps=args.fps)
-
-    # Qt와 ROS 콜백을 같은 스레드에서 처리해 GUI 데이터 경합을 없앤다.
-    ros_timer = QTimer(window)
-    ros_timer.timeout.connect(lambda: rclpy.spin_once(node, timeout_sec=0.0))
-    ros_timer.start(2)
+    data = DashboardNode(args.history_sec)
+    local = None
+    try:
+        import rclpy
+    except ModuleNotFoundError as exc:
+        if exc.name != "rclpy":
+            raise
+    else:
+        local, data.request = open_node(
+            data.receive,
+            data.set_command_result,
+            ros_args,
+            reject=lambda text: data.set_command_result(text, 40),
+        )
+        local.create_timer(1.0, data._tick_hz)
+    window = Dashboard(data, args.fps, args.history_sec)
+    if local:
+        ros_timer = QTimer(window)
+        ros_timer.timeout.connect(lambda: rclpy.spin_once(local, timeout_sec=0.0))
+        ros_timer.start(2)
+    window._update()
 
     if args.fullscreen:
         window.showFullScreen()
@@ -1369,8 +2144,11 @@ def main() -> None:
     try:
         exit_code = app.exec()
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        if local:
+            local.destroy_node()
+            rclpy.shutdown()
     sys.exit(exit_code)
 
 

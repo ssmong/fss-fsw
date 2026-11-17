@@ -1,0 +1,8 @@
+# Station-keeping target in the table frame; switches both controllers together.
+string controller_type  # pid or lqr
+float64 x               # m
+float64 y               # m
+float64 yaw             # rad
+---
+bool success
+string message

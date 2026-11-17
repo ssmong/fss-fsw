@@ -26,7 +26,7 @@ sudo apt-get install -y build-essential cmake ninja-build
 
 # 실시간 대시보드 (노트북에서 실행하는 경우에도 필요)
 echo "--- 대시보드 (PySide6 + pyqtgraph) ---"
-pip3 install PySide6 pyqtgraph PyOpenGL
+pip3 install PySide6 pyqtgraph PyOpenGL pyte paramiko
 
 # 개발 도구
 echo "--- 개발 도구 ---"

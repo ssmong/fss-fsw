@@ -5,6 +5,7 @@
 #include <fss_interfaces/msg/trajectory_reference.hpp>
 #include <fss_interfaces/srv/set_controller.hpp>
 #include <fss_interfaces/srv/set_guidance_mode.hpp>
+#include <fss_interfaces/srv/set_target.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
 
@@ -200,6 +201,35 @@ TEST_F(GncNodeTest, LoadedTrajectoryCanSwitchToTargetAndBack) {
     publish();
     ASSERT_TRUE(spin_until([this] { return reference_.has_value(); }));
     EXPECT_DOUBLE_EQ(reference_->x_ref, 0);
+}
+
+TEST_F(GncNodeTest, TargetServiceAppliesPidAndLqrAndRetainsTargetOnRejectedRequests) {
+    using Target = fss_interfaces::srv::SetTarget;
+    start();
+    const auto client = observer_->create_client<Target>("/gnc/set_target");
+    ASSERT_TRUE(client->wait_for_service(1s));
+    const auto send = [&](const std::string& type, double x, bool accepted) {
+        auto request = std::make_shared<Target::Request>();
+        request->controller_type = type;
+        request->x = x;
+        request->y = 2.5;
+        request->yaw = -0.4;
+        auto future = client->async_send_request(request);
+        ASSERT_TRUE(spin_until([&] { return future.wait_for(0ms) == std::future_status::ready; }));
+        EXPECT_EQ(future.get()->success, accepted);
+    };
+    send("pid", 1.5, true);
+    send("lqr", 2.0, true);
+    send("unknown", 0.0, false);
+    send("pid", std::numeric_limits<double>::quiet_NaN(), false);
+    publish();
+    ASSERT_TRUE(spin_until([this] { return reference_.has_value(); }));
+    EXPECT_DOUBLE_EQ(reference_->x_ref, 2.0);
+    EXPECT_DOUBLE_EQ(reference_->y_ref, 2.5);
+    EXPECT_DOUBLE_EQ(reference_->theta_ref, -0.4);
+    EXPECT_DOUBLE_EQ(reference_->vx_ref, 0.0);
+    EXPECT_DOUBLE_EQ(reference_->vy_ref, 0.0);
+    EXPECT_DOUBLE_EQ(reference_->omega_ref, 0.0);
 }
 
 TEST_F(GncNodeTest, ControlTimerUsesRosClockAndPausesWithSimulation) {

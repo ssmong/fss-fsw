@@ -6,6 +6,7 @@
 #include <fss_interfaces/msg/trajectory_reference.hpp>
 #include <fss_interfaces/srv/set_controller.hpp>
 #include <fss_interfaces/srv/set_guidance_mode.hpp>
+#include <fss_interfaces/srv/set_target.hpp>
 #include <rclcpp/create_timer.hpp>
 
 #include <algorithm>
@@ -31,6 +32,7 @@ using ThrustCommands = fss_interfaces::msg::ThrustCommands;
 using TrajectoryReference = fss_interfaces::msg::TrajectoryReference;
 using SetController = fss_interfaces::srv::SetController;
 using SetGuidanceMode = fss_interfaces::srv::SetGuidanceMode;
+using SetTarget = fss_interfaces::srv::SetTarget;
 
 std::filesystem::path config_directory() {
     const char* override_path = std::getenv("FSS_CONFIG_DIR");
@@ -129,6 +131,23 @@ public:
                     response->message = error.what();
                 }
             });
+        target_service_ = create_service<SetTarget>("/gnc/set_target",
+            [this](const std::shared_ptr<SetTarget::Request> request,
+                   std::shared_ptr<SetTarget::Response> response) {
+                try {
+                    const Reference target{request->x, request->y, request->yaw, 0, 0, 0};
+                    if (!GuidanceManager::finite(target))
+                        throw std::invalid_argument("target pose must be finite");
+                    const auto type = controller_type(request->controller_type);
+                    pipeline_->set_controller(type);
+                    pipeline_->guidance().hold_target(target);
+                    response->success = true;
+                    response->message = type + " target accepted";
+                } catch (const std::exception& error) {
+                    response->success = false;
+                    response->message = error.what();
+                }
+            });
         timer_ = rclcpp::create_timer(this, get_clock(),
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(dt_)),
             [this] { control_loop(); });
@@ -217,6 +236,7 @@ private:
     rclcpp::Publisher<TrajectoryReference>::SharedPtr reference_pub_;
     rclcpp::Service<SetGuidanceMode>::SharedPtr guidance_service_;
     rclcpp::Service<SetController>::SharedPtr controller_service_;
+    rclcpp::Service<SetTarget>::SharedPtr target_service_;
     rclcpp::TimerBase::SharedPtr timer_;
 };
 

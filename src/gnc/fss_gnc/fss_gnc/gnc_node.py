@@ -30,7 +30,7 @@ from fss_common.math_utils import build_thruster_matrix
 from fss_common.paths import config_file
 from fss_common.valve_thrust_map import load_valve_thrust_map
 from fss_interfaces.msg import SpacecraftState, ThrustCommands, TrajectoryReference
-from fss_interfaces.srv import SetController, SetGuidanceMode
+from fss_interfaces.srv import SetController, SetGuidanceMode, SetTarget
 from fss_gnc._gnc_core import (
     LQRRotational,
     LQRTranslational,
@@ -125,8 +125,8 @@ class GNCNode(Node):
         self._rot_type = self.get_parameter("rotational.type").value
 
         # ── 제어기 생성 (병진/회전 독립) ──
-        self._trans_ctrl = self._create_trans_controller()
-        self._rot_ctrl = self._create_rot_controller()
+        self._trans_ctrl = self._create_trans_controller(self._trans_type)
+        self._rot_ctrl = self._create_rot_controller(self._rot_type)
 
         # ── 할당기 (C++ core) ──
         self._allocator = QPAllocator()
@@ -149,6 +149,7 @@ class GNCNode(Node):
         # 서비스
         self.create_service(SetGuidanceMode, "/gnc/set_guidance_mode", self._srv_guidance)
         self.create_service(SetController, "/gnc/set_controller", self._srv_controller)
+        self.create_service(SetTarget, "/gnc/set_target", self._srv_target)
 
         # 제어 루프 타이머
         self._dt = 1.0 / control_rate
@@ -159,10 +160,8 @@ class GNCNode(Node):
             f"trans={self._trans_type}, rot={self._rot_type})"
         )
 
-    def _create_trans_controller(self):
+    def _create_trans_controller(self, ctrl_type):
         """병진 제어기를 파라미터에 따라 생성한다 (pid/lqr)."""
-        ctrl_type = self._trans_type
-
         if ctrl_type == "lqr":
             ctrl = LQRTranslational()
             ctrl.set_gain(self._load_lqr_gains("K_trans"), self._max_force)
@@ -184,10 +183,8 @@ class GNCNode(Node):
             f"[gnc_node] 알 수 없는 translational.type: '{ctrl_type}' (pid/lqr만 지원)"
         )
 
-    def _create_rot_controller(self):
+    def _create_rot_controller(self, ctrl_type):
         """회전 제어기를 파라미터에 따라 생성한다 (pid/lqr)."""
-        ctrl_type = self._rot_type
-
         if ctrl_type == "lqr":
             ctrl = LQRRotational()
             ctrl.set_gain(
@@ -411,20 +408,36 @@ class GNCNode(Node):
         self.get_logger().info(resp.message)
         return resp
 
+    def _switch_controller(self, new_type):
+        trans = self._create_trans_controller(new_type)
+        rot = self._create_rot_controller(new_type)
+        self._trans_ctrl, self._rot_ctrl = trans, rot
+        self._trans_type = self._rot_type = new_type
+
+    def _srv_target(self, req, resp):
+        new_type = req.controller_type.strip().lower()
+        try:
+            if new_type not in ("pid", "lqr"):
+                raise ValueError("controller type must be pid or lqr")
+            if not all(math.isfinite(value) for value in (req.x, req.y, req.yaw)):
+                raise ValueError("target pose must be finite")
+            self._switch_controller(new_type)
+            self._guidance.set_target(req.x, req.y, req.yaw)
+        except Exception as exc:
+            resp.success, resp.message = False, str(exc)
+        else:
+            resp.success, resp.message = True, f"{new_type} target accepted"
+        return resp
+
     def _srv_controller(self, req, resp):
         """제어기 변경/리셋 서비스."""
         new_type = req.controller_type.strip().lower() if req.controller_type else ""
 
         if new_type in ("pid", "lqr"):
             # 전환 실패(게인 파일/파라미터 누락) 시 기존 제어기를 유지하고 실패 응답
-            prev = (self._trans_type, self._rot_type, self._trans_ctrl, self._rot_ctrl)
             try:
-                self._trans_type = new_type
-                self._rot_type = new_type
-                self._trans_ctrl = self._create_trans_controller()
-                self._rot_ctrl = self._create_rot_controller()
+                self._switch_controller(new_type)
             except Exception as e:
-                self._trans_type, self._rot_type, self._trans_ctrl, self._rot_ctrl = prev
                 resp.success = False
                 resp.message = f"제어기 전환 실패({new_type}): {e}"
                 self.get_logger().error(resp.message)

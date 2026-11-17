@@ -1,55 +1,34 @@
-# Floating Spacecraft Simulator Flight Software
+# fss-fsw
 
-ROS2 flight software for a 3-DOF air-bearing spacecraft simulator propelled by eight cold-gas thrusters. It fuses IMU and Vicon data in an EKF, closes the loop with PID or LQR, and allocates thrust through a constrained QP to PLC-driven proportional valves.
+에어베어링 우주선 모형의 비행 소프트웨어와 지상국 **FSS Mission Control**입니다.
 
-## Highlights
-- 11-state EKF: Xsens IMU strapdown with Vicon pose updates, gyro and body/table accel bias states, Joseph-form update, χ² gating.
-- C++17 onboard ROS2 runtime: IMU/Vicon bridges, EKF, guidance, PID/LQR, 8-thruster QP allocation, Modbus TCP valve control and manager FSM. The default chain runs directly in C++ without pybind11.
-- GNC publishes per-nozzle target thrust in newtons; the valve driver inverts the measured thrust map before sending normalized inputs through the Modbus TCP HAL to the LS PLC. SIL consumes the driver's converted, gated commands.
-- Six-mode manager FSM (IDLE → ACTIVE, SAFE_HOLD, E-STOP) and a 3-joint Dynamixel arm driver with position, velocity and current modes.
-- Python SIL plant: configured 1 kHz RK4 rigid-body dynamics, digitized SMC PVQ valve curves and sensor noise; Python calibration, gain calculation, dashboards and Hydra experiment presets remain available.
-- Optional Python research GNC selected with `gnc_backend:=python`; its C++ algorithm bindings are an explicit build option. New Python controllers require code wiring as well as configuration.
-- GNC zeroes thrust after 100 ms without fresh navigation. The manager checks health at 20 Hz and latches SAFE_HOLD after 1 s of navigation silence; restored input requires manual rearming.
+## PC에서 관제하기
 
-This is a new C++ runtime port. See [runtime scope and verification](docs/ops/Cxx_Runtime.md).
+1. PC를 Jetson과 같은 실험실 네트워크에 연결하고 **FSS Mission Control**을 여세요.
+2. **+ FSS 연결**에서 주소 `192.168.0.9`, 계정 `smrl`과 SSH 암호를 입력하세요. 기체마다 원하는 ID와 **로봇팔 장착** 여부를 지정하세요. 진행 중인 실험을 지켜볼 때는 **모니터링만**을 선택하세요.
+3. 상단에서 기체를 선택하세요. 파란색 기체가 터미널과 조작 버튼의 대상입니다. 본체 위치 제어 실험은 **에어베어링 ON → PID 또는 LQR → X·Y(m)와 Yaw(°) 입력 → 목표 전송** 순서입니다.
+4. 지도에서 기체 옆의 X·Y·Yaw를 확인하세요. 관절각은 **상세 → 로봇팔**에 있습니다. 오른쪽의 **SSH**와 **로그**를 전환하고 **+**로 셸을 추가할 수 있습니다.
+5. 기록하려면 **실험 시작**을 누르고 이름을 입력하세요. 종료하면 관제 PC의 `experiments/<이름>/YYYY-MM-DD/HH-MM-SS/`에 수신 데이터, 로그, 궤적 그림이 남습니다. 첫 이름은 `default`이며 다음부터는 직전에 쓴 이름을 수정할 수 있습니다.
 
-## Stack
-ROS2 Humble · C++17 · Eigen · yaml-cpp · nlohmann/json · Python 3.10 · NumPy/SciPy · Hydra · Dynamixel SDK · Jetson Orin Nano
+### 새 Windows PC에서 처음 열 때
 
-## Layout
-```text
-src/       ROS2 packages: GNC, hardware, infra, ops
-config/    Hydra config tree and experiment presets
-scripts/   Setup, experiment runner, calibration, dashboard
-tests/     Native, ROS integration and Python tool/research tests
-plc/       PLC ladder project (XG5000)
-docs/      Design and operations notes (Korean)
+Python 3.10 이상을 설치한 뒤 저장소 폴더에서 PowerShell로 실행하세요. 두 번째부터는 마지막 줄만 실행하면 됩니다.
+
+```powershell
+py -m pip install PySide6 pyqtgraph numpy paramiko pyte
+py scripts/live_plot.py
 ```
 
-## Usage
+## 새 Jetson 준비
+
+Ubuntu 22.04에 ROS 2 Humble과 `colcon`이 설치된 Jetson에서 한 번 실행하세요.
+
 ```bash
-bash scripts/install_dependencies.sh
+git clone https://github.com/ssmong/fss-fsw.git ~/fss-fsw
+cd ~/fss-fsw
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install && source install/setup.bash
-python scripts/validate_config.py
-ROS_DOMAIN_ID=178 ROS_LOCALHOST_ONLY=1 colcon test --executor sequential
-colcon test-result --verbose
-python3 -m pytest -q tests/test_cxx_runtime.py              # compiled runtime + Python plant
-ros2 launch fss_bringup sim.launch.py                        # SIL
-python scripts/run_experiment.py experiment=trajectory_tracking system.use_sim=true
-python scripts/run_experiment.py experiment=valve_map_demo
-bash scripts/preflight_check.sh && ros2 launch fss_bringup fss_full.launch.py  # hardware
+bash scripts/install_dependencies.sh
+MAKEFLAGS=-j2 colcon build --symlink-install --executor sequential
 ```
 
-The complete `config/` tree is installed under `share/fss_bringup/config`; an ordinary build can run without the source checkout. To run with a working configuration tree, set `FSS_CONFIG_DIR` to its absolute path. `run_experiment.py` passes its Hydra configuration directory to every node automatically. Xsens vendor acquisition still starts separately with `scripts/launch/start_imu.sh`; optional arm and RealSense adapters retain their existing launch paths. The standalone reaction-wheel bench driver is also C++.
-
-For the Python research backend and Python tests that import `_gnc_core`:
-
-```bash
-sudo apt-get install pybind11-dev python3-dev
-colcon build --symlink-install --cmake-args -DFSS_GNC_BUILD_PYTHON_BINDINGS=ON
-source install/setup.bash
-ros2 launch fss_bringup sim.launch.py gnc_backend:=python
-python scripts/run_experiment.py system.use_sim=true system.gnc_backend=python
-python3 -m pytest -q tests
-```
+기체 기동과 종료는 [실장비 운용 절차](docs/ops/013_Arm_Execution.md), 모의 실험은 [시뮬레이션 실행 방법](docs/ops/Cxx_Runtime.md#build-and-launch)을 참고하세요.
