@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import sys
 
+import numpy as np
+
 from PySide6.QtCore import QObject, QPointF, QRectF, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen
 
@@ -13,6 +15,35 @@ from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPai
 def _finite(values, count):
     return (isinstance(values, (tuple, list)) and len(values) == count
             and all(isinstance(v, (int, float)) and math.isfinite(v) for v in values))
+
+
+def _video_frame(image):
+    """Supply 8-bit 4:2:0 so software H.264 encoders cannot select High 4:4:4."""
+    from PySide6.QtMultimedia import QVideoFrame, QVideoFrameFormat
+    image = image.convertToFormat(QImage.Format_RGBA8888)
+    height, width = image.height(), image.width()
+    rgb = np.ndarray((height, width, 4), dtype=np.uint8, buffer=image.constBits(),
+                     strides=(image.bytesPerLine(), 4, 1))[:, :, :3].astype(np.int32)
+    r, g, b = rgb.transpose(2, 0, 1)
+    y = ((66*r + 129*g + 25*b + 128) >> 8) + 16
+    # Average each 2x2 block before converting its shared chroma samples.
+    r, g, b = ((rgb[::2, ::2] + rgb[1::2, ::2] + rgb[::2, 1::2] + rgb[1::2, 1::2] + 2) // 4).transpose(2, 0, 1)
+    u = ((-38*r - 74*g + 112*b + 128) >> 8) + 128
+    v = ((112*r - 94*g - 18*b + 128) >> 8) + 128
+    fmt = QVideoFrameFormat(image.size(), QVideoFrameFormat.Format_YUV420P)
+    fmt.setColorSpace(QVideoFrameFormat.ColorSpace_BT601)
+    fmt.setColorRange(QVideoFrameFormat.ColorRange_Video)
+    frame = QVideoFrame(fmt)
+    if not frame.map(QVideoFrame.WriteOnly):
+        raise RuntimeError("영상 프레임 메모리를 열 수 없습니다")
+    try:
+        for index, plane in enumerate((y, u, v)):
+            target = np.ndarray(plane.shape, dtype=np.uint8, buffer=frame.bits(index),
+                                strides=(frame.bytesPerLine(index), 1))
+            target[:] = plane
+    finally:
+        frame.unmap()
+    return frame
 
 
 class TrajectoryRenderer:
@@ -182,8 +213,7 @@ class VideoRecorder(QObject):
         if index <= self._last_index:
             return
         self._last_index = index
-        from PySide6.QtMultimedia import QVideoFrame
-        frame = QVideoFrame(self._renderer.render(snapshot, elapsed_seconds))
+        frame = _video_frame(self._renderer.render(snapshot, elapsed_seconds))
         frame.setStartTime(round(elapsed_seconds * 1_000_000))
         frame.setEndTime(round((elapsed_seconds + 1 / self.fps) * 1_000_000))
         if len(self._pending) == 2:

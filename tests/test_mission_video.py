@@ -1,5 +1,8 @@
 import os
+import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -42,6 +45,26 @@ class VideoTest(unittest.TestCase):
         r.render({}, 5.1)
         self.assertFalse(r.trail)
 
+    def test_frame_uses_limited_range_yuv420_with_correct_colors(self):
+        from mission_video import _video_frame
+        from PySide6.QtGui import QImage, QColor
+        from PySide6.QtMultimedia import QVideoFrame, QVideoFrameFormat
+        for color, expected in (("black", (16, 128, 128)), ("white", (235, 128, 128)),
+                                ("red", (82, 90, 240))):
+            image = QImage(6, 4, QImage.Format_RGB32)
+            image.fill(QColor(color))
+            frame = _video_frame(image)
+            self.assertEqual(frame.pixelFormat(), QVideoFrameFormat.Format_YUV420P)
+            self.assertTrue(frame.map(QVideoFrame.ReadOnly))
+            try:
+                for plane, (width, height) in enumerate(((6, 4), (3, 2), (3, 2))):
+                    data = bytes(frame.bits(plane))
+                    for y in range(height):
+                        start = y * frame.bytesPerLine(plane)
+                        self.assertEqual(data[start:start + width], bytes([expected[plane]]) * width)
+            finally:
+                frame.unmap()
+
     def test_mp4_round_trip_decodes_frames_and_duration(self):
         from mission_video import VideoRecorder, TrajectoryRenderer
         from PySide6.QtCore import QUrl
@@ -62,6 +85,15 @@ class VideoTest(unittest.TestCase):
                 self.assertFalse(recorder.error, recorder.error)
                 self.assertEqual(recorder.frames_written, 12)
                 self.assertGreater(recorder.path.stat().st_size, 1000)
+                probe = shutil.which("ffprobe")
+                if probe:
+                    stream = json.loads(subprocess.check_output([
+                        probe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                        "stream=codec_name,profile,pix_fmt", "-of", "json", str(recorder.path)
+                    ]))["streams"][0]
+                    self.assertEqual(stream["codec_name"], "h264")
+                    self.assertEqual(stream["pix_fmt"], "yuv420p")
+                    self.assertIn(stream["profile"], ("Baseline", "Constrained Baseline", "Main", "High"))
                 player, sink = QMediaPlayer(), QVideoSink()
                 player.setVideoSink(sink)
                 frames = []
