@@ -18,9 +18,10 @@ IDLE 기동 후 /system/set_mode 서비스로 전이한다.
   ros2 launch fss_bringup fss_full.launch.py cpu_pin:=true log_level:=debug
 """
 
+from fss_common.hardware_ownership import claim_launch
 from fss_common.launch_utils import node_params, scheduling_defaults
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -189,6 +190,7 @@ def generate_launch_description() -> LaunchDescription:
             actuator_rt_priority_arg,
             log_level_arg,
             use_realsense_arg,
+            OpaqueFunction(function=claim_launch, condition=UnlessCondition(use_sim)),
             actuators_launch,
             arm_launch,
             sensors_launch,

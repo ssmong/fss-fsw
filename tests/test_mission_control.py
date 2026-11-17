@@ -75,6 +75,7 @@ class MissionControlTest(unittest.TestCase):
         w = self.window
         for endpoint in ("first", "second"):
             w.add_jetson(endpoint, "smrl", None, "", f"FSS-{endpoint}")
+            self.assertIsNone(w._vehicles.tabButton(w._vehicles.currentIndex(), self.ui.QTabBar.RightSide))
             self.body_status(w._links[endpoint])
         first, second = w._links.values()
         w.show()
@@ -88,25 +89,37 @@ class MissionControlTest(unittest.TestCase):
         self.assertEqual(w._vehicles.currentIndex(), 1)
         self.assertEqual(first.commands.get_nowait()[1:], ("start_body", True))
         self.assertTrue(second.commands.empty())
+        self.assertIsNone(w._vehicles.tabButton(0, self.ui.QTabBar.RightSide))
+        self.assertIs(buttons[1], w._vehicles.tabButton(1, self.ui.QTabBar.RightSide))
+        self.body_status(first)  # An idle heartbeat already in transit predates the remote command.
+        w._update()
+        self.assertIsNone(w._vehicles.tabButton(0, self.ui.QTabBar.RightSide))
         buttons[0].click()
         self.assertTrue(first.commands.empty())
+        first.inbox.put([("body_reply", "기체 소프트웨어 기동")])
+        w._update()
+        self.assertIsNone(w._vehicles.tabButton(0, self.ui.QTabBar.RightSide))
+        self.body_status(first, can_start_body=False)
+        w._update()
+        self.assertIsNone(w._vehicles.tabButton(0, self.ui.QTabBar.RightSide))
 
     def test_body_start_rechecks_pending_status_stale_link_and_reused_endpoint(self):
         w = self.window
         first, second = self.connect("host", 0), self.connect("other", 1)
-        button = w._vehicles.tabButton(0, self.ui.QTabBar.RightSide)
         for update in (dict(age=10), dict(read_only="모니터링"), dict(can_start_body=False),
                        dict(peers=["other_observer"])):
             self.body_status(first)
             self.body_status(second, observer="other_observer")
             w._update()
+            button = w._vehicles.tabButton(0, self.ui.QTabBar.RightSide)
             self.assertTrue(button.isEnabled())
             self.body_status(first, **update)
             button.click()
-            self.assertFalse(button.isEnabled())
+            self.assertIsNone(w._vehicles.tabButton(0, self.ui.QTabBar.RightSide))
             self.assertTrue(first.commands.empty())
         self.body_status(first)
         w._update()
+        button = w._vehicles.tabButton(0, self.ui.QTabBar.RightSide)
         first.inbox.put([("bridge_error", "connection lost")])
         button.click()
         self.assertTrue(first.commands.empty())
@@ -114,8 +127,37 @@ class MissionControlTest(unittest.TestCase):
         replacement = self.connect("host", 0)
         self.body_status(replacement)
         w._update()
-        w._start_vehicle_body("host / 0", first, button)
+        w._start_vehicle_body("host / 0", first)
         self.assertTrue(first.commands.empty() and replacement.commands.empty())
+
+    def test_idle_failure_can_retry_and_missing_tracking_leaves_running_tab_compact(self):
+        w = self.window
+        w.show()
+        w.add_jetson("host", "smrl", None, "", "FSS-" + "long" * 7)
+        link = w._links["host"]
+        side = self.ui.QTabBar.RightSide
+        self.body_status(link, can_start_body=False)
+        w._update()
+        self.assertIsNone(w._vehicles.tabButton(0, side))
+        compact_width = w._vehicles.tabRect(0).width()
+        self.body_status(link)
+        w._update()
+        self.assertGreater(w._vehicles.tabRect(0).width(), compact_width + 30)
+        w._vehicles.tabButton(0, side).click()
+        self.assertIsNone(w._vehicles.tabButton(0, side))
+        self.assertEqual(w._vehicles.tabRect(0).width(), compact_width)
+        link.inbox.put([("body_error", "기동 실패")])
+        w._update()
+        self.assertIsNone(w._vehicles.tabButton(0, side))
+        self.body_status(link)
+        w._update()
+        self.assertTrue(w._vehicles.tabButton(0, side).isEnabled())
+        self.body_status(link, can_start_body=False)
+        link.data.tracking_since -= 60
+        w._update()
+        self.assertTrue(w._vehicles.tabText(0).endswith("Missing"))
+        self.assertIsNone(w._vehicles.tabButton(0, side))
+        self.assertEqual(link.commands.qsize(), 1)
 
     def test_air_bearing_shows_telemetry_without_optimistic_switch_on_click(self):
         w = self.window
@@ -197,6 +239,124 @@ class MissionControlTest(unittest.TestCase):
         self.window.add_jetson("observer", "operator", None, "")
         self.assertTrue(observer.stopped.is_set())
         self.assertFalse(self.window._links["observer"].monitor_only)
+
+    def test_connect_detects_workflow_and_idle_bench_offers_both_operations(self):
+        w, ui = self.window, self.ui
+
+        def first(dialog):
+            connect = dialog.findChild(ui.QDialogButtonBox).button(ui.QDialogButtonBox.Ok)
+            self.assertIsNone(dialog.findChild(ui.QComboBox))
+            self.assertTrue(connect.isEnabled())
+            return 1
+
+        with patch.object(ui.QDialog, "exec", first):
+            w._connect_dialog()
+        link = w._links["192.168.0.9"]
+        self.assertEqual(link.profile, "auto")
+        self.assertTrue(link.commands.empty())
+        self.body_status(link, workflow="toss", toss_actions=["toss_prepare"], toss_state="대기")
+        w._update()
+        self.assertEqual(link.shells.selected, "log")
+        self.assertIsNone(w._vehicles.tabButton(0, ui.QTabBar.RightSide))
+        prepare = w._toss_buttons["toss_prepare"]
+        self.assertEqual(prepare.text(), "준비")
+        self.assertTrue(prepare.isEnabled())
+        self.assertEqual([w._toss_method.itemText(i) for i in range(w._toss_method.count())],
+                         ["Nominal", "JF_only", "Proposed", "위치 제어"])
+        self.assertTrue(link.commands.empty())
+        w._toss_method.setCurrentText("위치 제어")
+        prepare.click()
+        self.assertEqual(link.commands.get_nowait()[1:], ("start_body", True))
+        self.assertTrue(link.commands.empty())
+        self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
+        link.inbox.put([("body_reply", "기동")])
+        self.body_status(link, workflow="control", can_start_body=False)
+        w._update()
+        self.assertTrue(w._toss_controls.isHidden())
+        self.assertFalse(w._controls.isHidden())
+
+    def test_toss_actions_use_selected_fss_and_require_current_permissions(self):
+        w = self.window
+        for address in ("first", "second"):
+            w.add_jetson(address, "operator", None, "", display_id=address)
+            self.body_status(w._links[address], workflow="toss", can_start_body=False,
+                             toss_actions=["toss_prepare"], toss_state="준비 가능")
+        a, b = w._links.values()
+        w.show()
+        w._update()
+        self.assertTrue(w._controls.isHidden())
+        self.assertEqual(w._experiment_button.text(), "기록 시작")
+        self.assertFalse(w._send_target_button.isEnabled())
+        self.assertIsNone(w._vehicles.tabButton(1, self.ui.QTabBar.RightSide))
+        for action, value in (("start_body", True), ("mode", 3), ("toss_prepare", "unknown")):
+            b.request(action, value)
+        self.assertTrue(b.commands.empty())
+        with tempfile.TemporaryDirectory() as storage, patch.object(self.ui.QInputDialog, "getText",
+                                                                     return_value=("trial", True)):
+            w._experiment_root = Path(storage)
+            w._experiment_button.click()
+            self.assertTrue(b.data.recorder.active)
+            self.assertTrue(b.commands.empty())
+            w._experiment_button.click()
+        self.assertEqual(list(w._toss_buttons), ["toss_prepare", "toss_start", "toss_stop"])
+        w._toss_method.setCurrentText("JF_only")
+        w._toss_buttons["toss_start"].click()
+        self.assertTrue(b.commands.empty())
+        w._toss_buttons["toss_prepare"].click()
+        self.assertEqual(b.commands.get_nowait()[1:], ("toss_prepare", "JF_only"))
+        w._send_toss("toss_prepare")
+        self.assertFalse(b.data.recorder.active)
+        self.assertTrue(a.commands.empty() and b.commands.empty())
+
+        w._vehicles.setCurrentIndex(0)
+        self.assertEqual(w._toss_method.currentText(), "Nominal")
+        self.body_status(a, toss_actions=["toss_start", "toss_stop"], toss_state="대기")
+        a.inbox.put([("paper_status", SimpleNamespace(phase="ARMED"))])
+        w._update()
+        self.assertEqual(w._toss_status.text(), "ARMED")
+        w._toss_buttons["toss_start"].click()
+        self.assertEqual(a.commands.get_nowait()[1:], ("toss_start", True))
+        self.assertTrue(b.commands.empty())
+        self.assertFalse(a.data.recorder.active)
+        a.inbox.put([("toss_reply", "요청 수락")])
+        self.body_status(a, toss_actions=["toss_stop"], toss_state="진행 중")
+        w._update()
+        w._toss_buttons["toss_stop"].click()
+        self.assertEqual(a.commands.get_nowait()[1:], ("toss_stop", True))
+
+        w._vehicles.setCurrentIndex(1)
+        self.assertEqual(w._toss_method.currentText(), "JF_only")
+        self.assertNotEqual(w._toss_status.text(), "ARMED")
+        w._vehicles.setCurrentIndex(0)
+        a.toss_pending = False
+        for fields in (dict(toss_actions=[]), dict(toss_actions=["toss_start"], read_only="외부 실행 중"),
+                       dict(toss_actions=["toss_start"], peers=[b.observer]),
+                       dict(toss_actions=["toss_start"], age=4)):
+            self.body_status(a, **fields)
+            w._send_toss("toss_start")
+            self.assertTrue(a.commands.empty())
+        self.assertTrue(b.commands.empty())
+
+    def test_toss_alignment_only_shows_for_fresh_prelaunch_phase(self):
+        w = self.window
+        w.add_jetson("bench", "operator", None, "", monitor_only=True)
+        link = w._links["bench"]
+        self.body_status(link, workflow="toss", toss_actions=["toss_prepare"], toss_state="기존 실험")
+        report = dict(phase="IDLE", grasp_guide="Move TCP (table):",
+                      launch_pose_error=[.002, -.003, .1])
+        link.inbox.put([("paper_status", SimpleNamespace(**report))])
+        w.show()
+        w._update()
+        self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
+        self.assertIsNone(w._vehicles.tabButton(0, self.ui.QTabBar.RightSide))
+        self.assertTrue(w._toss_alignment.isVisible())
+        self.assertIn("-2.0 mm", w._toss_alignment.text())
+        link.data._last_rx["paper_status"] -= self.ui.SOURCE_TIMEOUT_SEC + 1
+        w._update()
+        self.assertFalse(w._toss_alignment.isVisible())
+        link.inbox.put([("paper_status", SimpleNamespace(**dict(report, phase="LAUNCH")))])
+        w._update()
+        self.assertFalse(w._toss_alignment.isVisible())
 
     def test_coordinates_accept_first_click_typing_offline_and_in_monitor_mode(self):
         from PySide6.QtCore import QPoint, Qt
@@ -438,6 +598,41 @@ class MissionControlTest(unittest.TestCase):
         self.assertTrue(self.window._terminal.isVisible())
         self.window._console_tabs.setCurrentIndex(1)
         self.assertEqual(self.window._log_text.toPlainText().count("measurement <lost>"), 2)
+
+    def test_toss_status_changes_and_clear_are_per_vehicle(self):
+        w = self.window
+        first = self.connect("first", 1)
+        second = self.connect("second", 2)
+        w._vehicles.setCurrentIndex(0)
+        node = first.data
+        initial = dict(phase="WAITING_FOR_A", fss_gripper="OPEN", contact_verified=False,
+                       grasp_guide="Move TCP (table): ...", launch_pose_error=[0.01, -0.002, math.pi/180])
+        node.receive("paper_status", SimpleNamespace(**initial))
+        self.assertIn("X -10.0 mm", node.toss_alignment)
+        self.assertIn("Yaw -1.0°", node.toss_alignment)
+        node.receive("paper_status", initial)
+        node.receive("paper_status", {**initial, "grasp_guide": "TCP within launch grasp tolerance"})
+        capture = dict(phase="CAPTURING", fss_gripper="CLOSING", contact_verified=True)
+        for _ in range(4):
+            node.receive("paper_status", capture)
+        lines = [e.message for e in node.logs]
+        for message in ("Self-tossing · 캡처 진입", "그리퍼 · CLOSING", "B 레일 접촉 확인", "시작 파지점 정렬 완료"):
+            self.assertEqual(lines.count(message), 1)
+        self.assertFalse(node.toss_alignment)
+        second.data.append_log("다른 기체")
+        with tempfile.TemporaryDirectory() as root:
+            directory = node.recorder.start(root, "demo", "first")
+            node.append_log("보관")
+            w._clear_logs.click()
+            self.assertFalse(node.logs)
+            self.assertFalse(w._log_text.toPlainText())
+            node.receive("paper_status", capture)
+            self.assertFalse(node.logs)
+            node.receive("paper_status", dict(phase="FAULT", reason="sensor timeout"))
+            self.assertEqual(node.logs[-1].level, 40)
+            node.recorder.stop()
+            self.assertIn("보관", (directory / "logs.txt").read_text(encoding="utf8"))
+        self.assertEqual(second.data.logs[-1].message, "다른 기체")
 
     def test_independent_ssh_tabs_and_log_selection_per_vehicle(self):
         first = self.connect("fss-a", 1)

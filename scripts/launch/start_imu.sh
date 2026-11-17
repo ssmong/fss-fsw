@@ -3,7 +3,6 @@
 # IMU 브리지는 fss_full/sensors 런치가 Hydra 설정으로 한 번만 실행한다.
 #
 # 사용법: bash scripts/launch/start_imu.sh
-# 포트 잠김 시: fuser -k /dev/ttyUSB0
 
 set -e
 

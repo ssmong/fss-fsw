@@ -9,14 +9,68 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from mission_arm import encoder_model, joint_angles, link_points, plan_arm_points
+from mission_arm import ViconArmOverlay, encoder_model, joint_angles, link_points, plan_arm_points
+from mission_ros import ArmRegistration
 
 
 def pose(x, y):
     return NS(position=NS(x=x, y=y), orientation=NS(z=0.0, w=1.0))
 
 
+def header(frame, ms):
+    return NS(frame_id=frame, stamp=NS(sec=10, nanosec=ms * 1_000_000))
+
+
 class ArmModelTest(unittest.TestCase):
+    def test_overlay_interpolates_vicon_and_uses_tracked_body_calibration(self):
+        overlay = ViconArmOverlay()
+        shape = (((0, 0), (1, 0), (2, 0), (3, 0)), 0)
+        with patch("time.monotonic", return_value=1) as now:
+            overlay.configure([0.5, 0, -math.pi, 10, 0.04, 0.15])
+            overlay.add("base_link", header("base_link", 10), shape)
+            overlay.add("table", header("table", 10), (1, 2, math.radians(179)))
+            self.assertIsNone(overlay.table_shape())  # no extrapolation
+            overlay.add("table", header("table", 30), (3, 2, math.radians(-179)))
+            points, yaw = overlay.table_shape()
+            self.assertAlmostEqual(points[-1][0], 4.5)
+            self.assertAlmostEqual(points[-1][1], 2)
+            self.assertAlmostEqual(yaw, 0)
+            now.return_value += 0.2
+            self.assertIsNone(overlay.table_shape())
+            overlay.configure([0, 0, 0, 0, 0.02, 0.15])
+            overlay.add("base_link", header("base_link", 25), shape)
+            overlay.add("table", header("table", 0), (1, 2, 0))
+            overlay.add("table", header("wrong", 25), (2, 2, 0))
+            overlay.add("table", header("table", 50), (3, 2, 0))
+            self.assertIsNone(overlay.table_shape())  # bracketing gap too large
+            overlay.configure(None)
+            self.assertIsNone(overlay.table_shape())
+
+    def test_registration_queries_only_the_model_and_invalidates_on_ambiguous_source(self):
+        from unittest.mock import Mock
+        import json
+
+        graph, receive, trigger = Mock(), Mock(), Mock()
+        base = NS(node_name="arm_kinematics_node", node_namespace="/", endpoint_gid=b"A")
+        camera = NS(node_name="vicon_bridge_node", node_namespace="/", endpoint_gid=b"B")
+        cameras = [camera]
+        graph.get_publishers_info_by_topic.side_effect = lambda t: cameras if "vicon" in t else [base]
+        graph.get_node_names.return_value = ["arm_kinematics_node", "vicon_bridge_node"]
+        reg = ArmRegistration(graph, receive, trigger)
+        graph.create_client.assert_called_once_with(trigger, "/arm/kinematics_model")
+        reg.poll()
+        response = reg.pending
+        response.done.return_value = True
+        response.result.return_value = NS(success=True, message=json.dumps({
+            "schema_version": 1, "configuration": {"frame_id": "table", "base_frame_id": "base_link",
+            "navigation_topic": "/navigation/state", "navigation_to_base": [1, 2, 3],
+            "vicon_only_alignment_ms": 12, "maximum_sample_skew_s": .04, "feedback_timeout_s": .15}}))
+        reg.poll()
+        receive.assert_called_with("arm_registration", [1, 2, 3, 12, .04, .15])
+        cameras.append(camera)
+        reg.poll()
+        receive.assert_called_with("arm_registration", None)
+
     def test_encoder_angles_are_matched_by_name(self):
         state = NS(name=["wrist", "shoulder", "elbow"], position=[1.0, 2.0, 3.0])
         self.assertEqual(joint_angles(state), (2, 3, 1))
@@ -127,6 +181,70 @@ class ArmPlotTest(unittest.TestCase):
             node.arm_equipped = False
             window._update_arm()
             self.assertTrue(window._arm_notice.isHidden())
+
+    def test_detail_shows_only_selected_fresh_table_tcp_and_alignment(self):
+        first, window = self.node, self.window
+        second = self.ui.DashboardNode()
+        first.request = second.request = lambda *_: None
+        tip = NS(header=header("table", 10), pose=pose(0.12345, -0.402))
+        tip.pose.orientation = NS(x=0.0, y=0.0, z=math.sqrt(.5), w=math.sqrt(.5))
+        with patch("time.monotonic", return_value=100) as now:
+            first._cb_arm_tcp(tip)
+            first._cb_paper_status(dict(phase="IDLE", grasp_guide="Move TCP (table):",
+                                        launch_pose_error=[.002, -.003, .1]))
+            window._update_arm()
+            self.assertEqual(window._tcp_readout.text(), "테이블 파지점   X 0.123 m   Y -0.402 m   Yaw 90.0°")
+            self.assertIn("-2.0 mm", window._arm_alignment.text())
+            self.assertFalse(window._arm_alignment.isHidden())
+            with patch.object(window, "_node", second):
+                tip.header = header("base_link", 20)
+                second._cb_arm_tcp(tip)
+                window._update_arm()
+                self.assertEqual(window._tcp_readout.text(), "테이블 파지점 · 미수신")
+                self.assertTrue(window._arm_alignment.isHidden())
+                self.assertEqual(window._arm_alignment.text(), "")
+            tip.header = header("table", 30)
+            tip.pose.orientation = NS(x=0, y=0, z=0, w=0)
+            first._cb_arm_tcp(tip)
+            window._update_arm()
+            self.assertEqual(window._tcp_readout.text(), "테이블 파지점   X 0.123 m   Y -0.402 m")
+            now.return_value += self.ui.ARM_TIMEOUT_SEC
+            window._update_arm()
+            self.assertEqual(window._tcp_readout.text(), "테이블 파지점 · 미수신")
+            now.return_value += self.ui.SOURCE_TIMEOUT_SEC
+            window._update_arm()
+            self.assertTrue(window._arm_alignment.isHidden())
+            self.assertEqual(window._arm_alignment.text(), "")
+
+    def test_map_prefers_published_table_links_over_camera_overlay(self):
+        node, window = self.node, self.window
+        node.request = lambda *_: None
+        with patch("time.monotonic", return_value=100) as now:
+            body = NS(header=header("table", 10), x=1, y=2, theta=math.pi / 2)
+            base = NS(header=header("base_link", 10), poses=[pose(i, 0) for i in range(4)])
+            node._cb_arm_joints(NS(name=["shoulder", "elbow", "wrist"], position=[0, 0, 0]))
+            node._cb_arm_registration([0, 0, 0, 0, .04, .15])
+            node._cb_vicon(body)
+            window._update_arm()
+            self.assertIsNone(window._arm_links.xData)  # joint angles alone do not identify the model
+            node._cb_arm_base(base)
+            window._update_arm()
+            self.assertEqual(window._arm_links.yData.tolist(), [2, 3, 4, 5])
+            self.assertIsNone(window._arm_tip.xData)
+            self.assertTrue(window._arm_notice.isHidden())
+            window._update_arm(allow_overlay=False)
+            self.assertIsNone(window._arm_links.xData)
+            now.return_value += .16
+            window._update_arm()
+            self.assertIsNone(window._arm_links.xData)
+            self.assertFalse(window._arm_notice.isHidden())
+            body.header = header("table", 15)
+            base.header = header("base_link", 15)
+            node._cb_vicon(body)
+            node._cb_arm_base(base)
+            node._cb_arm_table(NS(header=header("table", 15), poses=[pose(i, 0) for i in range(4)]))
+            window._update_arm()
+            self.assertEqual(window._arm_links.yData.tolist(), [0, 0, 0, 0])
 
     def test_private_arm_uses_published_geometry(self):
         node, window = self.node, self.window

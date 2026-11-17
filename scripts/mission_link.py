@@ -8,6 +8,7 @@ import shlex
 import socket
 import threading
 import time
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from PySide6.QtCore import QObject, Signal
 
 from mission_terminal import ShellSessions
 
+SOURCE_TIMEOUT_SEC = 2.5
 PREFERRED_WORKSPACE = ("FSS_FSW" if (Path(__file__).resolve().parents[1]
                                      / "src/hardware/hardware_runtime/package.xml").is_file()
                        else "fss-fsw")
@@ -24,7 +26,7 @@ class JetsonLink(QObject):
     trust = Signal(object, str, object)
     changed = Signal(str)
 
-    def __init__(self, data, monitor_only=False):
+    def __init__(self, data, monitor_only=False, profile=None):
         super().__init__()
         self.data = data
         self.inbox = queue.Queue(maxsize=256)
@@ -35,21 +37,52 @@ class JetsonLink(QObject):
         self.ready = False
         self.shells = ShellSessions()
         self.bridge_error = ""
-        self.monitor_only = monitor_only
+        self.profile = "monitor" if monitor_only else (profile or "auto")
+        if self.profile not in ("auto", "control", "monitor", "toss"):
+            raise ValueError("잘못된 FSS 연결 방식")
+        self.workflow = "toss" if self.profile == "toss" else "control"
+        self.monitor_only = self.profile == "monitor"
+        self.toss_actions = ()
+        self.toss_state = ""
+        self.toss_pending = False
         self.workspace = None
         self.private_arm = False
         self.can_start_body = False
+        self.body_start_pending = False
         self.last_body_status_at = float("-inf")
-        self.read_only = "모니터링 전용" if monitor_only else ""
+        self.read_only = "모니터링 전용" if self.monitor_only else ""
         self.observer = None
         self.peers = ()
 
     def start(self, host, user, domain, password):
         threading.Thread(target=self._run, args=(host, user, domain, password), daemon=True).start()
 
+    def can_toss(self, name):
+        return (self.profile in ("auto", "toss") and self.workflow == "toss"
+                and self.ready and not self.read_only and not self.bridge_error
+                and not self.stopped.is_set() and not self.toss_pending and not self.body_start_pending
+                and time.monotonic() - self.last_body_status_at <= SOURCE_TIMEOUT_SEC
+                and name in ("toss_prepare", "toss_start", "toss_stop") and name in self.toss_actions)
+
     def request(self, name, value):
-        if self.ready and not self.read_only:
-            self.commands.put((time.monotonic(), name, value))
+        if not self.ready or self.monitor_only or self.read_only or self.stopped.is_set() or self.bridge_error:
+            return
+        if name.startswith("toss_"):
+            if not self.can_toss(name):
+                return
+            if name == "toss_prepare" and value not in ("Nominal", "JF_only", "Proposed"):
+                return
+            if name != "toss_prepare" and value is not True:
+                return
+            self.toss_pending = True
+        elif name == "start_body":
+            if (self.profile not in ("auto", "control") or not self.can_start_body or self.body_start_pending
+                    or self.toss_pending or time.monotonic() - self.last_body_status_at > SOURCE_TIMEOUT_SEC):
+                return
+            self.body_start_pending = True
+        elif self.workflow != "control" or self.profile == "toss":
+            return
+        self.commands.put((time.monotonic(), name, value))
 
     def close(self):
         self.ready = False
@@ -75,18 +108,34 @@ class JetsonLink(QObject):
                         self.peers = value.peers
                         self.workspace = getattr(value, "workspace", None)
                         self.private_arm = getattr(value, "private_arm", False)
+                        workflow = getattr(value, "workflow", self.workflow)
+                        if workflow == "toss" and self.workflow != "toss":
+                            self.shells.selected = "log"
+                        self.workflow = workflow
                         self.can_start_body = getattr(value, "can_start_body", False)
                         self.last_body_status_at = getattr(value, "received_at", float("-inf"))
+                        self.toss_actions = tuple(getattr(value, "toss_actions", ()))
+                        self.toss_state = getattr(value, "toss_state", "")
                         self.read_only = getattr(value, "read_only", "") or (
                             "모니터링 전용" if self.monitor_only else "")
                 elif name == "bridge_error":
                     self.ready = False
+                    self.toss_pending = False
+                    self.toss_actions = ()
                     self.bridge_error = value
                     self.data.set_command_result(value, 40)
                 elif name == "reply":
                     self.data.set_command_result(value)
                 elif name == "reply_error":
                     self.data.set_command_result(value, 40)
+                elif name in ("body_reply", "body_error"):
+                    self.body_start_pending = False
+                    self.can_start_body = False
+                    self.data.set_command_result(value, 20 if name == "body_reply" else 40)
+                elif name in ("toss_reply", "toss_error"):
+                    self.toss_pending = False
+                    self.toss_actions = ()
+                    self.data.set_command_result(value, 20 if name == "toss_reply" else 40)
                 else:
                     self.data.receive(name, value)
 
@@ -143,32 +192,38 @@ class JetsonLink(QObject):
             self.shells.join()
 
     def _telemetry(self, client, domain):
-        code = Path(__file__).with_name("mission_ros.py").read_text(encoding="utf-8")
-        code = Path(__file__).with_name("mission_plan.py").read_text(encoding="utf-8") + "\n" + code
-        code = Path(__file__).with_name("mission_tracking.py").read_text(encoding="utf-8") + "\n" + code
-        runtime = Path(__file__).with_name("mission_runtime.py").read_text(encoding="utf-8")
+        directory = Path(__file__).parent
         domain = None if domain is None else int(domain)
-        auto_start = not self.monitor_only and domain is None
-        code = (runtime + '\nfirst_attach = os.environ["FSS_MISSION_REATTACH"] == "0"\n'
-                + f"startup_status, read_only = prepare_session({bool(self.monitor_only)!r}, "
-                f"{domain!r}, start_if_idle={auto_start!r} and first_attach)\n"
-                + f"if {auto_start!r} and first_attach and native_overlay_changed(read_only):\n    raise SystemExit(75)\n"
-                + "private_arm = private_base() is not None\n"
-                + code)
-        preferred = PREFERRED_WORKSPACE
-        select = runtime + f"\nprint(select_workspace({preferred!r}, monitor_only={bool(self.monitor_only)!r}))\n"
-        # Native processes must not resolve a missing package from a legacy underlay.
-        # Concurrent normal connections can choose different native overlays
-        # before either starts. Re-source the winning overlay in a fresh shell.
-        cmd = (f"export FSS_MISSION_PREFERRED={shlex.quote(preferred)}; "
-               'connect_bridge() (export FSS_MISSION_REATTACH="$1"; '
-               f"FSS_MISSION_WORKSPACE=$(python3 -c {shlex.quote(select)}) && export FSS_MISSION_WORKSPACE && "
-               'if [[ "$FSS_MISSION_WORKSPACE" == FSS_FSW ]]; then setup=setup.bash; '
+        names = ("mission_runtime", "mission_toss", "mission_bootstrap")
+        routing = "\n".join((directory / (name + ".py")).read_text(encoding="utf-8") for name in names)
+        selection = (routing + f'\nprint(":".join(bridge_selection({self.profile!r}, {domain!r}, '
+                     'os.environ["FSS_MISSION_TRANSITION"], os.environ["FSS_MISSION_PREFERRED"])))')
+        context = (f'globals().update(bridge_context({self.profile!r}, {domain!r}, '
+                   'os.environ["FSS_MISSION_TRANSITION"], os.environ["FSS_MISSION_WORKFLOW"]))')
+        bridge = "\n".join([routing, context, *((directory / (name + ".py")).read_text(encoding="utf-8")
+                                             for name in ("mission_plan", "mission_tracking", "mission_ros"))])
+
+        def python_argument(source):
+            # Keep the SSH command below Linux's per-argument exec limit, including nested shell quoting.
+            data = base64.b64encode(zlib.compress(source.encode("utf-8"))).decode("ascii")
+            return shlex.quote(f"import base64,zlib;exec(compile(zlib.decompress(base64.b64decode({data!r})),"
+                               "'<mission-control>','exec'))")
+
+        # Each pass sources exactly one ROS overlay in its own subshell. The outer shell keeps the SSH
+        # channel open while changing from an idle bench to an operator-selected native stack.
+        cmd = (f'export FSS_MISSION_PREFERRED={shlex.quote(PREFERRED_WORKSPACE)}; '
+               'connect_bridge() (export FSS_MISSION_TRANSITION="$1"; '
+               f'route=$(python3 -c {python_argument(selection)}) || exit $?; '
+               'export FSS_MISSION_WORKFLOW="${route%%:*}" FSS_MISSION_WORKSPACE="${route#*:}"; '
+               'if [[ "$FSS_MISSION_WORKFLOW" == toss ]]; then '
+               'source "$HOME/self_tossing_hardware/scripts/env.sh"; '
+               'else if [[ "$FSS_MISSION_WORKSPACE" == FSS_FSW ]]; then setup=setup.bash; '
                'else unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH ROS_PACKAGE_PATH PYTHONPATH LD_LIBRARY_PATH FSS_CONFIG_DIR; '
-               'setup=local_setup.bash; fi && '
-               'source /opt/ros/humble/setup.bash && source "$HOME/$FSS_MISSION_WORKSPACE/install/$setup" '
-               f"&& exec python3 -u -c {shlex.quote(code)}); "
-               'connect_bridge 0; rc=$?; if [[ $rc == 75 ]]; then connect_bridge 1; else exit "$rc"; fi')
+               'setup=local_setup.bash; fi; '
+               'source /opt/ros/humble/setup.bash && source "$HOME/$FSS_MISSION_WORKSPACE/install/$setup"; fi '
+               f'&& exec python3 -u -c {python_argument(bridge)}); '
+               'transition=first; while true; do connect_bridge "$transition"; rc=$?; case "$rc" in '
+               '75|77) transition=passive;; 76) transition=body;; *) exit "$rc";; esac; done')
         with client.get_transport().open_session(timeout=8) as ch:
             ch.exec_command("bash -c " + shlex.quote(cmd))
             ch.settimeout(0.1)
@@ -176,6 +231,7 @@ class JetsonLink(QObject):
             error = ""
             last_rx = time.monotonic()
             full_stream = False
+            observer = None
             while not self.stopped.is_set():
                 recording = self.data.recorder.active
                 if recording != full_stream:
@@ -186,7 +242,10 @@ class JetsonLink(QObject):
                     if time.monotonic() - stamp < 1:
                         ch.sendall((json.dumps([name, value]) + "\n").encode())
                     else:
-                        self.inbox.put([("reply_error", "전송 시간 초과")], timeout=2)
+                        error_event = "body_error" if name == "start_body" else "reply_error"
+                        if name.startswith("toss_"):
+                            error_event = "toss_error"
+                        self.inbox.put([(error_event, "전송 시간 초과")], timeout=2)
                 if ch.recv_stderr_ready():
                     error = ch.recv_stderr(8192).decode(errors="replace").strip()[-350:]
                 if time.monotonic() - last_rx > 12:
@@ -212,6 +271,9 @@ class JetsonLink(QObject):
                     if isinstance(event, list) and len(event) == 2:
                         if event[0] == "connected" and isinstance(event[1], SimpleNamespace):
                             event[1].received_at = last_rx
+                            if event[1].observer != observer:
+                                observer = event[1].observer
+                                full_stream = False
                         batch.append(event)
                 if batch:
                     self.inbox.put(batch, timeout=2)

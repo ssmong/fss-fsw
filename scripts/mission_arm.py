@@ -1,10 +1,83 @@
 """Planar arm feedback used by Mission Control. All angles are radians internally."""
 
 import math
+import time
+from bisect import bisect_left
+from collections import deque
 
 
 JOINTS = ("shoulder", "elbow", "wrist")
 JOINT_LABELS = ("어깨", "팔꿈치", "손목")
+
+
+class ViconArmOverlay:
+    """Align measured base-frame links with Vicon in ROS time for display only."""
+
+    def __init__(self):
+        self.config = None
+        self.vicon = deque(maxlen=64)
+        self.links = deque(maxlen=16)
+
+    def configure(self, values):
+        self.config = None
+        self.vicon.clear()
+        self.links.clear()
+        if (isinstance(values, (list, tuple)) and len(values) == 6
+                and all(type(v) in (int, float) and math.isfinite(v) for v in values)):
+            x, y, yaw, delay_ms, skew, timeout = values
+            if delay_ms >= 0 and skew > 0 and timeout > 0:
+                self.config = x, y, yaw, delay_ms / 1000, skew, min(timeout, 0.5)
+
+    def add(self, frame, header, sample):
+        if self.config is None:
+            return
+        buffer = self.vicon if frame == "table" else self.links
+        stamp = getattr(header, "stamp", None)
+        if not stamp or getattr(header, "frame_id", None) != frame:
+            return
+        t = stamp.sec + stamp.nanosec * 1e-9
+        if buffer is self.vicon:
+            t -= self.config[3]
+        if buffer and t < buffer[-1][0] - self.config[5]:
+            self.vicon.clear()
+            self.links.clear()
+        if not buffer or t > buffer[-1][0]:
+            buffer.append((t, time.monotonic(), sample))
+
+    def table_shape(self):
+        if self.config is None or not self.vicon or not self.links:
+            return None
+        ox, oy, angle_offset, _, max_skew, timeout = self.config
+        now = time.monotonic()
+        # Only interpolate between measured poses. A faster encoder stream can
+        # be ahead of the camera, so consider the most recent overlapping sample.
+        for t, received, shape in reversed(self.links):
+            if now - received > timeout or t < max(self.vicon[-1][0], self.links[-1][0]) - timeout:
+                break
+            i = bisect_left(self.vicon, t, key=lambda sample: sample[0])
+            if i == len(self.vicon):
+                continue
+            right = self.vicon[i]
+            if i == 0 and right[0] != t:
+                break
+            left = right if right[0] == t else self.vicon[i - 1]
+            span = right[0] - left[0]
+            if span > max_skew or min(left[1], right[1]) < now - timeout:
+                continue
+            ratio = (t - left[0]) / span if span else 0
+            x, y, yaw = left[2]
+            nx, ny, nyaw = right[2]
+            x += ratio * (nx - x)
+            y += ratio * (ny - y)
+            yaw += ratio * math.remainder(nyaw - yaw, math.tau)
+            c, s = math.cos(yaw), math.sin(yaw)
+            x += c * ox - s * oy
+            y += s * ox + c * oy
+            yaw += angle_offset
+            c, s = math.cos(yaw), math.sin(yaw)
+            points, wrist = shape
+            return tuple((x + c * px - s * py, y + s * px + c * py) for px, py in points), yaw + wrist
+        return None
 
 
 def joint_angles(message):
@@ -15,6 +88,20 @@ def joint_angles(message):
     if not all(name in values and math.isfinite(values[name]) for name in JOINTS):
         return None
     return tuple(values[name] for name in JOINTS)
+
+
+def pose_yaw_deg(q):
+    components = tuple(getattr(q, key, None) for key in ("x", "y", "z", "w"))
+    if any(v is None or not math.isfinite(v) for v in components):
+        return None
+    x, y, z, w = components
+    if not math.isclose(math.hypot(x, y, z, w), 1.0, abs_tol=1e-3):
+        return None
+    # The end effector's +X axis projected onto the table.
+    forward_x, forward_y = w*w + x*x - y*y - z*z, 2 * (x*y + w*z)
+    if math.hypot(forward_x, forward_y) > 1e-8:
+        return math.degrees(math.atan2(forward_y, forward_x))
+    return None
 
 
 def link_points(message, frame):

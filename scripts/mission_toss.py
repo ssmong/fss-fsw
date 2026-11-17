@@ -1,0 +1,306 @@
+"""Operator-triggered adapter for the bench's ~/.bash_aliases self-tossing interface."""
+
+import ast
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+if "device_processes" not in globals():  # SSH bridge concatenates these modules.
+    from mission_runtime import (FSS_NODES, PRIVATE, ROS_ENV_KEYS, checkout_for, device_processes,
+                                 executable_name, guarded_full_launch, launch_package, process_role,
+                                 ros_network, select_workspace)
+
+
+TOSS_METHODS = ("Proposed", "Nominal", "JF_only")
+# The lab's Nominal run uses the velocity tracking override on its toss_run command.
+TOSS_RUN_OPTIONS = {"Nominal": ("tracking_mode:=velocity",)}
+TOSS_COMMANDS = ("toss_prepare", "toss_start", "toss_stop")
+TOSS_START_PHASES = ("IDLE", "STOPPED", "MISSED", "A_HELD")
+TOSS_UPGRADE = "Self-tossing FSW 런처 업데이트 필요"
+
+
+def toss_bench_installed(home=None):
+    home = home or Path.home()
+    root = home / "self_tossing_hardware"
+    if not all(path.is_file() for path in (root / "scripts/env.sh", root / "install_client/local_setup.bash",
+                                           home / PRIVATE / "install/local_setup.bash")):
+        return False
+    try:
+        aliases = (home / ".bash_aliases").read_text()
+    except OSError:
+        return False
+    return all(re.search(r"^\s*(?:function\s+)?" + name + r"\s*\(\s*\)\s*\{", aliases, re.MULTILINE)
+               for name in ("toss_fss", "toss_run", "toss_start", "toss_stop"))
+
+
+def detect_toss_workflow(domain=None):
+    if not toss_bench_installed():
+        return False
+    native = False
+    for argv, env in device_processes(Path("/proc")):
+        if (toss_flight(argv, env) or launch_package(argv) == "self_tossing_hils"
+                or executable_name(argv) == "capture_executor"):
+            return True
+        native |= process_role(argv, environ=env) == "flight"
+    return not native
+
+
+def toss_process(pid, proc):
+    # /proc/pid/stat's parenthesized command can contain spaces and parentheses.
+    fields = (proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+    return int(fields[1]), int(fields[3]), int(fields[19])  # parent, session, start ticks
+
+
+def toss_flight(argv, env):
+    expected = {"use_arm:=true", "use_thrusters:=false", "use_imu:=true", "use_realsense:=false",
+                "auto_activate:=true", "toss_nav_uncertainty_grace:=true",
+                f"arm_config:={Path.home() / PRIVATE}/src/hardware/hardware_runtime/config/arm.yaml"}
+    options = [arg for arg in argv if ":=" in arg]
+    return (launch_package(argv) == "fss_bringup" and "fss_full.launch.py" in argv
+            and checkout_for(argv, env) == PRIVATE and len(options) == len(expected) and set(options) == expected)
+
+
+def active_toss_env():
+    fleets = [env for argv, env in device_processes(Path("/proc")) if toss_flight(argv, env)]
+    return fleets[0] if len(fleets) == 1 else None
+
+
+def attach_toss(domain=None):
+    # The bench's interactive shell may have its own DDS settings.
+    env = active_toss_env()
+    if env is not None:
+        for key in ROS_ENV_KEYS:
+            if key in env:
+                os.environ[key] = env[key]
+            else:
+                os.environ.pop(key, None)
+    if domain is not None:
+        os.environ["ROS_DOMAIN_ID"] = str(domain)
+
+
+def toss_trigger_reply(output):
+    for line in reversed(output.splitlines()):
+        try:
+            expr = ast.parse(line.strip(), mode="eval").body
+            if not isinstance(expr, ast.Call):
+                continue
+            if getattr(expr.func, "attr", None) != "Trigger_Response":
+                continue
+            fields = {item.arg: ast.literal_eval(item.value) for item in expr.keywords}
+            if fields.get("success") is True:
+                return fields.get("message") or "요청 수락"
+            raise RuntimeError(fields.get("message") or "실험 서비스가 요청을 거부했습니다.")
+        except (ValueError, SyntaxError):
+            continue
+    raise RuntimeError("실험 서비스 응답을 확인할 수 없습니다.")
+
+
+class TossBench:
+    def __init__(self, home=None, proc=Path("/proc")):
+        self.home = home or Path.home()
+        self.proc = proc
+        self.state = self.home / ".ros/mission-control"
+        self.children = []
+        self.child_lock = threading.Lock()
+        self.cancelled = threading.Event()
+        self.phase = ""
+        self.phase_at = float("-inf")
+
+    def observe(self, status):
+        if isinstance(status, dict) and isinstance(status.get("phase"), str):
+            self.phase = status["phase"]
+            self.phase_at = time.monotonic()
+
+    def _owner_record(self, action):
+        try:
+            record = json.loads((self.state / (action + ".json")).read_text())
+            pid, ticks = record[:2]
+            _, session, start = toss_process(pid, self.proc)
+            return record if pid == session and ticks == start else None
+        except (FileNotFoundError, ValueError, TypeError, IndexError):
+            return None
+
+    def _owner(self, action):
+        record = self._owner_record(action)
+        return record[0] if record else None
+
+    def _stage(self, names, expected_fss=None):
+        # Reap only launch wrappers started by this bridge.
+        with self.child_lock:
+            self.children[:] = [child for child in self.children if child.poll() is None]
+        if not (self.home / ".bash_aliases").is_file():
+            return (), "~/.bash_aliases 없음"
+        ancestry, programs, fss, paper, executors = {}, {}, [], [], []
+        paper_options = []
+        for pid, argv, env in device_processes(self.proc, with_pid=True):
+            try:
+                parent, session, _ = toss_process(pid, self.proc)
+            except FileNotFoundError:
+                continue
+            if ros_network(env) != ros_network(os.environ):
+                return (), "다른 ROS 환경에서 기체 사용 중"
+            ancestry[pid] = (parent, session)
+            programs[pid] = executable_name(argv)
+            package = launch_package(argv)
+            if toss_flight(argv, env):
+                fss.append(pid)
+            elif package == "self_tossing_hils" and "paper_toss.launch.py" in argv:
+                paper.append(pid)
+                paper_options = [arg for arg in argv if ":=" in arg]
+            elif executable_name(argv) == "capture_executor":
+                executors.append(pid)
+        if len(fss) > 1 or len(paper) > 1 or len(executors) > 1:
+            return (), "기체 또는 실험 실행기 중복"
+        if expected_fss and fss and ancestry[fss[0]][1] != expected_fss:
+            return (), "기체 실행 소유자 변경"
+        # Only launch-tree children may share hardware with a verified full-toss stack.
+        roots = set(fss + paper)
+        fss_nodes = set()
+        for pid in ancestry:
+            owner = pid
+            while owner in ancestry and owner not in roots and owner > 1:
+                owner = ancestry[owner][0]
+            if owner not in roots:
+                return (), "다른 실험에서 사용 중"
+            if owner in fss:
+                fss_nodes.add(programs[pid])
+        if any(names.count(name) > 1 for name in (*FSS_NODES, "paper_toss_executor")):
+            return (), "ROS 기체 또는 실험 실행기 중복"
+        phase = self.phase if time.monotonic() - self.phase_at < 3 else ""
+        record = self._owner_record("toss_run")
+        launch = record[0] if record else None
+        if paper or executors or "paper_toss_executor" in names or launch:
+            if not launch or any(ancestry[pid][1] != launch for pid in paper + executors):
+                return (), "기존 실험 · " + (phase or "상태 수신 대기")
+            if paper and (len(record) != 3 or record[2] not in TOSS_METHODS
+                          or sorted(paper_options) != sorted(("execute:=true", "method:=" + record[2],
+                                                              *TOSS_RUN_OPTIONS.get(record[2], ())))):
+                return (), "실행기 방법 또는 설정 불일치"
+            if not fss or not paper or not executors or "paper_toss_executor" not in names or not phase:
+                return (), "실험 상태 수신 대기"
+            if phase in TOSS_START_PHASES:
+                if phase == "A_HELD":
+                    return ("toss_start", "toss_stop"), phase
+                return ("toss_start",), phase
+            return ("toss_stop",), phase
+        if fss:
+            if ({"arm_driver_node", "manager_node"}.issubset(names)
+                    and "manager_node" in fss_nodes and fss_nodes.intersection(("arm_driver_node", "arm_driver"))):
+                return ("toss_run",), "실험 FSW 준비됨"
+            return (), "실험 FSW 준비 중"
+        if self._owner("toss_fss"):
+            return (), "실험 FSW 준비 중"
+        if FSS_NODES.intersection(names):
+            return (), "ROS 도메인에서 다른 기체 사용 중"
+        if not guarded_full_launch(self.home / PRIVATE):
+            return (), TOSS_UPGRADE
+        return ("toss_fss",), "실험 FSW 대기"
+
+    def available(self, names):
+        actions, status = self._stage(names)
+        if actions in (("toss_fss",), ("toss_run",)):
+            actions = ("toss_prepare",)
+        return actions, status
+
+    def capabilities(self, names, domain):
+        actions, status = self.available(names)
+        body = False
+        if domain is None and (status in (TOSS_UPGRADE, "실험 FSW 대기")):
+            try:
+                work = select_workspace(os.getenv("FSS_MISSION_PREFERRED", PRIVATE), home=self.home, proc=self.proc)
+                body = work != PRIVATE and guarded_full_launch(self.home / work)
+            except (RuntimeError, OSError):
+                pass
+        return actions, status, body
+
+    def request(self, action, value, names, verify_service):
+        from fcntl import LOCK_EX, LOCK_NB, flock
+
+        if action not in TOSS_COMMANDS or (value not in TOSS_METHODS if action == "toss_prepare" else value is not True):
+            raise ValueError("올바르지 않은 실험 요청")
+        self.state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if action != "toss_prepare":
+            return self._invoke(action, value, names, verify_service)
+        with (self.state / "toss-prepare.lock").open("a") as reservation:
+            try:
+                flock(reservation, LOCK_EX | LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("다른 관제에서 실험 준비 중") from exc
+            actions, status = self._stage(names())
+            expected_fss = None
+            if actions == ("toss_fss",):
+                self._invoke("toss_fss", True, names, verify_service)
+                expected_fss = self._owner("toss_fss")
+                if not expected_fss:
+                    raise RuntimeError(f"FSW 기동 실패 · {self.state / 'toss_fss.log'}")
+                deadline = time.monotonic() + 25
+                while not self.cancelled.wait(0.25):
+                    actions, status = self._stage(names(), expected_fss)
+                    if actions == ("toss_run",):
+                        break
+                    if (not self._owner("toss_fss") or time.monotonic() >= deadline
+                            or status != "실험 FSW 준비 중"):
+                        raise RuntimeError(f"FSW 준비 확인 필요 · {status} · {self.state / 'toss_fss.log'}")
+            if self.cancelled.is_set() or actions != ("toss_run",):
+                raise RuntimeError(status)
+            self._invoke("toss_run", value, names, verify_service, expected_fss)
+            deadline = time.monotonic() + 25
+            while not self.cancelled.wait(0.25):
+                actions, status = self._stage(names(), expected_fss)
+                if actions and all(item in ("toss_start", "toss_stop") for item in actions):
+                    return f"{value} 실험 준비 완료 · {status}"
+                if (not self._owner("toss_run") or time.monotonic() >= deadline
+                        or status != "실험 상태 수신 대기"):
+                    raise RuntimeError(f"실행기 준비 확인 필요 · {status} · {self.state / 'toss_run.log'}")
+            raise RuntimeError("연결 종료")
+
+    def _invoke(self, action, value, names, verify_service, expected_fss=None):
+        from fcntl import LOCK_EX, LOCK_NB, flock
+
+        with (self.state / "startup.lock").open("a") as lock:
+            try:
+                flock(lock, LOCK_EX | LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("다른 기체 요청 처리 중") from exc
+            choices, status = self._stage(names(), expected_fss)
+            if action not in choices or self.cancelled.is_set():
+                raise RuntimeError(status)
+            command = ["bash", "-c", 'source "$HOME/.bash_aliases" && "$@"', "mission-control", action]
+            if action == "toss_run":
+                command.extend((value, *TOSS_RUN_OPTIONS.get(value, ())))
+            if action in ("toss_start", "toss_stop"):
+                verify_service("/paper_toss/" + action.removeprefix("toss_"))
+                # These aliases call the existing Trigger service, including its ownership/interlock checks.
+                # A ROS CLI exit status alone does not establish that the request was accepted.
+                with (self.state / "toss-trigger.log").open("w+") as output:
+                    child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                             start_new_session=True)
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        import signal
+                        # Only cancel our transient CLI request. The target executor owns its motion.
+                        os.killpg(child.pid, signal.SIGKILL)
+                        child.wait()
+                        raise RuntimeError("실험 서비스 응답 시간 초과 · 현재 단계를 확인하세요.")
+                    output.seek(0)
+                    result = output.read(32768)
+                if child.returncode:
+                    raise RuntimeError(result.strip()[-350:] or "실험 서비스 호출 실패")
+                return toss_trigger_reply(result)
+            log = self.state / (action + ".log")
+            with log.open("ab") as output:
+                child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                         start_new_session=True)
+            with self.child_lock:
+                self.children.append(child)
+            _, _, ticks = toss_process(child.pid, self.proc)
+            record = self.state / (action + ".json")
+            owner = [child.pid, ticks] + ([value] if action == "toss_run" else [])
+            record.with_suffix(".tmp").write_text(json.dumps(owner))
+            record.with_suffix(".tmp").replace(record)
+            return f"{action} {value if action == 'toss_run' else ''} 기동 요청 · {log}".replace("  ", " ")

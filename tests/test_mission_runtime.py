@@ -2,7 +2,7 @@
 
 import sys
 import os
-import ast
+import json
 import shlex
 import tempfile
 import unittest
@@ -15,8 +15,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from mission_ros import MissionActions, ValveOutput
 from mission_runtime import (
     PUBLIC, PRIVATE, PRIVATE_CPP, HardwareBusy, checkout_for, local_service_owner,
-    local_stacks, native_overlay_changed, prepare_hardware, prepare_session, process_role, select_workspace,
+    local_stacks, native_overlay_changed, prepare_hardware, prepare_session, process_role, select_workspace, startup_failure,
 )
+
+
+class BodyAvailability(unittest.TestCase):
+    def test_heartbeat_hides_local_or_other_launch_and_offers_retry_when_idle(self):
+        import mission_ros
+
+        ros, node = Mock(), Mock()
+        events = []
+        clock = iter([0, 1, 2, 3, 4, 5, 6, 7])
+        now = [next(clock)]
+        node.get_name.return_value = "fss_mission_test"
+        node.get_node_names.side_effect = [[], [], ["gnc_node"], [], [], [], [], []]
+        ros.ok.side_effect = [True] * 8 + [False]
+        def advance(*_args, **_kwargs):
+            mission_ros._starting_flight = None
+            now[0] = next(clock, now[0])
+
+        ros.spin_once.side_effect = advance
+        processes = Mock(side_effect=[{"flight": ["external"]}, {"flight": []}])
+        runtime = dict(_starting_flight=object(), prepare_hardware=Mock(), PUBLIC=PUBLIC,
+                       PRIVATE_CPP=PRIVATE_CPP, FSS_NODES={"gnc_node"}, local_stacks=processes)
+        modules = {"rclpy": ros, "rosidl_runtime_py.convert": Mock()}
+        env = {"ROS_LOCALHOST_ONLY": "1", "ROS_DOMAIN_ID": "0", "FSS_MISSION_WORKSPACE": PUBLIC}
+        with (patch.dict(mission_ros.__dict__, runtime), patch.dict(sys.modules, modules),
+              patch.dict(os.environ, env), patch.object(mission_ros, "open_node", return_value=(node, None)),
+              patch("mission_ros.time.monotonic", side_effect=lambda: now[0]),
+              patch("mission_ros.select.select", return_value=([], [], [])),
+              patch("builtins.print", side_effect=lambda msg, **kw: events.append(json.loads(msg)))):
+            mission_ros.serve()
+        self.assertEqual([value["can_start_body"] for name, value in events if name == "connected"],
+                         [False, False, False, True, True, True, True, True])
+        self.assertEqual(processes.call_count, 2)
+        runtime["prepare_hardware"].assert_not_called()
 
 
 class ValveTelemetry(unittest.TestCase):
@@ -129,6 +162,12 @@ class FlightCommands(unittest.TestCase):
 
 
 class Discovery(unittest.TestCase):
+    def setUp(self):
+        guard = patch("mission_runtime.claim_installed_hardware")
+        self.lease = guard.start()
+        self.addCleanup(guard.stop)
+        self.lease.return_value.__enter__.return_value.fileno.return_value = 43
+
     @staticmethod
     def install_launch_fixture(prefix):
         launch = prefix / "share/fss_bringup/launch"
@@ -141,7 +180,8 @@ class Discovery(unittest.TestCase):
             if source.is_dir():
                 (launch / name).write_bytes((source / name).read_bytes())
             else:  # Private clone before its native submodule is initialized.
-                (launch / name).write_text('LaunchConfiguration("require_explicit_target")')
+                (launch / name).write_text('LaunchConfiguration("require_explicit_target")\n'
+                                           'OpaqueFunction(function=claim_launch, condition=UnlessCondition(use_sim))')
 
     def test_portable_overlay_selection_from_installs_and_live_processes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -282,37 +322,49 @@ class Discovery(unittest.TestCase):
                 for owner in ("self_tossing_hils", PRIVATE, "FSS_FSW/hardware_runtime", alternate + " · self_tossing_hils"):
                     self.assertFalse(native_overlay_changed(str(HardwareBusy({}, owner))))
 
-    def test_ssh_bootstrap_enables_autostart_only_on_first_normal_attach(self):
+    def test_ssh_workflow_selection_and_explicit_shared_bench_start(self):
+        import mission_bootstrap as boot
+
+        for shared in (True, False):
+            for profile in ("auto", "monitor"):
+                with patch.object(boot, "detect_toss_workflow", return_value=shared), patch.object(
+                        boot, "select_workspace", return_value=PUBLIC):
+                    self.assertEqual(boot.bridge_selection(profile, None, "first", PUBLIC),
+                                     ("toss", PRIVATE) if shared else ("control", PUBLIC))
+                    self.assertEqual(boot.bridge_selection(profile, None, "body", PUBLIC), ("control", PUBLIC))
+                for transition in ("first", "passive", "body"):
+                    for domain in (None, 3):
+                        with patch.object(boot, "toss_bench_installed", return_value=shared), patch.object(
+                                boot, "prepare_session", return_value=("ready", "")) as prepare, patch.object(
+                                boot, "private_base", return_value=None):
+                            ctx = boot.bridge_context(profile, domain, transition, "control")
+                            expected = (profile == "auto" and domain is None and
+                                        (transition == "body" or transition == "first" and not shared))
+                            prepare.assert_called_once_with(profile == "monitor", domain, start_if_idle=expected)
+                            self.assertTrue(ctx["follow_workflow"])
+                with patch.object(boot, "prepare_session") as prepare, patch.object(boot, "attach_toss") as attach:
+                    ctx = boot.bridge_context(profile, None, "first", "toss")
+                    attach.assert_called_once_with(None)
+                    prepare.assert_not_called()
+                    self.assertEqual(ctx["toss_monitor"], profile == "monitor")
+
+    def test_ssh_bootstrap_fits_exec_argument_limit(self):
         try:
             from mission_link import JetsonLink
         except ModuleNotFoundError as exc:
             if exc.name == "PySide6":
                 self.skipTest("PySide6 unavailable")
             raise
-        for monitor, domain in ((False, None), (True, None), (False, 3)):
-            client = MagicMock()
-            link = JetsonLink(Mock(), monitor_only=monitor)
-            link.stopped.set()
-            link._telemetry(client, domain)
-            channel = client.get_transport.return_value.open_session.return_value.__enter__.return_value
-            shell = shlex.split(channel.exec_command.call_args.args[0])[2]
-            bridge = next(arg.removesuffix(");") for arg in shlex.split(shell) if "first_attach =" in arg)
-            tree = ast.parse(bridge)
-            begin = next(i for i, line in enumerate(tree.body) if isinstance(line, ast.Assign)
-                         and getattr(line.targets[0], "id", None) == "first_attach")
-            startup = compile(ast.Module(tree.body[begin:begin+3], []), "<bootstrap>", "exec")
-            for first in (True, False):
-                attach = Mock(return_value=("기체 연결", ""))
-                scope = {"os": os, "prepare_session": attach, "native_overlay_changed": lambda _: True}
-                with patch.dict(os.environ, {"FSS_MISSION_REATTACH": "0" if first else "1"}):
-                    should_start = first and not monitor and domain is None
-                    if should_start:
-                        with self.assertRaises(SystemExit) as result:
-                            exec(startup, scope)
-                        self.assertEqual(result.exception.code, 75)
-                    else:
-                        exec(startup, scope)
-                    attach.assert_called_once_with(monitor, domain, start_if_idle=should_start)
+        link = JetsonLink(Mock())
+        link.stopped.set()
+        client = MagicMock()
+        link._telemetry(client, None)
+        channel = client.get_transport.return_value.open_session.return_value.__enter__.return_value
+        command = channel.exec_command.call_args.args[0]
+        self.assertLess(len(command.encode()), 128 * 1024)
+        args = shlex.split(command)
+        self.assertEqual(args[:2], ["bash", "-c"])
+        self.assertEqual(len(args), 3)
 
     def test_mismatched_discovery_profiles_cannot_start_or_attach_for_commands(self):
         peers = [{"ROS_DOMAIN_ID": "8", "CYCLONEDDS_URI": uri} for uri in ("file:///a", "file:///b")]
@@ -450,8 +502,12 @@ class Discovery(unittest.TestCase):
                 self.assertEqual([args.args[0] for args in popen.call_args_list],
                                  [["bash", "scripts/launch/start_imu.sh"],
                                   ["ros2", "launch", "fss_bringup", "fss_full.launch.py",
-                                   "gnc_backend:=cpp", "require_explicit_target:=true"]])
+                                   "gnc_backend:=cpp", "use_arm:=false", "require_explicit_target:=true"]])
                 self.assertEqual(os.environ["ROS_LOCALHOST_ONLY"], "1")
+                self.lease.assert_called_once()
+                for call in popen.call_args_list:
+                    self.assertEqual(call.kwargs["pass_fds"], (43,))
+                    self.assertEqual(call.kwargs["env"]["FSS_HARDWARE_LEASE_FD"], "43")
 
     def test_failed_auto_launch_retains_manual_retry_and_rejects_old_launch_files_before_spawning(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -470,6 +526,18 @@ class Discovery(unittest.TestCase):
                 self.assertFalse(reason)
                 spawn.assert_not_called()
                 self.install_launch_fixture(install)
+                legacy = home / PRIVATE / "install"
+                legacy.mkdir(parents=True)
+                (legacy / "setup.bash").touch()
+                profile = home / PRIVATE_CPP / "base.launch.py"
+                profile.parent.mkdir(parents=True)
+                profile.write_text('LaunchConfiguration("require_explicit_target")')
+                status, reason = prepare_session(start_if_idle=True)
+                self.assertIn("하드웨어 잠금 런처", status)
+                self.assertFalse(reason)
+                spawn.assert_not_called()
+                self.lease.assert_not_called()
+                self.install_launch_fixture(legacy)
                 spawn.return_value.poll.return_value = 2
                 status, reason = prepare_session(start_if_idle=True)
                 self.assertIn("flight.log", status)
@@ -482,6 +550,10 @@ class Discovery(unittest.TestCase):
                 spawn.return_value.poll.return_value = None
                 self.assertEqual(prepare_hardware(), "기체 소프트웨어 기동")
                 self.assertEqual(spawn.call_count, 2)
+                self.assertEqual(startup_failure([]), "")
+                spawn.return_value.poll.return_value = 3
+                self.assertIn("시작 중 종료 (3)", startup_failure([]))
+                self.assertEqual(startup_failure([]), "")
 
     def test_match_launch_argv_not_python_source_or_shell_text(self):
         self.assertIsNone(process_role(["python3", "-c", "ros2 launch self_tossing_hils"]))

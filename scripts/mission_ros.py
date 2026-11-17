@@ -117,6 +117,61 @@ class MissionActions:
                 self.request("valve", False)
 
 
+class ArmRegistration:
+    """Read the tracking-frame calibration from the active link publisher."""
+
+    def __init__(self, node, receive, trigger):
+        self.node, self.receive = node, receive
+        self.client = node.create_client(trigger, "/arm/kinematics_model")
+        self.request = trigger.Request()
+        self.owner = self.pending = None
+        self.loaded = False
+        self.retry_at = 0.0
+
+    def poll(self):
+        links = self.node.get_publishers_info_by_topic("/arm/link_poses_base")
+        camera = self.node.get_publishers_info_by_topic("/sensors/vicon_state")
+        owner = None
+        if (len(links) == len(camera) == 1 and links[0].node_name == "arm_kinematics_node"
+                and links[0].node_namespace == "/" and camera[0].node_namespace == "/"
+                and camera[0].node_name in ("vicon_bridge_node", "plant_model_node")
+                and self.node.get_node_names().count("arm_kinematics_node") == 1):
+            owner = bytes(links[0].endpoint_gid), bytes(camera[0].endpoint_gid)
+        if owner != self.owner:
+            if self.pending:
+                self.pending.cancel()
+            self.owner, self.pending, self.loaded, self.retry_at = owner, None, False, 0.0
+            self.receive("arm_registration", None)
+        if owner is None or self.loaded:
+            return
+        if self.pending and self.pending.done():
+            try:
+                response = self.pending.result()
+                if response.success and len(response.message) <= 65536:
+                    info = json.loads(response.message)
+                    cfg = info["configuration"]
+                    if (info["schema_version"] == 1 and cfg["frame_id"] == "table" and cfg["base_frame_id"] == "base_link"
+                            and cfg["navigation_topic"] in ("/navigation/state", "/sensors/vicon_state")):
+                        self.receive("arm_registration", [*cfg["navigation_to_base"], cfg["vicon_only_alignment_ms"],
+                                                          cfg["maximum_sample_skew_s"], cfg["feedback_timeout_s"]])
+                        self.loaded = True
+            except Exception:
+                # Optional calibration may disappear during a driver restart.
+                pass
+            self.pending = None
+        now = time.monotonic()
+        if not self.loaded and now >= self.retry_at:
+            if self.pending:
+                self.pending.cancel()
+                self.pending = None
+            if self.client.service_is_ready():
+                self.retry_at = now + 3.0
+                try:
+                    self.pending = self.client.call_async(self.request)
+                except RuntimeError:
+                    pass
+
+
 class ValveOutput:
     topic = "/actuators/valve_commands"
     status_topic = "/actuators/valve_status"
@@ -200,6 +255,7 @@ def open_node(receive, reply, args=None, reject=None):
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Imu, JointState
     from std_msgs.msg import String
+    from std_srvs.srv import Trigger
 
     rclpy.init(args=args)
     node = rclpy.create_node("fss_mission_" + uuid.uuid4().hex)
@@ -263,6 +319,8 @@ def open_node(receive, reply, args=None, reject=None):
             receive("paper_trial", ["", None, None])
 
     node.create_subscription(String, "/paper_toss/status", paper_status, qos_profile_sensor_data)
+    registration = ArmRegistration(node, receive, Trigger)
+    node.create_timer(1.0, registration.poll)
     valve_output = ValveOutput(node, receive, GetParameters)
     node.create_subscription(ValveCommands, valve_output.topic, valve_output.native, 10)
 
@@ -330,6 +388,8 @@ def serve():
     recording = False
 
     def forward(name, msg):
+        if name == "paper_status" and globals().get("toss_bench"):
+            toss_bench.observe(msg)
         if not recording and name in ("arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"):
             if name == "arm_driver":
                 sample_ns = time.monotonic_ns()
@@ -344,7 +404,7 @@ def serve():
         # The dashboard uses IMU arrivals only to measure the incoming rate.
         if name == "imu" and not recording:
             data = {}
-        elif name in ("plans", "paper_trial", "paper_status", "tracking_error"):
+        elif name in ("plans", "paper_trial", "paper_status", "tracking_error", "arm_registration"):
             data = msg
         elif name == "valve_output":
             data = {"duty_cycles": msg.duty_cycles}
@@ -368,21 +428,88 @@ def serve():
             emit("reply_error", status)
     heartbeat = 0.0
     pending = b""
-    def can_start_body():
-        return (not globals().get("read_only") and "prepare_hardware" in globals()
-                and os.getenv("FSS_MISSION_WORKSPACE") in (PUBLIC, PRIVATE_CPP)
-                and os.getenv("ROS_LOCALHOST_ONLY") == "1" and os.getenv("ROS_DOMAIN_ID", "0") == "0"
-                and not FSS_NODES.intersection(node.get_node_names()))
+    bench = globals().get("toss_bench")
+    passive = globals().get("toss_monitor", False)
+    domain = globals().get("toss_domain")
+    next_workflow_check = 0.0
+    toss_pool = toss_future = None
+    if bench:
+        from concurrent.futures import ThreadPoolExecutor
+        toss_pool = ThreadPoolExecutor(max_workers=1)
+
+    def verify_toss_service(service):
+        publishers = node.get_publishers_info_by_topic("/paper_toss/status")
+        if (len(publishers) != 1 or publishers[0].node_name != "paper_toss_executor"
+                or publishers[0].node_namespace != "/"):
+            raise RuntimeError("실험 상태 발행자를 확인할 수 없습니다.")
+        owners = []
+        for name, namespace in node.get_node_names_and_namespaces():
+            if any(s == service and "std_srvs/srv/Trigger" in types
+                   for s, types in node.get_service_names_and_types_by_node(name, namespace)):
+                owners.append((name, namespace))
+        if owners != [("paper_toss_executor", "/")]:
+            raise RuntimeError("실험 서비스 소유자를 확인할 수 없습니다.")
+    next_idle_check = 0.0
+    idle = False
+
+    def can_start_body(names):
+        nonlocal next_idle_check, idle
+        if (globals().get("read_only") or "prepare_hardware" not in globals()
+                or os.getenv("FSS_MISSION_WORKSPACE") not in (PUBLIC, PRIVATE_CPP)
+                or os.getenv("ROS_LOCALHOST_ONLY") != "1" or os.getenv("ROS_DOMAIN_ID", "0") != "0"
+                or globals().get("_starting_flight") is not None or FSS_NODES.intersection(names)):
+            next_idle_check = 0.0
+            return False
+        # Another bridge's launcher can be alive before its ROS nodes appear.
+        now = time.monotonic()
+        if now >= next_idle_check:
+            try:
+                idle = not local_stacks()["flight"]
+            except (OSError, RuntimeError):
+                idle = False
+            next_idle_check = now + 5.0
+        return idle
 
     try:
         while rclpy.ok():
+            if toss_future and toss_future.done():
+                try:
+                    emit("toss_reply", toss_future.result())
+                except Exception as exc:
+                    emit("toss_error", str(exc) or type(exc).__name__)
+                toss_future = None
+                heartbeat = 0.0
             if time.monotonic() >= heartbeat:
-                peers = [name for name in node.get_node_names() if name.startswith("fss_mission_")]
+                names = node.get_node_names()
+                peers = [name for name in names if name.startswith("fss_mission_")]
+                check_start = globals().get("startup_failure")
+                if check_start and (error := check_start(names)):
+                    emit("log", {"level": 40, "name": "Mission Control", "msg": error})
+                    emit("reply_error", error)
+                toss_actions, toss_state = (), ""
+                body_allowed = False
+                if bench:
+                    try:
+                        toss_actions, toss_state, body_allowed = bench.capabilities(names, domain)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        toss_state = str(exc)
+                else:
+                    body_allowed = can_start_body(names)
+                if (globals().get("follow_workflow") and toss_future is None
+                        and time.monotonic() >= next_workflow_check):
+                    next_workflow_check = time.monotonic() + 3
+                    next_toss = detect_toss_workflow(domain)
+                    env = active_toss_env() if bench and next_toss and domain is None else None
+                    if (bool(bench) != next_toss or (env is not None and ros_network(env) != ros_network(os.environ))):
+                        raise SystemExit(77)
                 emit("connected", {"observer": node.get_name(), "peers": peers,
                                    "workspace": os.getenv("FSS_MISSION_WORKSPACE"),
                                    "private_arm": globals().get("private_arm", False),
-                                   "can_start_body": can_start_body(),
-                                   "read_only": globals().get("read_only", "")})
+                                   "can_start_body": body_allowed and not passive and toss_future is None,
+                                   "workflow": "toss" if bench else "control",
+                                   "toss_actions": toss_actions if toss_future is None and not passive else (),
+                                   "toss_state": toss_state, "read_only": ("모니터링 전용" if passive else "")
+                                   if bench else globals().get("read_only", "")})
                 heartbeat = time.monotonic() + 1
             if select.select([sys.stdin], [], [], 0)[0]:
                 data = os.read(sys.stdin.fileno(), 4096)
@@ -394,19 +521,37 @@ def serve():
                     name, value = json.loads(command)
                     if name == "record_stream":
                         recording = value is True
+                    elif bench:
+                        if name == "start_body":
+                            try:
+                                if (value is not True or passive or toss_future is not None
+                                        or not bench.capabilities(node.get_node_names(), domain)[2]):
+                                    raise ValueError("기체 실행 가능 상태를 확인하세요.")
+                                emit("body_reply", "기체 제어 FSW 전환 중")
+                                raise SystemExit(76)
+                            except (OSError, RuntimeError, ValueError) as exc:
+                                emit("body_error", str(exc))
+                        elif passive or name not in TOSS_COMMANDS or toss_future is not None:
+                            emit("toss_error", "실험 명령 또는 처리 상태를 확인하세요.")
+                        else:
+                            toss_future = toss_pool.submit(bench.request, name, value, node.get_node_names, verify_toss_service)
                     elif name == "start_body":
                         try:
-                            if value is not True or not can_start_body():
+                            if value is not True or not can_start_body(node.get_node_names()):
                                 raise ValueError("기체 실행 상태를 확인하세요.")
-                            emit("reply", prepare_hardware())
+                            emit("body_reply", prepare_hardware())
                         except (OSError, RuntimeError, ValueError) as exc:
-                            emit("reply_error", str(exc))
+                            emit("body_error", str(exc))
+                        next_idle_check = 0.0
                     else:
                         request(name, value)
             rclpy.spin_once(node, timeout_sec=0.02)
     except (BrokenPipeError, KeyboardInterrupt):
         pass
     finally:
+        if bench:
+            bench.cancelled.set()
+            toss_pool.shutdown(wait=True, cancel_futures=True)
         node.destroy_node()
         rclpy.shutdown()
 

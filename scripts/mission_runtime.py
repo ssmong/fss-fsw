@@ -23,6 +23,7 @@ class HardwareBusy(RuntimeError):
 
 PUBLIC, PRIVATE = "fss-fsw", "FSS_FSW"
 PRIVATE_CPP = PRIVATE + "/runtime/cpp"
+_starting_flight = None
 
 
 def program_path(argv):
@@ -88,7 +89,7 @@ def process_role(argv, selected=None, environ=None):
     return None
 
 
-def device_processes(proc):
+def device_processes(proc, *, with_pid=False):
     for process in proc.iterdir():
         if not process.name.isdigit():
             continue
@@ -111,7 +112,7 @@ def device_processes(proc):
             if relevant:
                 raise RuntimeError("실행 중인 장치 프로세스의 ROS 환경을 확인할 수 없습니다.") from exc
             continue
-        yield argv, env
+        yield (int(process.name), argv, env) if with_pid else (argv, env)
 
 
 def native_install(work):
@@ -251,9 +252,37 @@ def forwards_target_wait(path):
                for node in ast.walk(tree))
 
 
+def guarded_full_launch(workspace):
+    """Check the installed launcher that ros2 launch will resolve."""
+    install = Path(workspace) / "install"
+    for prefix in (install / "fss_bringup", install):
+        path = prefix / "share/fss_bringup/launch/fss_full.launch.py"
+        if path.is_file():
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, UnicodeError):
+                return False
+            return any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                       and node.func.id == "OpaqueFunction"
+                       and any(kw.arg == "function" and isinstance(kw.value, ast.Name)
+                               and kw.value.id == "claim_launch" for kw in node.keywords)
+                       for node in ast.walk(tree))
+    return False
+
+
+def claim_installed_hardware():
+    try:
+        from fss_common.hardware_ownership import claim_hardware
+        from fss_common.mission_device_probe import device_resource_owner
+    except ImportError as exc:
+        raise RuntimeError("Jetson FSW 하드웨어 잠금 모듈을 업데이트하세요.") from exc
+    return claim_hardware(probe=device_resource_owner)
+
+
 def prepare_hardware(*, only_if_idle=False):
     """Serialize startup and check ownership again before opening any devices."""
     from fcntl import LOCK_EX, flock
+    global _starting_flight
 
     selected = os.getenv("FSS_MISSION_WORKSPACE", PUBLIC)
     if selected not in (PRIVATE_CPP, PUBLIC):
@@ -296,6 +325,10 @@ def prepare_hardware(*, only_if_idle=False):
             launch_files.append(profile)
         if not all(forwards_target_wait(path) for path in launch_files):
             raise RuntimeError("기체 런처에 목표 대기 설정이 없습니다. Jetson FSW를 업데이트하세요.")
+        legacy = Path.home() / PRIVATE
+        if not guarded_full_launch(Path.home() / selected) or (
+                (legacy / "install/setup.bash").is_file() and not guarded_full_launch(legacy)):
+            raise RuntimeError("Jetson의 FSS 하드웨어 잠금 런처를 업데이트하세요.")
         if only_if_idle:
             # A second SSH client may connect just after a launcher has failed.
             # An explicit operator retry can still run immediately.
@@ -306,22 +339,46 @@ def prepare_hardware(*, only_if_idle=False):
 
         # Keep the stack alive across SSH/UI reconnects. Concurrent sessions see
         # the same ros2 launch process under the startup lock.
-        def start(command, filename):
+        def start(command, filename, fd):
             with (state / filename).open("ab") as log:
                 child = subprocess.Popen(command, cwd=work, stdin=subprocess.DEVNULL,
                                          stdout=log, stderr=subprocess.STDOUT,
-                                         start_new_session=True)
+                                         start_new_session=True, pass_fds=(fd,),
+                                         env={**os.environ, "FSS_HARDWARE_LEASE_FD": str(fd)})
             time.sleep(0.35)
             if child.poll() is not None:
                 raise RuntimeError(f"기동 실패: {state / filename}")
             return child
 
-        if not stacks["imu"] and (Path.home() / "xsens_mti_ros2_driver/install/setup.bash").is_file():
-            start(["bash", "scripts/launch/start_imu.sh"], "imu.log")
-        flight = ([str(profile), "use_sim:=false"] if profile
-                  else ["fss_bringup", "fss_full.launch.py", "gnc_backend:=cpp"])
-        start(["ros2", "launch", *flight, "require_explicit_target:=true"], "flight.log")
+        with claim_installed_hardware() as lease:
+            fd = lease.fileno()
+            if not stacks["imu"] and (Path.home() / "xsens_mti_ros2_driver/install/setup.bash").is_file():
+                start(["bash", "scripts/launch/start_imu.sh"], "imu.log", fd)
+            flight = ([str(profile), "use_sim:=false"] if profile
+                      else ["fss_bringup", "fss_full.launch.py", "gnc_backend:=cpp", "use_arm:=false"])
+            child = start(["ros2", "launch", *flight, "require_explicit_target:=true"], "flight.log", fd)
+        _starting_flight = (child, state / "flight.log", time.monotonic())
         return "기체 소프트웨어 기동"
+
+
+def startup_failure(node_names):
+    """Report late startup failure once, without acting on the running stack."""
+    global _starting_flight
+    if _starting_flight is None:
+        return ""
+    child, log, began = _starting_flight
+    missing = {"manager_node", "valve_driver_node", "gnc_node"}.difference(node_names)
+    result = child.poll()
+    if result is not None:
+        error = f"FSW 시작 중 종료 ({result}) · {log}"
+    elif not missing:
+        error = ""
+    elif time.monotonic() - began < 20:
+        return ""
+    else:
+        error = f"FSW 시작 상태 확인 필요 · {', '.join(sorted(missing))} 미수신 · {log}"
+    _starting_flight = None
+    return error
 
 
 def prepare_session(monitor_only=False, domain=None, *, start_if_idle=False):

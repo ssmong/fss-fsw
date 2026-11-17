@@ -54,8 +54,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mission_arm import JOINT_LABELS, encoder_model, feedback_source, joint_angles, link_points, plan_arm_points
-from mission_link import JetsonLink, PREFERRED_WORKSPACE
+from mission_arm import JOINT_LABELS, ViconArmOverlay, encoder_model, feedback_source, joint_angles, link_points, plan_arm_points, pose_yaw_deg
+from mission_link import JetsonLink, PREFERRED_WORKSPACE, SOURCE_TIMEOUT_SEC
 from mission_recording import ExperimentRecorder
 from mission_terminal import TerminalView
 from mission_ros import open_node
@@ -94,7 +94,6 @@ class LogEntry:
                 f'{html.escape(self.message)}</span>')
 
 BODY_HALF_W = 0.15  # 우주선 반폭 [m]
-SOURCE_TIMEOUT_SEC = 2.5
 XY_TRAIL_SEC = 5.0
 ARM_TIMEOUT_SEC = 0.5
 
@@ -330,13 +329,19 @@ class DashboardNode:
         self.arm_equipped = True
         self.tracking_since = None
         self.target_draft = ("PID", 0.0, 0.0, 0.0)
+        self.toss_method = "Nominal"
+        self.toss_phase = self.toss_phase_label = ""
+        self.toss_gripper = self.toss_alignment = ""
+        self.toss_contact = self.toss_aligned = False
         self.reported_recording_error = ""
         history_size = max(100, int(history_sec * 100.0))
 
         # Vicon 상태
         self.vicon_trail = XYTrail()
         self.arm_tcp_trail = XYTrail()
+        self.arm_overlay = ViconArmOverlay()
         self.arm_joints = self.arm_table = self.arm_base = self.arm_tcp = None
+        self.arm_tcp_yaw_deg = None
         self.arm_table_origin = None
         self.arm_table_stamp = self.arm_tcp_stamp = None
         self.arm_gripper_pair = None
@@ -491,6 +496,7 @@ class DashboardNode:
         if not all(math.isfinite(value) for value in (msg.x, msg.y, msg.theta)):
             return
         self.vicon_trail.append(msg.x, msg.y)
+        self.arm_overlay.add("table", msg.header, (msg.x, msg.y, msg.theta))
         timestamp = self._relative_time(msg.header.stamp)
         self.t_v.append(timestamp)
         self.x_v.append(msg.x)
@@ -509,8 +515,10 @@ class DashboardNode:
         if self.arm_source != "출처 미확인" and self.arm_source != source:
             self.arm_tcp_trail.samples.clear()
             self.arm_joints = self.arm_table = self.arm_base = self.arm_tcp = None
+            self.arm_tcp_yaw_deg = None
             self.arm_table_origin = self.arm_table_stamp = self.arm_tcp_stamp = None
             self.arm_gripper_pair = None
+            self.arm_overlay.links.clear()
         self.arm_source = source
         self._mark_rx("arm_driver")
 
@@ -529,7 +537,11 @@ class DashboardNode:
     def _cb_arm_base(self, msg):
         if (sample := link_points(msg, "base_link")) is not None:
             self.arm_base = sample
+            self.arm_overlay.add("base_link", msg.header, sample)
             self._mark_rx("arm_base")
+
+    def _cb_arm_registration(self, values):
+        self.arm_overlay.configure(values)
 
     def _cb_arm_tcp(self, msg):
         p = msg.pose.position
@@ -540,6 +552,7 @@ class DashboardNode:
             self.arm_tcp_trail.append(math.nan, math.nan)
         self.arm_tcp_trail.append(p.x, p.y)
         self.arm_tcp = (p.x, p.y)
+        self.arm_tcp_yaw_deg = pose_yaw_deg(getattr(msg.pose, "orientation", None))
         stamp = getattr(msg.header, "stamp", None)
         self.arm_tcp_stamp = (stamp.sec, stamp.nanosec) if stamp else None
         self._mark_rx("arm_tcp")
@@ -627,6 +640,46 @@ class DashboardNode:
 
     def _cb_paper_status(self, status):
         data = status if isinstance(status, dict) else getattr(status, "__dict__", {})
+        phase = data.get("phase")
+        if not isinstance(phase, str) or not phase:
+            return
+        if phase != self.toss_phase:
+            phases = {"IDLE": "대기", "WAITING_FOR_A": "시작 파지점 정렬 대기", "PREPARING": "준비 중",
+                      "A_HELD": "시작 파지점 고정",
+                      "LAUNCH": "발사 구간", "COAST": "자유 이동", "CAPTURING": "캡처 진입",
+                      "CLOSING": "파지 중", "LOCAL_BRAKE": "제동 중", "PLANNED_BRAKE": "계획 제동",
+                      "HOLDING": "파지 유지", "STOPPING": "정지 중", "STOPPED": "정지",
+                      "MISSED": "캡처 실패", "FAULT": "실험 오류"}
+            level = 40 if phase == "FAULT" else 30 if phase == "MISSED" else 20
+            reason = data.get("reason") if level >= 30 else None
+            message = phases.get(phase, phase)
+            self.toss_phase_label = message
+            self.append_log(f"Self-tossing · {message}" + (f" · {reason}" if reason else ""), level)
+        self.toss_phase = phase
+        gripper = data.get("fss_gripper")
+        if isinstance(gripper, str) and gripper and gripper != self.toss_gripper:
+            self.toss_gripper = gripper
+            self.append_log(f"그리퍼 · {gripper}")
+        contact = data.get("contact_verified") is True
+        if contact and not self.toss_contact:
+            self.append_log("B 레일 접촉 확인")
+        self.toss_contact = contact
+        guide = data.get("grasp_guide")
+        aligned = guide == "TCP within launch grasp tolerance"
+        self.toss_alignment = ""
+        if aligned:
+            self.toss_alignment = "시작 파지점 정렬 완료"
+            if not self.toss_aligned:
+                self.append_log(self.toss_alignment)
+        elif isinstance(guide, str) and guide.startswith("Move TCP (table):"):
+            error = data.get("launch_pose_error")
+            if (isinstance(error, (list, tuple)) and len(error) == 3 and
+                    all(type(v) in (int, float) and math.isfinite(v) for v in error)):
+                x, y, yaw = error
+                self.toss_alignment = (f"파지점까지  X {-1000*x:+.1f} mm   Y {-1000*y:+.1f} mm"
+                                       f"   Yaw {-math.degrees(yaw):+.1f}°")
+        self.toss_aligned = aligned
+        self._mark_rx("paper_status")
         directory = data.get("log_directory")
         if (data.get("frame_id") == "table" and data.get("plan_id")
                 and directory and directory != self.trial_directory):
@@ -855,7 +908,6 @@ class Dashboard(QMainWindow):
             QPushButton#bodyStart {{ background:{C_PANEL}; border:1px solid {C_BORDER};
                 border-radius:10px; min-height:18px; padding:1px 7px; margin-right:6px; font-size:12px; }}
             QPushButton#bodyStart:hover {{ border-color:{C_INFO}; }}
-            QPushButton#bodyStart:disabled {{ background:{C_PANEL_ALT}; color:{C_IDLE}; }}
             QPushButton:focus, QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus {{
                 border:2px solid {C_FOCUS}; }}
             QDoubleSpinBox QLineEdit {{
@@ -896,6 +948,9 @@ class Dashboard(QMainWindow):
         self._controls = self._build_control_bar()
         self._controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         sidebar.addWidget(self._controls)
+        self._toss_controls = self._build_toss_controls()
+        sidebar.addWidget(self._toss_controls)
+        self._toss_controls.hide()
         sidebar.addWidget(self._build_valve_plot())
         console_row = QHBoxLayout()
         self._console_tabs = QTabBar()
@@ -933,6 +988,10 @@ class Dashboard(QMainWindow):
         self._log_level.setCurrentIndex(self._log_level.findData(20))
         filter_row.addWidget(self._log_level)
         filter_row.addStretch()
+        self._clear_logs = QPushButton("비우기")
+        self._clear_logs.setToolTip("선택한 FSS의 화면 로그 비우기")
+        self._clear_logs.clicked.connect(self._clear_visible_log)
+        filter_row.addWidget(self._clear_logs)
         log_layout.addLayout(filter_row)
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
@@ -1053,17 +1112,37 @@ class Dashboard(QMainWindow):
 
     def _can_start_body(self, endpoint, link):
         return (self._links.get(endpoint) is link and link.ready and not link.stopped.is_set()
+                and link.profile in ("auto", "control")
                 and not link.read_only and not link.bridge_error and link.can_start_body
+                and not link.body_start_pending and not link.toss_pending
                 and time.monotonic() - link.last_body_status_at <= SOURCE_TIMEOUT_SEC
                 and not self._shared_domain(link))
 
-    def _start_vehicle_body(self, endpoint, link, button):
+    def _start_vehicle_body(self, endpoint, link):
         for connected in self._links.values():
             connected.drain()
-        button.setEnabled(False)
         if self._can_start_body(endpoint, link):
-            link.can_start_body = False
             link.data.send_command("start_body", True)
+        self._update()
+
+    def _update_body_button(self, index, endpoint, link, label):
+        side = QTabBar.RightSide
+        button = self._vehicles.tabButton(index, side)
+        if link.workflow == "toss" or not self._can_start_body(endpoint, link):
+            if button is not None:
+                button.setEnabled(False)
+                self._vehicles.setTabButton(index, side, None)
+                button.deleteLater()
+            return
+        if button is None:
+            button = QPushButton("본체 시작", self._vehicles)
+            button.setObjectName("bodyStart")
+            button.adjustSize()
+            button.clicked.connect(lambda: self._start_vehicle_body(endpoint, link))
+            self._vehicles.setTabButton(index, side, button)
+        action = f"{label} 본체 FSW 시작"
+        button.setAccessibleName(action)
+        button.setToolTip(action)
 
     def _reset_estop(self):
         if self._node.mode_name == "EMERGENCY_STOP" and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC:
@@ -1095,7 +1174,7 @@ class Dashboard(QMainWindow):
             self._stop_experiment(node, "operator")
         elif self._selected_can_record():
             last = self._vehicle_settings.value("experiments/last_name", "default", type=str)
-            name, accepted = QInputDialog.getText(self, "실험 시작", "실험 이름", text=last)
+            name, accepted = QInputDialog.getText(self, "기록 시작", "실험 이름", text=last)
             if not accepted or node is not self._node:
                 return
             if link:
@@ -1139,6 +1218,8 @@ class Dashboard(QMainWindow):
         display_id.setPlaceholderText("예: FSS-1")
         display_id.setMaxLength(32)
         arm = QCheckBox("로봇팔 장착")
+        monitor = QCheckBox("모니터링만")
+        monitor.setToolTip("선택한 기체의 데이터를 확인합니다.")
 
         def load_profile(address):
             endpoint = address.strip()
@@ -1153,13 +1234,10 @@ class Dashboard(QMainWindow):
         for label, field in (("SSH 주소", host), ("FSS ID (선택)", display_id),
                              ("SSH 계정", user), ("암호", password)):
             form.addRow(label, field)
-        monitor = QCheckBox("모니터링만")
-        monitor.setToolTip("체크하면 실행 중인 FSS의 데이터만 수신합니다.")
         form.addRow("", arm)
         form.addRow("", monitor)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("연결")
-        buttons.button(QDialogButtonBox.Ok).setToolTip("일반 연결은 유휴 FSS를 목표 대기 상태로 시작합니다.")
         buttons.button(QDialogButtonBox.Cancel).setText("취소")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -1167,10 +1245,12 @@ class Dashboard(QMainWindow):
         password.setFocus()
         if dialog.exec() and host.text().strip() and user.text().strip():
             self.add_jetson(host.text().strip(), user.text().strip(), None, password.text(),
-                            display_id.text(), monitor_only=monitor.isChecked(), arm_equipped=arm.isChecked())
+                            display_id.text(), arm_equipped=arm.isChecked(), monitor_only=monitor.isChecked())
 
-    def add_jetson(self, host, user, domain, password, display_id=None, monitor_only=False, arm_equipped=None):
+    def add_jetson(self, host, user, domain, password, display_id=None, monitor_only=False, arm_equipped=None,
+                   profile=None):
         endpoint = host if domain is None else f"{host} / {domain}"
+        profile = "monitor" if monitor_only else (profile or "auto")
         arm_key = f"arm_equipped/{endpoint}"
         if arm_equipped is None:
             arm_equipped = self._vehicle_settings.value(arm_key, True, type=bool)
@@ -1193,15 +1273,17 @@ class Dashboard(QMainWindow):
                 existing.display_id = display_id
                 existing.data.arm_equipped = arm_equipped
                 shells_finished = all(shell.finished for shell in existing.shells.sessions.values())
-                if (existing.ssh_user == user and existing.monitor_only == monitor_only
+                if (existing.ssh_user == user and existing.profile == profile
                         and endpoint not in self._link_errors
                         and (profile_changed or not (existing.bridge_error or shells_finished
-                                             or (existing.read_only and not monitor_only)))):
+                                             or (existing.read_only and profile != "monitor")))):
                     self._update()
                     return
                 self._disconnect_jetson(i)
                 break
-        link = JetsonLink(DashboardNode(self._history_sec), monitor_only=monitor_only)
+        link = JetsonLink(DashboardNode(self._history_sec), profile=profile)
+        if profile == "toss":
+            link.shells.selected = "log"
         link.ssh_user = user
         link.display_id = display_id
         link.data.arm_equipped = arm_equipped
@@ -1212,12 +1294,6 @@ class Dashboard(QMainWindow):
         link.changed.connect(self._connection_error)
         index = self._vehicles.addTab(endpoint)
         self._vehicles.setTabData(index, endpoint)
-        start = QPushButton("본체 시작", self._vehicles)
-        start.setObjectName("bodyStart")
-        start.setEnabled(False)
-        start.adjustSize()
-        start.clicked.connect(lambda: self._start_vehicle_body(endpoint, link, start))
-        self._vehicles.setTabButton(index, QTabBar.RightSide, start)
         self._vehicles.setCurrentIndex(index)
         self._select_vehicle(index)
         colors = [C_EKF, C_WARN, C_VICON, "#7048a2", "#a7376d"]
@@ -1258,12 +1334,14 @@ class Dashboard(QMainWindow):
         changed = chosen is not self._node
         if changed and hasattr(self, "_target_x"):
             self._node.target_draft = self._read_target()
+            self._node.toss_method = self._toss_method.currentText()
         self._node = chosen
         if hasattr(self, "_log_panel"):
             self._bind_console(link)
         if changed and hasattr(self, "_target_x"):
             controller, x, y, yaw = self._node.target_draft
             self._controller.button(0 if controller == "PID" else 1).setChecked(True)
+            self._toss_method.setCurrentText(self._node.toss_method)
             for field, value in ((self._target_x, x), (self._target_y, y), (self._target_yaw, yaw)):
                 field.setValue(value)
         self._log_view_key = None
@@ -1381,6 +1459,108 @@ class Dashboard(QMainWindow):
         self._command_status.hide()
         layout.addWidget(self._command_status)
         return bar
+
+    def _build_toss_controls(self):
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(12, 9, 12, 10)
+        layout.setSpacing(5)
+        layout.addWidget(QLabel("작업"), 0, 0)
+        self._toss_status = QLabel()
+        self._toss_status.setTextFormat(Qt.PlainText)
+        self._toss_status.setStyleSheet(f"color:{C_TEXT_DIM};")
+        self._toss_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._toss_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(self._toss_status, 0, 1, 1, 3)
+        self._toss_method = QComboBox()
+        self._toss_method.setAccessibleName("준비할 실험 또는 위치 제어")
+        self._toss_method.addItems(("Nominal", "JF_only", "Proposed"))
+        self._toss_method.activated.connect(lambda _: self._update())
+        layout.addWidget(self._toss_method, 1, 0)
+        self._toss_buttons = {}
+        for col, (action, label) in enumerate((
+                ("toss_prepare", "준비"), ("toss_start", "출발"), ("toss_stop", "정지")), start=1):
+            button = QPushButton(label)
+            button.setAccessibleName("선택한 작업 준비" if action == "toss_prepare" else f"Self-tossing {label}")
+            if action == "toss_start":
+                button.setObjectName("sendTarget")
+            button.clicked.connect(lambda checked=False, name=action: self._send_toss(name))
+            layout.addWidget(button, 1, col)
+            self._toss_buttons[action] = button
+        self._toss_alignment = QLabel()
+        self._toss_alignment.setTextFormat(Qt.PlainText)
+        self._toss_alignment.setStyleSheet(f"color:{C_TEXT_DIM};")
+        self._toss_alignment.hide()
+        layout.addWidget(self._toss_alignment, 2, 0, 1, 4)
+        return panel
+
+    def _can_send_toss(self, link, action):
+        return link and link.data is self._node and not self._shared_domain(link) and link.can_toss(action)
+
+    def _send_toss(self, action):
+        endpoint = self._vehicles.tabData(self._vehicles.currentIndex())
+        link = self._links.get(endpoint)
+        for connected in self._links.values():
+            connected.drain()
+        if action == "toss_prepare" and self._toss_method.currentText() == "위치 제어":
+            if link and link.workflow == "toss" and link.data is self._node and self._can_start_body(endpoint, link):
+                link.data.send_command("start_body", True)
+            self._update()
+            return
+        if self._can_send_toss(link, action):
+            value = self._toss_method.currentText() if action == "toss_prepare" else True
+            link.data.send_command(action, value)
+        self._update()
+
+    def _live_toss_alignment(self, link):
+        node = self._node
+        if (node.toss_alignment and node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
+                and node.toss_phase in ("IDLE", "WAITING_FOR_A")
+                and (link is None or (link.ready and not link.stopped.is_set() and not link.bridge_error))):
+            return node.toss_alignment
+        return ""
+
+    def _update_toss_controls(self, link):
+        endpoint = self._vehicles.tabData(self._vehicles.currentIndex())
+        body = self._can_start_body(endpoint, link)
+        body_item = self._toss_method.findText("위치 제어")
+        offers_body = link.can_start_body and link.profile in ("auto", "control") and not link.read_only
+        if offers_body and body_item < 0:
+            self._toss_method.addItem("위치 제어")
+            if self._node.toss_method == "위치 제어":
+                self._toss_method.setCurrentText("위치 제어")
+        elif not offers_body and body_item >= 0:
+            self._toss_method.removeItem(body_item)
+        for action, button in self._toss_buttons.items():
+            button.setEnabled(bool(self._can_send_toss(link, action)))
+        prepare = self._toss_buttons["toss_prepare"]
+        prepare.setToolTip("본체를 PID/LQR 목표 대기로 기동합니다." if self._toss_method.currentText() == "위치 제어"
+                           else "실험 본체와 계획 실행기를 준비합니다. 기체 설정에 따라 에어베어링이 열립니다.")
+        self._toss_method.setEnabled(body or prepare.isEnabled())
+        if self._toss_method.currentText() == "위치 제어":
+            prepare.setEnabled(body)
+        phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
+        choosing = not phase_fresh or self._toss_method.isEnabled()
+        self._toss_method.setVisible(choosing)
+        prepare.setVisible(choosing)
+        if not link.ready or link.stopped.is_set() or link.bridge_error:
+            status = "연결 대기"
+        elif phase_fresh:
+            plan = self._node.active_plan_key()
+            method = plan.rsplit("/", 1)[-1] if plan else ""
+            phase = self._node.toss_phase_label
+            status = f"{method} · {phase}" if method else phase
+        elif time.monotonic() - link.last_body_status_at <= SOURCE_TIMEOUT_SEC:
+            status = link.toss_state or "상태 미수신"
+        else:
+            status = "상태 미수신"
+        self._toss_status.setText(status)
+        self._toss_status.setToolTip(link.read_only or link.toss_state or status)
+        alignment = self._live_toss_alignment(link)
+        self._toss_alignment.setText(alignment)
+        self._toss_alignment.setVisible(bool(alignment))
 
     def _build_valve_plot(self):
         panel = QFrame()
@@ -1536,6 +1716,15 @@ class Dashboard(QMainWindow):
         self._arm_readout = QLabel("관절 데이터 대기")
         self._arm_readout.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._arm_readout)
+        self._tcp_readout = QLabel()
+        self._tcp_readout.setAlignment(Qt.AlignCenter)
+        self._tcp_readout.setToolTip("기체가 /arm/end_effector_pose에 발행한 모델 파지점")
+        layout.addWidget(self._tcp_readout)
+        self._arm_alignment = QLabel()
+        self._arm_alignment.setAlignment(Qt.AlignCenter)
+        self._arm_alignment.setTextFormat(Qt.PlainText)
+        self._arm_alignment.hide()
+        layout.addWidget(self._arm_alignment)
         self._cad_choice = QCheckBox("fss-fsw CAD (+X) · 관절각으로 보기")
         self._cad_choice.clicked.connect(self._select_arm_cad)
         layout.addWidget(self._cad_choice, alignment=Qt.AlignCenter)
@@ -1551,7 +1740,8 @@ class Dashboard(QMainWindow):
 
     def _select_arm_cad(self, checked):
         self._node.arm_local_cad = checked
-        self._update_arm()
+        selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
+        self._update_arm(allow_overlay=not (selected and self._shared_domain(selected)))
 
     @staticmethod
     def _draw_arm(curve, shape, age):
@@ -1559,7 +1749,7 @@ class Dashboard(QMainWindow):
         color = C_IDLE if age > ARM_TIMEOUT_SEC else C_ARM
         curve.setData(xs, ys, pen=pg.mkPen(color, width=3), symbolBrush=color)
 
-    def _update_arm(self):
+    def _update_arm(self, *, allow_overlay=True):
         node = self._node
         if node is self._default_node:
             self._local_bubble.show_vehicle(node)
@@ -1586,18 +1776,34 @@ class Dashboard(QMainWindow):
             paired = aligned or node.source_age("arm_pair") < 0.15
             if paired:
                 table, tip = node.arm_gripper_pair
+        projected = None
+        if shown and allow_overlay and age_table > ARM_TIMEOUT_SEC:
+            projected = node.arm_overlay.table_shape()
+            if projected is not None:
+                table, age_table, paired = projected, 0.0, False
         tip_color = C_IDLE if age_tcp > ARM_TIMEOUT_SEC else C_ARM
         self._arm_tip.setData([tip[0]] if tip else [], [tip[1]] if tip else [],
                               symbolBrush=tip_color, symbolPen=tip_color)
         self._draw_arm(self._arm_links, table, age_table)
+        self._arm_links.setToolTip("Vicon과 본체 기준 링크로 계산한 지도 위치" if projected else "테이블 기준 링크 위치")
         xs, ys = zip(table[0][-1], tip) if paired else ([], [])
         self._gripper_link.setData(xs, ys, pen=pg.mkPen(tip_color, width=3))
         selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
         connected = getattr(selected, "ready", False) if selected else node.request is not None
+        tcp_text = "테이블 파지점 · 미수신"
+        if shown and node.arm_tcp is not None and age_tcp < ARM_TIMEOUT_SEC:
+            x, y = node.arm_tcp
+            tcp_text = f"테이블 파지점   X {x:.3f} m   Y {y:.3f} m"
+            if node.arm_tcp_yaw_deg is not None:
+                tcp_text += f"   Yaw {node.arm_tcp_yaw_deg:.1f}°"
+        self._tcp_readout.setText(tcp_text)
+        alignment = self._live_toss_alignment(selected) if shown else ""
+        self._arm_alignment.setText(alignment)
+        self._arm_alignment.setVisible(bool(alignment))
         if connected and node.arm_equipped and table is None:
             if base or joints or tip:
                 self._arm_notice.setText("로봇팔 지도 위치 미수신")
-                self._arm_notice.setToolTip("팔 데이터는 수신 중입니다. 지도에 표시할 /arm/link_poses (table)를 기다립니다.")
+                self._arm_notice.setToolTip("지도에는 테이블 기준 링크 또는 시각과 좌표가 정합된 Vicon·본체 기준 링크가 필요합니다.")
             else:
                 self._arm_notice.setText("로봇팔 신호 미수신")
                 self._arm_notice.setToolTip("선택한 기체에서 로봇팔 관절각이나 링크 위치가 수신되지 않았습니다.")
@@ -2153,6 +2359,11 @@ class Dashboard(QMainWindow):
 
         self._update_logs()
 
+    def _clear_visible_log(self):
+        self._node.logs.clear()
+        self._node.log_revision += 1
+        self._update_logs()
+
     def _update_logs(self):
         minimum = self._log_level.currentData()
         key = (self._node.log_revision, minimum)
@@ -2217,6 +2428,8 @@ class Dashboard(QMainWindow):
         if rate_due:
             self._last_rate = time.monotonic()
         names = Counter((link.display_id or endpoint).casefold() for endpoint, link in self._links.items())
+        for connected in self._links.values():
+            connected.drain()
         for i in range(self._vehicles.count()):
             endpoint = self._vehicles.tabData(i)
             link = self._links.get(endpoint)
@@ -2224,7 +2437,6 @@ class Dashboard(QMainWindow):
                 local = self._default_node
                 self._vehicles.setTabText(i, f"로컬 ROS · {local.tracking_status()}")
                 continue
-            link.drain()
             data = link.data
             if link.bridge_error:
                 self._stop_experiment(data, "telemetry_disconnected")
@@ -2251,12 +2463,7 @@ class Dashboard(QMainWindow):
                 tooltip = f"{label}\n{tooltip}"
             self._vehicles.setTabToolTip(i, f"{tooltip}\n{detail}" if detail else tooltip)
             self._vehicles.setTabText(i, f"{short_label} · {status}".replace("&", "&&"))
-            start = self._vehicles.tabButton(i, QTabBar.RightSide)
-            if start is not None:
-                action = f"{label} 본체 FSW 시작"
-                start.setAccessibleName(action)
-                start.setToolTip(action)
-                start.setEnabled(self._can_start_body(endpoint, link))
+            self._update_body_button(i, endpoint, link, label)
             if endpoint in self._trails:
                 trail, marker = self._trails[endpoint]
                 xs, ys = data.vicon_trail.coordinates()
@@ -2268,10 +2475,19 @@ class Dashboard(QMainWindow):
                     marker.show_vehicle(data, label if len(self._links) > 1 else "")
         self._terminal.refresh()
         selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
-        enabled = selected.ready and not selected.read_only and not selected.stopped.is_set() if selected else bool(self._node.request)
+        toss = selected is not None and selected.workflow == "toss"
+        if selected and self._console_tabs.tabData(self._console_tabs.currentIndex()) != selected.shells.selected:
+            self._bind_console(selected)
+        self._controls.setVisible(not toss)
+        self._toss_controls.setVisible(toss)
+        if toss:
+            self._update_toss_controls(selected)
+        enabled = (selected.ready and not selected.read_only and not selected.bridge_error
+                   and not selected.stopped.is_set() and not toss) if selected else bool(self._node.request)
         shared_domain = selected and self._shared_domain(selected)
         if shared_domain:
             enabled = False
+        self._btn_estop.setVisible(not toss)
         self._btn_estop.setEnabled(enabled)
         self._release_estop.setVisible(enabled and self._node.mode_name == "EMERGENCY_STOP"
                                        and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC)
@@ -2279,7 +2495,8 @@ class Dashboard(QMainWindow):
         recorder = self._node.recorder
         self._report_recording_error(self._default_node)
         self._experiment_button.setEnabled(recorder.active or self._selected_can_record())
-        self._experiment_button.setText("실험 종료" if recorder.active else "실험 시작")
+        verb = "종료" if recorder.active else "시작"
+        self._experiment_button.setText(f"{'기록' if toss else '실험'} {verb}")
         self._experiment_button.setToolTip(str(recorder.directory) if recorder.directory else "선택한 FSS 데이터 기록")
         node = self._node
         target = node.source_age("reference") < XY_TRAIL_SEC
@@ -2300,7 +2517,7 @@ class Dashboard(QMainWindow):
         self._command_status.setVisible(bool(self._command_status.text()))
         self._update_summary()
         self._update_trajectory()
-        self._update_arm()
+        self._update_arm(allow_overlay=not shared_domain)
         occupied = []
         if selected and (key := self._vehicles.tabData(self._vehicles.currentIndex())) in self._trails:
             self._trails[key][1].avoid_other_bubbles(occupied)
