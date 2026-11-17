@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class MissionControlTest(unittest.TestCase):
@@ -26,6 +26,14 @@ class MissionControlTest(unittest.TestCase):
             cls.app = live_plot.QApplication.instance() or live_plot.QApplication([])
 
     def setUp(self):
+        def video(*args, **kwargs):
+            encoder = Mock(finished=False, error="", frames_written=0, frames_dropped=0)
+            encoder.stop.side_effect = lambda: setattr(encoder, "finished", True)
+            return encoder
+
+        encoder = patch("mission_recording.VideoRecorder", side_effect=video)
+        encoder.start()
+        self.addCleanup(encoder.stop)
         self.window = self.ui.Dashboard(self.ui.DashboardNode())
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -493,13 +501,13 @@ class MissionControlTest(unittest.TestCase):
                 self.assertEqual(name.call_args.kwargs["text"], "default")
             self.assertTrue(first.data.recorder.active)
             self.assertTrue(first.data.recorder.directory.is_dir())
-            self.assertEqual(w._experiment_button.text(), "실험 종료")
+            self.assertEqual(w._experiment_button.text(), "기록 종료")
 
             w.add_jetson("second", "operator", None, "", monitor_only=True)
             second = w._links["second"]
             second.inbox.put([("connected", SimpleNamespace(observer="b", peers=[], read_only=""))])
             w._update()
-            self.assertEqual(w._experiment_button.text(), "실험 시작")
+            self.assertEqual(w._experiment_button.text(), "기록 시작")
             with patch.object(self.ui.QInputDialog, "getText", return_value=("second_trial", True)) as name:
                 w._experiment_button.click()
                 self.assertEqual(name.call_args.kwargs["text"], "trial")
@@ -646,7 +654,7 @@ class MissionControlTest(unittest.TestCase):
         link.inbox.put([("plans", entries), ("paper_trial", ["a", 1.])])
         w._control_views.button(1).click()
         w._update()
-        self.assertTrue(w._toss_method.isEnabled())
+        self.assertFalse(w._toss_method.isEnabled())
         self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
         self.assertFalse(w._toss_buttons["toss_start"].isEnabled())
         index = w._plan_picker.findData("b/Proposed")
@@ -659,6 +667,84 @@ class MissionControlTest(unittest.TestCase):
         w._update()
         self.assertEqual(w._update_plan_and_get_target()[:3], (2., 2., 1.))
         self.assertTrue(link.commands.empty())
+
+    def test_automatic_recording_keeps_each_run_and_preserves_manual_archives(self):
+        w = self.window
+        w.add_jetson("observer", "operator", None, "", monitor_only=True)
+        first = w._links["observer"]
+        second = self.connect("second", 2)
+        recorder = Mock(active=False, error="", video_error="")
+        first.data.recorder = recorder
+        w._recorders.add(recorder)
+        recorder.start.side_effect = lambda *args: setattr(recorder, "active", True) or Path("saved")
+        recorder.stop.side_effect = lambda *args: setattr(recorder, "active", False) or Path("saved")
+        def report(phase, run="run-1"):
+            first.data.receive("paper_status", dict(
+                frame_id="table", plan_id="plan", log_directory=f"/logs/{run}", phase=phase))
+        for phase in ("IDLE", "WAITING_FOR_A", "CLOSING_AT_A", "A_HELD", "STOPPING", "STOPPED"):
+            report(phase)
+        recorder.start.assert_not_called()
+        report("PREPARING")
+        recorder.start.assert_called_once_with(w._experiment_root, "self-tossing", "observer")
+        self.assertFalse(first.data.source_run["partial_join"])
+        self.assertTrue(recorder.capture.called)
+        report("PREPARING")
+        report("HOLDING")
+        self.assertTrue(recorder.active)
+        report("STOPPED")
+        recorder.stop.assert_called_once_with("stopped")
+        recorded = [call.args[1]["phase"] for call in recorder.record.call_args_list
+                    if call.args[0] == "paper_status"]
+        self.assertEqual(recorded, ["PREPARING", "PREPARING", "HOLDING", "STOPPED"])
+        report("PREPARING")  # Repeated old status cannot recreate a run.
+        self.assertFalse(recorder.active)
+        report("LAUNCH", "run-2")
+        self.assertTrue(first.data.source_run["partial_join"])
+        w._stop_experiment(first.data, "operator")
+        report("LAUNCH", "run-2")
+        self.assertFalse(recorder.active)
+        recorder.active = True  # A manual archive already spans the next experiment.
+        report("PREPARING", "run-3")
+        report("FAULT", "run-3")
+        self.assertTrue(recorder.active)
+        self.assertEqual(recorder.start.call_count, 2)
+        self.assertEqual(recorder.stop.call_count, 2)
+        self.assertIs(w._node, second.data)
+        self.assertTrue(first.commands.empty() and second.commands.empty())
+        recorder.active = False
+
+    def test_recording_snapshot_uses_each_fss_vicon_and_live_plan_independent_of_preview(self):
+        w = self.window
+        first, second = self.connect("first", 1), self.connect("second", 2)
+        first.data.x_v.append(.1)
+        first.data.y_v.append(.2)
+        first.data.th_v.append(90.)
+        first.data._mark_rx("vicon")
+        first.data.receive("plans", [
+            ["active/Nominal", "a", [[1., 1.], [2., 2.]], [0., 2.], [0., 1.],
+             [[0., 0., 0.], [0., 0., 0.]], [[[0., -.15], [0., -.2], [0., -.2]], [0., -.1]]],
+            ["preview/Proposed", "b", [[2., 3.], [3., 3.]], [0., 2.], [2., 3.]]])
+        first.data.receive("paper_trial", ["a", 1., "active/Nominal"])
+        first.data.plan_choice = "preview/Proposed"
+        first.data.arm_base = (((0., 0.), (.1, .2)), None)
+        first.data._mark_rx("arm_base")
+        snap = first.data.recording_snapshot()
+        self.assertEqual(snap["pose"], (.1, .2, math.pi/2))
+        self.assertEqual(snap["ghost"], (1.5, 1.5, .5))
+        self.assertEqual(snap["arm"], [[0., 0.], [.1, .2]])
+        for name in ("arm", "ghost_arm", "plan"):
+            self.assertIsInstance(snap[name], list)
+            self.assertTrue(all(isinstance(point, list) for point in snap[name]))
+        first.data.recording_target_revisions = dict(first.data.target_revisions)
+        self.assertIsNone(first.data.recording_snapshot()["ghost"])
+        first.data.receive("paper_trial", ["a", 1., "active/Nominal"])
+        first.data.receive("paper_status", {"phase": "STOPPED"})
+        self.assertEqual(first.data.recording_snapshot()["ghost"], (1.5, 1.5, .5))
+        self.assertIsNone(second.data.recording_snapshot()["pose"])
+        self.assertIs(w._node, second.data)
+        self.assertEqual(first.data.plan_choice, "preview/Proposed")
+        first.data._last_rx["vicon"] -= 10
+        self.assertIsNone(first.data.recording_snapshot()["pose"])
 
     def test_method_preview_uses_defaults_and_running_clock_without_sending_commands(self):
         w = self.window
@@ -685,11 +771,18 @@ class MissionControlTest(unittest.TestCase):
         first.inbox.put([("paper_trial", ["current/Nominal", .5, "current/Nominal"])])
         w._update()
         self.assertEqual(w._update_plan_and_get_target()[:2], (1.25, 1.5))
-        for phase in ("STOPPED", "MISSED", "FAULT", "IDLE", "PREPARING", "A_HELD"):
+        for phase in ("STOPPED", "MISSED", "FAULT"):
             first.inbox.put([("paper_status", SimpleNamespace(phase=phase)),
                              ("paper_trial", ["current/Nominal", .75, "current/Nominal"])])
             w._update()
             self.assertEqual(w._update_plan_and_get_target()[:2], (2., 1.))
+        for phase in ("IDLE", "PREPARING", "A_HELD"):
+            first.inbox.put([("paper_status", SimpleNamespace(phase=phase)),
+                             ("paper_trial", ["current/Nominal", None, "current/Nominal"])])
+            w._update()
+            self.assertEqual(w._update_plan_and_get_target()[:2], (1., 1.))
+            self.assertEqual(w._toss_method.currentText(), "Nominal")
+            self.assertFalse(w._toss_method.isEnabled())
         first.inbox.put([("paper_status", SimpleNamespace(phase="LAUNCH")),
                          ("paper_trial", ["current/Nominal", .5, "current/Nominal"])])
         w._update()
@@ -698,7 +791,7 @@ class MissionControlTest(unittest.TestCase):
         w._update()
         self.assertFalse(w._ghost.isVisible())
         w._vehicles.setCurrentIndex(0)
-        self.assertEqual(w._toss_method.currentText(), "Proposed")
+        self.assertEqual(w._toss_method.currentText(), "Nominal")
         self.assertEqual(w._update_plan_and_get_target()[:2], (1.25, 1.5))
         first.data._last_rx["paper_trial"] -= 10
         self.assertEqual(w._update_plan_and_get_target()[:2], (2., 1.))
@@ -713,6 +806,43 @@ class MissionControlTest(unittest.TestCase):
         self.assertEqual(self.window._update_plan_and_get_target()[:2], (2.0, 0.5))
         node.receive("paper_trial", ["id", 0.5, None])
         self.assertIsNone(self.window._update_plan_and_get_target())
+
+    def test_preparing_proposed_matches_dropdown_auto_path_and_initial_ghost(self):
+        w = self.window
+        for monitor in (False, True):
+            with self.subTest(monitor=monitor):
+                host = f"host-{monitor}"
+                w.add_jetson(host, "operator", None, "", monitor_only=monitor)
+                link = w._links[host]
+                self.body_status(link, workflow="toss", can_start_body=False)
+                link.inbox.put([
+                    ("plans", [
+                        ["bundle/Nominal", "n", [[.5, .5], [.7, .7]], [0., 1.]],
+                        ["bundle/Proposed", "p", [[2., 3.], [2.5, 3.5]], [0., 1.]]]),
+                    ("plan_defaults", {"Nominal": "bundle/Nominal", "Proposed": "bundle/Proposed"})])
+                w._control_views.button(1).click()
+                w._update()
+                self.assertTrue(w._toss_method.isEnabled())
+                self.assertEqual(w._toss_method.currentText(), "Nominal")
+                link.inbox.put([("paper_status", {"phase": "PREPARING"}),
+                                ("paper_trial", ["p", None, "bundle/Proposed"])])
+                w._update()
+                self.assertEqual(w._drawn_plan, "bundle/Proposed")
+                self.assertEqual(w._toss_method.currentText(), "Proposed")
+                self.assertFalse(w._toss_method.isEnabled())
+                self.assertEqual((w._ghost.x(), w._ghost.y()), (2., 3.))
+                self.assertIn("Proposed", w._plan_picker.currentText())
+                link.inbox.put([("paper_status", {"phase": "LAUNCH"}),
+                                ("paper_trial", ["p", .5, "bundle/Proposed"])])
+                w._update()
+                self.assertEqual((w._ghost.x(), w._ghost.y()), (2.25, 3.25))
+                index = w._plan_picker.findData("bundle/Nominal")
+                w._plan_picker.setCurrentIndex(index)
+                w._choose_plan(index)
+                self.assertEqual((w._ghost.x(), w._ghost.y()), (.5, .5))
+                self.assertIn("초기 자세", w._plan_picker.toolTip())
+                self.assertEqual(w._toss_method.currentText(), "Proposed")
+                self.assertTrue(link.commands.empty())
 
     def test_plan_error_graph_stays_with_vehicle_and_run(self):
         w = self.window

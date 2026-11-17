@@ -35,7 +35,7 @@ class CatalogRelayTest(unittest.TestCase):
         catalog = SimpleNamespace(plans=[], signatures={}, defaults={}, refresh=Mock(return_value=False))
         with patch.dict(sys.modules, modules), patch.multiple(
             mission_ros, create=True, PlanCatalog=lambda: catalog, load_table_plans=Mock(),
-            paper_plan_elapsed=Mock(), paper_run_files=Mock(), PaperTracking=PaperTracking,
+            paper_plan_elapsed=Mock(return_value=None), paper_run_files=Mock(return_value=None), PaperTracking=PaperTracking,
             ValveOutput=Mock(), ArmRegistration=Mock(),
         ):
             mission_ros.open_node(lambda kind, value: events.append((kind, value)), Mock())
@@ -49,3 +49,13 @@ class CatalogRelayTest(unittest.TestCase):
             refresh()
             self.assertEqual(events[-2:], [("plans", catalog.plans), ("plan_defaults", catalog.defaults)])
             node.create_client.return_value.call_async.assert_not_called()
+            import json
+            status = next(call.args[2] for call in node.create_subscription.call_args_list
+                          if call.args[1] == "/paper_toss/status")
+            with patch.object(PaperTracking, "poll", return_value=[{"final_sample": True}]):
+                events.clear()
+                status(SimpleNamespace(data=json.dumps({"frame_id": "table", "plan_id": "A", "phase": "FAULT"})))
+                self.assertEqual([name for name, _ in events], ["paper_trial", "tracking_error", "paper_status"])
+                events.clear()
+                status(SimpleNamespace(data=json.dumps({"frame_id": "table", "plan_id": "A", "phase": "PREPARING"})))
+                self.assertEqual(events[0][0], "paper_status")

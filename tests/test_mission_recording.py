@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
@@ -36,6 +37,7 @@ class RecordingTest(unittest.TestCase):
             header = NS(frame_id="table", stamp=NS(sec=20, nanosec=100))
             fss.receive("vicon", NS(header=header, x=1.2, y=0.4, theta=.1))
             fss.receive("vicon", NS(header=header, x=1.3, y=0.5, theta=.2))
+            fss.recorder.record("ekf", NS(header=header, x=9, y=9, theta=9))
             fss.receive("imu", NS(header=header, angular_velocity=NS(z=1.25), orientation_covariance=[math.nan]*9))
             fss.receive("valve", NS(header=header, commanded_duty_cycles=[0.3]*8, applied_values=[1200]*8,
                                     main_valve_open=True, modbus_rtt_ms=2.0))
@@ -47,7 +49,7 @@ class RecordingTest(unittest.TestCase):
             fss.receive("vicon", NS(header=header, x=0, y=0, theta=0))
             with gzip.open(run / "telemetry.jsonl.gz", "rt", encoding="utf-8") as fp:
                 records = [json.loads(line) for line in fp]
-            self.assertEqual([r["kind"] for r in records], ["session_context", "vicon", "vicon", "imu",
+            self.assertEqual([r["kind"] for r in records], ["session_context", "pose", "pose", "imu",
                                                           "valve", "valve_output", "log", "command", "command_result"])
             self.assertEqual(records[3]["data"]["angular_velocity"]["z"], 1.25)
             self.assertEqual(records[3]["data"]["orientation_covariance"], [None]*9)
@@ -59,10 +61,83 @@ class RecordingTest(unittest.TestCase):
             self.assertTrue(all(r["elapsed_s"] >= 0 and r["received_unix_ns"] > 0 for r in records))
             self.assertIn("[DEBUG] arm: 숨은 DEBUG 메시지", (run / "logs.txt").read_text(encoding="utf8"))
             summary = json.loads((run / "session.json").read_text(encoding="utf8"))
-            self.assertEqual((summary["vehicle"], summary["counts"]["vicon"], summary["stop_reason"]),
+            self.assertEqual((summary["vehicle"], summary["counts"]["pose"], summary["stop_reason"]),
                              ("FSS-2", 2, "disconnected"))
+            self.assertEqual(summary["pose_source"], "vicon")
+            self.assertNotIn("ekf", summary["counts"])
+            with (run / "pose.csv").open(encoding="utf-8", newline="") as fp:
+                poses = list(csv.DictReader(fp))
+            self.assertEqual([r["x_m"] for r in poses], ["1.2", "1.3"])
+            self.assertEqual(poses[-1]["yaw_rad"], "0.2")
+            self.assertEqual(poses[-1]["sample_stamp_ns"], "20000000100")
             self.assertEqual(summary["status"], "finished")
             self.assertGreater(QImage(str(run / "trajectory.png")).width(), 600)
+
+    def test_archive_finalizes_real_mp4_before_gui_shutdown(self):
+        from mission_recording import ExperimentRecorder
+        with tempfile.TemporaryDirectory() as root:
+            recorder = ExperimentRecorder()
+            run = recorder.start(root, "video", "A")
+            recorder.record("vicon", NS(x=1., y=2., theta=.1))
+            recorder.capture({"pose": [1., 2., .1], "ghost": [1.2, 2., .2],
+                              "ghost_arm": [[0., 0.], [.2, .2]]})
+            deadline = time.monotonic() + 10
+            while not recorder._video.frames_written and not recorder.video_error and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.005)
+            self.assertFalse(recorder.video_error, recorder.video_error)
+            recorder.stop()
+            self.assertTrue(recorder.finish_video())
+            summary = json.loads((run / "session.json").read_text())
+            self.assertEqual(summary["video"]["status"], "finished")
+            self.assertGreaterEqual(summary["video"]["frames"], 1)
+            self.assertGreater((run / "trajectory.mp4").stat().st_size, 1000)
+
+    def test_video_completion_updates_its_own_run_and_failure_keeps_telemetry(self):
+        from PySide6.QtCore import QObject, Signal
+        from mission_recording import ExperimentRecorder
+
+        class Encoder(QObject):
+            finalized = Signal(str)
+
+            def __init__(self, directory, fps):
+                super().__init__()
+                self.path = Path(directory) / "trajectory.mp4"
+                self.finished = False
+                self.error = ""
+                self.frames_written = self.frames_dropped = 0
+
+            def capture(self, snapshot, elapsed):
+                self.frames_written += 1
+
+            def stop(self):
+                pass
+
+            def complete(self, error=""):
+                self.finished, self.error = True, error
+                self.finalized.emit(str(self.path))
+
+        with tempfile.TemporaryDirectory() as root, patch("mission_recording.VideoRecorder", Encoder):
+            recorder = ExperimentRecorder()
+            first = recorder.start(root, "self-tossing", "A")
+            recorder.capture({"pose": [1, 2, 0], "ghost": [1.1, 2, 0]})
+            old_video = recorder._video
+            recorder.stop()
+            second = recorder.start(root, "self-tossing", "A")
+            recorder.capture({})
+            new_video = recorder._video
+            old_video.complete()
+            self.assertEqual(json.loads((first / "session.json").read_text())["video"]["status"], "finished")
+            self.assertEqual(json.loads((second / "session.json").read_text())["status"], "recording")
+            new_video.complete("disk full")
+            self.assertTrue(recorder.active)
+            self.assertIn("disk full", recorder.video_error)
+            recorder.record("vicon", NS(x=1, y=2, theta=.1))
+            recorder.stop()
+            summary = json.loads((second / "session.json").read_text())
+            self.assertEqual(summary["video"]["status"], "error")
+            self.assertEqual(summary["status"], "finished")
+            self.assertEqual(summary["counts"]["pose"], 1)
 
     def test_conflicting_names_and_io_failure(self):
         from datetime import datetime, timezone

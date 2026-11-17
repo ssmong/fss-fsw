@@ -329,6 +329,11 @@ class DashboardNode:
     def __init__(self, history_sec: float = 30.0) -> None:
         self.request = None
         self.recorder = ExperimentRecorder(self.recording_context)
+        self.recording_status = None
+        self.auto_recording_run = None
+        self.source_run = None
+        self.target_revisions = {"paper_trial": 0, "reference": 0}
+        self.recording_target_revisions = {}
         self.arm_equipped = True
         self.tracking_since = None
         self.target_draft = ("PID", 0.0, 0.0, 0.0)
@@ -339,6 +344,7 @@ class DashboardNode:
         self.toss_gripper = self.toss_alignment = ""
         self.toss_contact = self.toss_aligned = False
         self.reported_recording_error = ""
+        self.reported_video_error = ""
         history_size = max(100, int(history_sec * 100.0))
 
         # Vicon 상태
@@ -424,9 +430,11 @@ class DashboardNode:
 
     def recording_context(self):
         return {"arm_equipped": self.arm_equipped, "selected_plan": self.plan_choice,
-                "active_plan_id": self.paper_trial, "plans": self.paper_plans}
+                "active_plan_id": self.paper_trial, "plans": self.paper_plans, "source_run": self.source_run}
 
     def receive(self, name, msg):
+        if name == "paper_status" and self.recording_status:
+            self.recording_status(msg, False)
         if self.recorder.active:
             payload = msg
             if name == "valve":
@@ -436,6 +444,8 @@ class DashboardNode:
                     payload["header"] = msg.header
             self.recorder.record(name, payload)
         getattr(self, "_cb_" + name)(msg)
+        if name == "paper_status" and self.recording_status:
+            self.recording_status(msg, True)
 
     def send_command(self, name, value):
         if self.request:
@@ -475,6 +485,8 @@ class DashboardNode:
 
     def _mark_rx(self, source: str) -> None:
         self._last_rx[source] = time.monotonic()
+        if source in self.target_revisions:
+            self.target_revisions[source] += 1
 
     def tracking_age(self):
         age = self.source_age("vicon")
@@ -724,6 +736,66 @@ class DashboardNode:
         matches = [key for key, plan in self.paper_plans.items() if plan[0] == self.paper_trial]
         return matches[0] if len(matches) == 1 else None
 
+    def preview_plan_key(self):
+        try:
+            options = shlex.split(self.toss_options)
+        except ValueError:
+            return None
+        if any(option.split(":=", 1)[0] == "trial_file" for option in options):
+            return None
+        if self.plan_defaults is not None:
+            return self.plan_defaults.get(self.toss_method)
+        matches = [key for key in self.paper_plans if key.rsplit("/", 1)[-1] == self.toss_method]
+        return matches[0] if len(matches) == 1 else None
+
+    def plan_target(self, *, live_only=False):
+        active = self.active_plan_key()
+        if live_only and self.target_revisions["paper_trial"] <= self.recording_target_revisions.get("paper_trial", -1):
+            active = None
+        elapsed = self.paper_elapsed if self.source_age("paper_trial") <= SOURCE_TIMEOUT_SEC else None
+        if (self.toss_phase and not (live_only and self.toss_phase in ("STOPPED", "MISSED", "FAULT"))
+                and self.toss_phase not in (
+                "LAUNCH", "COAST", "CAPTURING", "CLOSING", "LOCAL_BRAKE",
+                "PLANNED_BRAKE", "HOLDING", "STOPPING")):
+            elapsed = None
+        key = active if live_only or self.plan_choice == "auto" else self.plan_choice
+        if (not live_only and self.plan_choice == "auto" and self.control_view == "toss"
+                and elapsed is None and (active is None or self.toss_phase in ("STOPPED", "MISSED", "FAULT"))):
+            key = self.preview_plan_key()
+        if key not in self.paper_plans:
+            key = None
+        following = key is not None and key == active and elapsed is not None
+        if key is not None:
+            _, xy, times, yaw, joints, geometry = self.paper_plans[key]
+            t = elapsed if following else 0.0
+            arm = None
+            if self.arm_equipped and yaw is not None and joints is not None and geometry is not None:
+                angles = [np.interp(t, times, column) for column in joints.T]
+                arm = plan_arm_points(angles, *geometry)
+            target = (np.interp(t, times, xy[:, 0]), np.interp(t, times, xy[:, 1]),
+                    np.interp(t, times, yaw) if yaw is not None else None, arm)
+            return key, target, following
+        if (self.source_age("reference") < XY_TRAIL_SEC
+                and (not live_only or self.target_revisions["reference"]
+                     > self.recording_target_revisions.get("reference", -1))):
+            # A base-only target preserves the latest measured articulation for comparison.
+            arm = self.measured_arm_in_base() if self.arm_equipped else None
+            return None, (*self.latest_ref, arm), False
+        return None, None, False
+
+    def recording_snapshot(self):
+        pose = None
+        if self.source_age("vicon") < XY_TRAIL_SEC and self.x_v:
+            pose = (self.x_v[-1], self.y_v[-1], math.radians(self.th_v[-1]))
+        key, target, _ = self.plan_target(live_only=True)
+        snapshot = {"pose": pose, "arm": self.measured_arm_in_base() if self.arm_equipped else None,
+                    "ghost": target[:3] if target else None, "ghost_arm": target[3] if target else None,
+                    "plan": self.paper_plans[key][1] if key else None}
+        for name in ("arm", "ghost_arm", "plan"):
+            if snapshot[name] is not None:
+                snapshot[name] = np.asarray(snapshot[name]).tolist()
+        return snapshot
+
     def _cb_imu(self, msg) -> None:
         self._imu_count += 1
         self._mark_rx("imu")
@@ -882,6 +954,8 @@ class Dashboard(QMainWindow):
         self._history_sec = history_sec
         self._experiment_root = Path(__file__).resolve().parents[1] / "experiments"
         self._links = {}
+        self._recorded_runs = {}
+        self._recorders = {node.recorder}
         self._vehicle_settings = QSettings("FSS", "Mission Control")
         self._trails = {}
         self._link_errors = {}
@@ -1044,7 +1118,7 @@ class Dashboard(QMainWindow):
         self._arm_notice.setStyleSheet(f"color:{C_TEXT_DIM};")
         self._arm_notice.hide()
         footer.addWidget(self._arm_notice)
-        self._experiment_button = QPushButton("실험 시작")
+        self._experiment_button = QPushButton("기록 시작")
         self._experiment_button.setToolTip("선택한 FSS 데이터 기록")
         self._experiment_button.clicked.connect(self._toggle_experiment)
         footer.addWidget(self._experiment_button)
@@ -1211,6 +1285,8 @@ class Dashboard(QMainWindow):
             if not self._selected_can_record():
                 return
             vehicle = (link.display_id or endpoint) if link else "local"
+            node.source_run = None
+            node.recording_target_revisions = {}
             try:
                 directory = node.recorder.start(self._experiment_root, name.strip(), vehicle)
             except (OSError, ValueError) as exc:
@@ -1218,12 +1294,14 @@ class Dashboard(QMainWindow):
                 return
             self._vehicle_settings.setValue("experiments/last_name", name.strip())
             node.reported_recording_error = ""
+            node.reported_video_error = ""
             node.append_log(f"실험 기록 시작 · {directory}")
         self._update()
 
     @staticmethod
     def _stop_experiment(node, reason):
         if node.recorder.active:
+            node.recorder.capture(node.recording_snapshot())
             try:
                 directory = node.recorder.stop(reason)
             except OSError as exc:
@@ -1231,12 +1309,55 @@ class Dashboard(QMainWindow):
                 node.set_command_result(f"실험 저장 실패 · {exc}", 40)
             else:
                 node.append_log(f"실험 저장 · {directory}")
+        node.auto_recording_run = None
+
+    def _auto_record_status(self, endpoint, link, message, after):
+        data = message if isinstance(message, dict) else getattr(message, "__dict__", {})
+        phase, plan, directory = (data.get(name) for name in ("phase", "plan_id", "log_directory"))
+        if (data.get("frame_id") != "table" or not all(isinstance(value, str) and value
+                                                     for value in (phase, plan, directory))):
+            return
+        node = link.data
+        key = plan, directory
+        if after:
+            if node.auto_recording_run == key:
+                node.source_run["phase"] = phase
+                node.recorder.capture(node.recording_snapshot())
+            if node.auto_recording_run == key and phase in ("STOPPED", "MISSED", "FAULT"):
+                self._stop_experiment(node, phase.lower())
+            return
+        if phase not in ("PREPARING", "LAUNCH", "COAST", "CAPTURING", "CLOSING",
+                         "LOCAL_BRAKE", "PLANNED_BRAKE", "HOLDING"):
+            return
+        handled = self._recorded_runs.setdefault(endpoint, set())
+        if key in handled:
+            return
+        handled.add(key)
+        if node.auto_recording_run:
+            self._stop_experiment(node, "next_run")
+        if node.recorder.active:
+            return
+        node.source_run = {"plan_id": plan, "log_directory": directory,
+                           "phase": phase, "partial_join": phase != "PREPARING"}
+        node.recording_target_revisions = dict(node.target_revisions)
+        try:
+            saved = node.recorder.start(self._experiment_root, "self-tossing", link.display_id or endpoint)
+        except (OSError, ValueError) as exc:
+            node.set_command_result(f"실험 자동 기록 실패 · {exc}", 40)
+            return
+        node.auto_recording_run = key
+        node.reported_recording_error = ""
+        node.reported_video_error = ""
+        node.append_log(f"실험 자동 기록 시작 · {saved}")
 
     @staticmethod
     def _report_recording_error(node):
         if node.recorder.error and node.reported_recording_error != node.recorder.error:
             node.reported_recording_error = node.recorder.error
             node.set_command_result(f"실험 저장 실패 · {node.recorder.error}", 40)
+        if node.recorder.video_error and node.reported_video_error != node.recorder.video_error:
+            node.reported_video_error = node.recorder.video_error
+            node.append_log(f"실험 영상 저장 실패 · {node.recorder.video_error}", 40)
 
     def _connect_dialog(self):
         dialog = QDialog(self)
@@ -1311,6 +1432,7 @@ class Dashboard(QMainWindow):
                 self._disconnect_jetson(i)
                 break
         link = JetsonLink(DashboardNode(self._history_sec), profile=profile)
+        self._recorders.add(link.data.recorder)
         if profile == "toss":
             link.shells.selected = "log"
         link.ssh_user = user
@@ -1319,6 +1441,8 @@ class Dashboard(QMainWindow):
         link.data.append_log(f"{host} 연결 중")
         self._links[endpoint] = link
         link.data.request = link.request
+        link.data.recording_status = lambda message, after: self._auto_record_status(
+            endpoint, link, message, after)
         link.trust.connect(self._confirm_key)
         link.changed.connect(self._connection_error)
         index = self._vehicles.addTab(endpoint)
@@ -1363,7 +1487,6 @@ class Dashboard(QMainWindow):
         changed = chosen is not self._node
         if changed and hasattr(self, "_target_x"):
             self._node.target_draft = self._read_target()
-            self._node.toss_method = self._toss_method.currentText()
             self._node.toss_options = self._toss_options.text()
         self._node = chosen
         if hasattr(self, "_log_panel"):
@@ -1405,11 +1528,14 @@ class Dashboard(QMainWindow):
             self._select_vehicle(self._vehicles.currentIndex())
 
     def closeEvent(self, event):
+        self._timer.stop()
         self._stop_experiment(self._default_node, "window_closed")
         for link in self._links.values():
             link.drain()
             self._stop_experiment(link.data, "window_closed")
             link.close()
+        for recorder in self._recorders:
+            recorder.finish_video()
         super().closeEvent(event)
 
     def _build_header(self) -> QHBoxLayout:
@@ -1583,7 +1709,14 @@ class Dashboard(QMainWindow):
             button.setEnabled(bool(self._can_send_toss(link, action)))
         prepare = self._toss_buttons["toss_prepare"]
         prepare.setToolTip("실험 본체와 계획 실행기를 준비합니다. 기체 설정에 따라 에어베어링이 열립니다.")
-        self._toss_method.setEnabled(True)
+        active = self._node.active_plan_key()
+        bound = bool(active and self._node.toss_phase not in ("STOPPED", "MISSED", "FAULT"))
+        method = active.rsplit("/", 1)[-1] if bound else self._node.toss_method
+        self._toss_method.blockSignals(True)
+        self._toss_method.setCurrentText(method)
+        self._toss_method.blockSignals(False)
+        self._toss_method.setEnabled(not bound)
+        self._toss_method.setToolTip("현재 실험의 경로" if bound else "실험 경로 미리보기")
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
         start = self._toss_buttons["toss_start"]
         grasp_first = (phase_fresh and self._node.toss_phase in ("IDLE", "STOPPED", "MISSED")
@@ -2295,19 +2428,6 @@ class Dashboard(QMainWindow):
         self._node.plan_choice = self._plan_picker.itemData(index)
         self._update_trajectory()
 
-    def _preview_plan_key(self):
-        node = self._node
-        try:
-            options = shlex.split(node.toss_options)
-        except ValueError:
-            return None
-        if any(option.split(":=", 1)[0] == "trial_file" for option in options):
-            return None
-        if node.plan_defaults is not None:
-            return node.plan_defaults.get(node.toss_method)
-        matches = [key for key in node.paper_plans if key.rsplit("/", 1)[-1] == node.toss_method]
-        return matches[0] if len(matches) == 1 else None
-
     def _update_plan_and_get_target(self):
         node = self._node
         if self._picker_catalog is not node.paper_plans:
@@ -2324,18 +2444,7 @@ class Dashboard(QMainWindow):
                                               f"저장 계획 미리보기 · {key}", Qt.ToolTipRole)
             self._plan_picker.setCurrentIndex(self._plan_picker.findData(node.plan_choice))
             self._plan_picker.setVisible(bool(node.paper_plans))
-        active = node.active_plan_key()
-        elapsed = node.paper_elapsed if node.source_age("paper_trial") <= SOURCE_TIMEOUT_SEC else None
-        if node.toss_phase and node.toss_phase not in (
-                "LAUNCH", "COAST", "CAPTURING", "CLOSING", "LOCAL_BRAKE",
-                "PLANNED_BRAKE", "HOLDING", "STOPPING"):
-            elapsed = None
-        key = active if node.plan_choice == "auto" else node.plan_choice
-        if (node.plan_choice == "auto" and node.control_view == "toss"
-                and elapsed is None):
-            key = self._preview_plan_key()
-        if key not in node.paper_plans:
-            key = None
+        key, target, following = node.plan_target()
         if key != self._drawn_plan:
             self._drawn_plan = key
             if key is None:
@@ -2348,22 +2457,9 @@ class Dashboard(QMainWindow):
             auto_label += " · " + key.rsplit("/", 1)[-1]
         if self._plan_picker.itemText(0) != auto_label:
             self._plan_picker.setItemText(0, auto_label)
-        following = key is not None and key == active and elapsed is not None
         self._plan_picker.setToolTip("실행 중인 실험의 계획" if following else
                                      f"계획 초기 자세 · {key}" if key else "계획 경로 숨기기")
-        if key is not None:
-            _, xy, times, yaw, joints, geometry = node.paper_plans[key]
-            t = elapsed if following else 0.0
-            arm = None
-            if node.arm_equipped and yaw is not None and joints is not None and geometry is not None:
-                angles = [np.interp(t, times, column) for column in joints.T]
-                arm = plan_arm_points(angles, *geometry)
-            return (np.interp(t, times, xy[:, 0]), np.interp(t, times, xy[:, 1]),
-                    np.interp(t, times, yaw) if yaw is not None else None, arm)
-        if node.source_age("reference") < XY_TRAIL_SEC:
-            # A base-only target preserves the latest measured articulation for comparison.
-            arm = node.measured_arm_in_base() if node.arm_equipped else None
-            return (*node.latest_ref, arm)
+        return target
 
     def _update_trajectory(self) -> None:
         node = self._node
@@ -2512,6 +2608,8 @@ class Dashboard(QMainWindow):
             if link.bridge_error:
                 self._stop_experiment(data, "telemetry_disconnected")
             self._report_recording_error(data)
+            if data.recorder.active:
+                data.recorder.capture(data.recording_snapshot())
             if rate_due:
                 data._tick_hz()
             if endpoint in self._link_errors:
@@ -2566,9 +2664,11 @@ class Dashboard(QMainWindow):
         self._send_target_button.setEnabled(enabled and not toss)
         recorder = self._node.recorder
         self._report_recording_error(self._default_node)
+        if self._default_node.recorder.active:
+            self._default_node.recorder.capture(self._default_node.recording_snapshot())
         self._experiment_button.setEnabled(recorder.active or self._selected_can_record())
         verb = "종료" if recorder.active else "시작"
-        self._experiment_button.setText(f"{'기록' if toss else '실험'} {verb}")
+        self._experiment_button.setText(f"기록 {verb}")
         self._experiment_button.setToolTip(str(recorder.directory) if recorder.directory else "선택한 FSS 데이터 기록")
         node = self._node
         target = node.source_age("reference") < XY_TRAIL_SEC

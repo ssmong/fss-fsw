@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
+from mission_video import VideoRecorder
 
 
 TRACKING_IDS = ("run_id", "plan_key", "plan_id", "phase")
@@ -28,6 +29,7 @@ TRACKING_VALUES = (
       for source in ("actual", "planned", "error")),
 )
 TRACKING_COLUMNS = ("received_unix_ns", "elapsed_s", *TRACKING_IDS, *TRACKING_VALUES)
+POSE_COLUMNS = ("received_unix_ns", "elapsed_s", "sample_stamp_ns", "x_m", "y_m", "yaw_rad")
 
 
 def _tracking_sample(value):
@@ -87,12 +89,20 @@ def _run_directory(root, name, now):
             index += 1
 
 
+def _save_session(directory, summary):
+    tmp = directory / "session.tmp"
+    tmp.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(directory / "session.json")
+
+
 class ExperimentRecorder:
     def __init__(self, context=None):
         self.context = context
         self.directory = None
         self.active = False
         self.error = ""
+        self.video_error = ""
+        self._videos = []
 
     def start(self, root, name, vehicle):
         if self.active:
@@ -107,6 +117,10 @@ class ExperimentRecorder:
                 "x", encoding="utf-8", newline="", buffering=1))
             self._tracking = csv.DictWriter(tracking_file, fieldnames=TRACKING_COLUMNS)
             self._tracking.writeheader()
+            pose_file = self._files.enter_context((self.directory / "pose.csv").open(
+                "x", encoding="utf-8", newline="", buffering=1))
+            self._pose = csv.DictWriter(pose_file, fieldnames=POSE_COLUMNS)
+            self._pose.writeheader()
             self._buffer = bytearray()
             self._start_ns = time.monotonic_ns()
             self._last_flush_ns = 0
@@ -114,8 +128,10 @@ class ExperimentRecorder:
             self._paths = {}
             self._path_counts = Counter()
             self._strides = Counter()
-            self._summary = {"format_version": 1, "experiment": name.strip() or "default", "vehicle": vehicle,
-                             "started_at": now.isoformat(), "status": "recording"}
+            self._summary = {"format_version": 2, "experiment": name.strip() or "default", "vehicle": vehicle,
+                             "started_at": now.isoformat(), "status": "recording", "pose_source": "vicon"}
+            self._video = None
+            self.video_error = ""
             self._save_summary()
             self.active = True
             self.error = ""
@@ -130,9 +146,54 @@ class ExperimentRecorder:
         return self.directory
 
     def _save_summary(self):
-        tmp = self.directory / "session.tmp"
-        tmp.write_text(json.dumps(self._summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.directory / "session.json")
+        _save_session(self.directory, self._summary)
+
+    def capture(self, snapshot):
+        if not self.active or self.video_error:
+            return
+        elapsed = (time.monotonic_ns() - self._start_ns) * 1e-9
+        try:
+            if self._video is None:
+                video = self._video = VideoRecorder(self.directory, fps=10)
+                self._videos = [v for v in self._videos if not v.finished] + [video]
+                directory, summary = self.directory, self._summary
+                summary["video"] = {"file": "trajectory.mp4", "status": "recording"}
+                video.finalized.connect(lambda *args: self._video_done(video, directory, summary))
+                if video.finished:
+                    self._video_done(video, directory, summary)
+            self._video.capture(snapshot, elapsed)
+        except (ImportError, OSError, RuntimeError) as exc:
+            self.video_error = f"궤적 동영상 저장 오류 · {exc}"
+            self._summary["video"] = {"file": "trajectory.mp4", "status": "error", "error": str(exc)}
+            self.log("ERROR", self.video_error)
+            try:
+                self._save_summary()
+            except OSError:
+                pass
+
+    def _video_done(self, video, directory, summary):
+        summary["video"] = {"file": "trajectory.mp4", "status": "error" if video.error else "finished",
+                            "frames": video.frames_written, "dropped_frames": video.frames_dropped,
+                            "error": video.error}
+        if video.error and directory == self.directory:
+            self.video_error = f"궤적 동영상 저장 오류 · {video.error}"
+            self.log("ERROR", self.video_error)
+        try:
+            _save_session(directory, summary)
+        except OSError as exc:
+            if directory == self.directory:
+                self.video_error = f"궤적 동영상 상태 저장 오류 · {exc}"
+
+    def finish_video(self, timeout=16.0):
+        """Drain encoder output when closing the GUI, without stopping any FSS node."""
+        from PySide6.QtCore import QCoreApplication
+        deadline = time.monotonic() + timeout
+        for video in self._videos:
+            video.stop()
+        while any(not video.finished for video in self._videos) and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(.005)
+        return all(video.finished for video in self._videos)
 
     def _flush(self):
         if self._buffer:
@@ -144,6 +205,8 @@ class ExperimentRecorder:
     def _fail(self, exc):
         self.active = False
         self.error = f"실험 기록 오류 · {exc}"
+        if self._video is not None:
+            self._video.stop()
         try:
             self._files.close()
         except OSError:
@@ -155,12 +218,20 @@ class ExperimentRecorder:
             pass
 
     def record(self, kind, value):
-        if not self.active:
+        if not self.active or kind == "ekf":
             return
+        if kind == "vicon":
+            kind = "pose"
         now = time.monotonic_ns()
         try:
             row = {"received_unix_ns": time.time_ns(), "elapsed_s": (now - self._start_ns) * 1e-9,
                    "kind": kind, "data": value}
+            if kind == "pose":
+                header = getattr(value, "header", None)
+                stamp = getattr(header, "stamp", None)
+                self._pose.writerow({"received_unix_ns": row["received_unix_ns"], "elapsed_s": row["elapsed_s"],
+                                     "sample_stamp_ns": stamp.sec * 10**9 + stamp.nanosec if stamp else None,
+                                     "x_m": value.x, "y_m": value.y, "yaw_rad": value.theta})
             if kind == "tracking_error":
                 sample = _tracking_sample(value)
                 if sample is None:
@@ -173,7 +244,7 @@ class ExperimentRecorder:
             if now - self._last_flush_ns >= 250_000_000 or len(self._buffer) >= 262144:
                 self._flush()
                 self._last_flush_ns = now
-            if kind in ("vicon", "ekf"):
+            if kind == "pose":
                 self._point(kind, value.x, value.y)
             elif kind == "ref":
                 self._point(kind, value.x_ref, value.y_ref)
@@ -206,6 +277,10 @@ class ExperimentRecorder:
         if not self.active:
             return self.directory
         self.active = False
+        if self._video is not None:
+            self._video.stop()
+            if not self._video.finished:
+                self._summary["video"]["status"] = "encoding"
         self._summary.update(stopped_at=datetime.now().astimezone().isoformat(), stop_reason=reason,
                              duration_s=(time.monotonic_ns() - self._start_ns) * 1e-9, counts=dict(self._counts))
         try:
@@ -250,8 +325,8 @@ class ExperimentRecorder:
             painter.drawText(526, 107, self._summary["started_at"][:19].replace("T", " "))
             painter.drawText(526, 135, f"Duration   {self._summary['duration_s']:.1f} s")
             y_legend = 190
-            for kind, label, color in (("ref", "GNC reference", "#be451e"), ("ekf", "EKF", "#68628d"),
-                                       ("vicon", "Vicon", "#0066cc"), ("arm_tcp", "Grasp point", "#007b70")):
+            for kind, label, color in (("ref", "Target", "#be451e"),
+                                       ("pose", "Measured", "#0066cc"), ("arm_tcp", "Grasp point", "#007b70")):
                 points = self._paths.get(kind)
                 if not points:
                     continue

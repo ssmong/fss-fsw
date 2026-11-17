@@ -315,7 +315,9 @@ def open_node(receive, reply, args=None, reject=None):
             status = json.loads(msg.data)
         except (ValueError, TypeError):
             return
-        receive("paper_status", status)
+        terminal = isinstance(status, dict) and status.get("phase") in ("STOPPED", "MISSED", "FAULT")
+        if not terminal:
+            receive("paper_status", status)
         plan_id = status.get("plan_id") if isinstance(status, dict) and status.get("frame_id") == "table" else None
         if isinstance(plan_id, str) and plan_id:
             last_paper_status, last_paper_status_at = status, time.monotonic()
@@ -342,6 +344,9 @@ def open_node(receive, reply, args=None, reject=None):
                 receive("plans", tracking.plans)
                 receive("plan_defaults", catalog.defaults)
             receive("paper_trial", ["", None, None])
+        # The recorder closes on terminal status, after the final clock and errors.
+        if terminal:
+            receive("paper_status", status)
 
     node.create_subscription(String, "/paper_toss/status", paper_status, qos_profile_sensor_data)
     registration = ArmRegistration(node, receive, Trigger)
