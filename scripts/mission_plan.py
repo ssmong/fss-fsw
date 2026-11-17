@@ -1,4 +1,4 @@
-"""Read spacecraft XY samples from registered self_tossing_hardware paper trials."""
+"""Read spacecraft body poses from registered self_tossing_hardware paper trials."""
 
 import hashlib
 import io
@@ -9,7 +9,7 @@ import zipfile
 
 
 def load_table_plans(root=None):
-    """Return (experiment/method, plan ID, table XY, sample seconds) per bundle."""
+    """Return (experiment/method, plan ID, table XY, seconds, table yaw radians or None)."""
     try:
         import numpy as np
         import yaml
@@ -41,10 +41,10 @@ def load_table_plans(root=None):
                 if str(plan["frame"].item()) != "fss_sim_1aa9864" or list(plan["phase_names"]) != ["push", "flight"]:
                     continue
                 push, flight = plan["X_push"], plan["X_flight"]
-                if any(a.ndim != 2 or len(a) < 2 or a.shape[1] != 9 for a in (push, flight)):
+                if any(a.ndim != 2 or len(a) < 2 or a.shape[1] not in (2, 9) for a in (push, flight)):
                     continue
                 base = json.loads(setup.read_text())["base_pose"]
-                if np.shape(base) != (3,) or not np.allclose(push[0, :3], base, atol=1e-6, rtol=0):
+                if np.shape(base) not in ((2,), (3,)) or not np.allclose(push[0, :2], base[:2], atol=1e-6, rtol=0):
                     continue
                 durations = np.asarray(plan["T"], dtype=float)
                 if durations.shape != (2,) or not np.isfinite(durations).all() or np.any(durations <= 0):
@@ -55,6 +55,16 @@ def load_table_plans(root=None):
                 times = np.r_[np.linspace(0, durations[0], len(push)),
                               np.linspace(durations[0], durations.sum(), len(flight))[1:]]
                 xy = np.vstack((push[:, :2], flight[1:, :2]))
+                yaw = None
+                if push.shape[1] == flight.shape[1] == 9 and len(base) == 3:
+                    # State columns start with body x, y, yaw, then the three joint angles.
+                    headings = np.r_[push[:, 2], flight[:, 2]]
+                    if np.isfinite(headings).all() and math.isfinite(base[2]):
+                        if abs(math.remainder(push[0, 2] - base[2], math.tau)) > 1e-6:
+                            continue
+                        if abs(math.remainder(push[-1, 2] - flight[0, 2], math.tau)) <= 1e-6:
+                            registered = np.r_[push[:, 2], flight[1:, 2]] + angle
+                            yaw = np.unwrap(np.arctan2(np.sin(registered), np.cos(registered)))
             c, s = np.cos(angle), np.sin(angle)
             xy = xy @ np.array([[c, s], [-s, c]]) + offset
             if not np.isfinite(xy).all() or not isinstance(trial["plan_id"], str) or not trial["plan_id"]:
@@ -62,7 +72,10 @@ def load_table_plans(root=None):
             if len(xy) > 512:
                 indices = np.linspace(0, len(xy) - 1, 512, dtype=int)
                 xy, times = xy[indices], times[indices]
-            plans.append((manifest.parent.relative_to(root).as_posix(), trial["plan_id"], xy.tolist(), times.tolist()))
+                if yaw is not None:
+                    yaw = yaw[indices]
+            plans.append((manifest.parent.relative_to(root).as_posix(), trial["plan_id"], xy.tolist(),
+                          times.tolist(), yaw.tolist() if yaw is not None else None))
         except (OSError, RuntimeError, KeyError, ValueError, TypeError, IndexError,
                 EOFError, zipfile.BadZipFile, yaml.YAMLError):
             continue

@@ -281,25 +281,31 @@ class MissionControlTest(unittest.TestCase):
         second = self.connect("second", 2)
         key = "bundle/Nominal"
         for link in (first, second):
-            link.inbox.put([("plans", [[key, "id", [[1., 0.], [2., 3.]], [0., 4.]]])])
+            # Registered body yaw turns through 180° while the path goes northeast.
+            link.inbox.put([("plans", [[key, "id", [[1., 0.], [2., 3.]], [0., 4.],
+                                       self.ui.np.radians([170., 190.]).tolist()]])])
         first.inbox.put([("paper_trial", ["id", 1.])])
         self.window._vehicles.setCurrentIndex(0)
         self.window._update()
         self.assertEqual(self.window._plan_curve.xData.tolist(), [1, 2])
         self.assertIsNone(self.window._xy_plot.plotItem.legend)
-        self.assertEqual(self.window._elapsed_plan_curve.xData.tolist(), [1, 1.25])
-        self.assertEqual(self.window._elapsed_plan_curve.yData.tolist(), [0, 0.75])
+        ghost = self.window._ghost
+        self.assertTrue(ghost.isVisible())
+        self.assertEqual((ghost.x(), ghost.y()), (1.25, 0.75))
+        self.assertAlmostEqual(ghost.rotation(), 175.)
+        self.assertEqual(ghost.path(), self.window._ghost_outline)
         first.inbox.put([("paper_trial", ["id", 6.])])
         self.window._update()
-        self.assertEqual(self.window._elapsed_plan_curve.xData.tolist(), [1, 2])
+        self.assertEqual((ghost.x(), ghost.y()), (2., 3.))
+        self.assertAlmostEqual(ghost.rotation(), 190.)
         first.data._last_rx["paper_trial"] -= 10
         self.window._update()
         self.assertIsNone(self.window._plan_curve.xData)
-        self.assertIsNone(self.window._elapsed_plan_curve.xData)
+        self.assertFalse(ghost.isVisible())
         self.window._plan_picker.setCurrentIndex(2)
         self.window._choose_plan(2)
         self.assertEqual(self.window._plan_curve.xData.tolist(), [1, 2])
-        self.assertIsNone(self.window._elapsed_plan_curve.xData)
+        self.assertFalse(ghost.isVisible())
         self.window._vehicles.setCurrentIndex(1)
         self.assertIsNone(self.window._plan_curve.xData)
         self.window._vehicles.setCurrentIndex(0)
@@ -414,14 +420,27 @@ class MissionControlTest(unittest.TestCase):
         self.window._vehicles.setCurrentIndex(0)
         self.assertTrue(self.window._send_target_button.isEnabled())
 
-    def test_switch_replaces_measured_and_target_paths_and_valve_commands(self):
+    def test_position_only_plan_has_no_heading_and_waits_for_executor_clock(self):
+        link = self.connect("first", 1)
+        link.inbox.put([("plans", [["bundle/old", "id", [[1., 2.], [2., 2.]], [0., 1.]]]),
+                        ("paper_trial", ["id", None])])
+        self.window._update()
+        ghost = self.window._ghost
+        self.assertFalse(ghost.isVisible())
+        link.inbox.put([("paper_trial", ["id", .5])])
+        self.window._update()
+        self.assertTrue(ghost.isVisible())
+        self.assertEqual((ghost.x(), ghost.y()), (1.5, 2.))
+        self.assertEqual(ghost.path(), self.window._ghost_ring)
+
+    def test_switch_replaces_measured_path_target_pose_and_valve_commands(self):
         first = self.connect("first", 1)
         second = self.connect("second", 2)
         header = SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=0))
         for i, link in enumerate((first, second), start=1):
             link.inbox.put([
                 ("vicon", SimpleNamespace(header=header, x=i, y=-i, theta=0)),
-                ("ref", SimpleNamespace(header=header, x_ref=2*i, y_ref=i, theta_ref=0)),
+                ("ref", SimpleNamespace(header=header, x_ref=2*i, y_ref=i, theta_ref=-.5*i)),
                 ("valve", SimpleNamespace(commanded_duty_cycles=[i / 4] * 8,
                                           main_valve_open=False, modbus_rtt_ms=0)),
             ])
@@ -429,12 +448,19 @@ class MissionControlTest(unittest.TestCase):
             self.window._vehicles.setCurrentIndex(tab)
             self.window._update()
             self.assertEqual(list(self.window._vicon_curve.xData), [expected_x])
-            self.assertEqual(list(self.window._ref_curve.xData), [2 * expected_x])
+            ghost = self.window._ghost
+            self.assertTrue(ghost.isVisible())
+            self.assertEqual((ghost.x(), ghost.y()), (2 * expected_x, expected_x))
+            self.assertAlmostEqual(ghost.rotation(), self.ui.math.degrees(-.5 * expected_x))
             self.assertEqual(list(self.window._valve_cmd_bar.opts["height"]), [expected_x / 4] * 8)
+        first.data._last_rx["reference"] -= 6
+        self.window._update()
+        self.assertFalse(ghost.isVisible())
         self.window._disconnect_jetson(0)
         self.assertIs(self.window._node, second.data)
         self.window._disconnect_jetson(0)
         self.assertIsNone(self.window._vicon_curve.xData)
+        self.assertFalse(ghost.isVisible())
         self.assertFalse(self.window._valve_cmd_bar.isVisible())
 
     def test_stale_mode_blocks_open_and_tracking_expires_after_five_seconds(self):

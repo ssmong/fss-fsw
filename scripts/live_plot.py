@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QCoreApplication, QEvent, QLocale, QRectF, QSettings, QTimer, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QFontDatabase, QFontMetricsF, QTransform
+from PySide6.QtGui import QBrush, QColor, QFont, QFontDatabase, QFontMetricsF, QPainterPath, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -336,7 +336,6 @@ class DashboardNode:
 
         # Vicon 상태
         self.vicon_trail = XYTrail()
-        self.reference_trail = XYTrail()
         self.arm_tcp_trail = XYTrail()
         self.arm_joints = self.arm_table = self.arm_base = self.arm_tcp = None
         self.arm_table_origin = None
@@ -580,7 +579,6 @@ class DashboardNode:
         self._mark_rx("valve")
 
     def _cb_ref(self, msg) -> None:
-        self.reference_trail.append(msg.x_ref, msg.y_ref)
         timestamp = self._relative_time(msg.header.stamp)
         self.t_r.append(timestamp)
         self.ref_x.append(msg.x_ref)
@@ -590,8 +588,10 @@ class DashboardNode:
         self._mark_rx("reference")
 
     def _cb_plans(self, entries) -> None:
-        self.paper_plans = {key: (plan_id, np.asarray(xy), np.asarray(times))
-                            for key, plan_id, xy, times in entries}
+        self.paper_plans = {}
+        for key, plan_id, xy, times, *optional in entries:
+            yaw = np.asarray(optional[0]) if optional and optional[0] is not None else None
+            self.paper_plans[key] = (plan_id, np.asarray(xy), np.asarray(times), yaw)
         if self.plan_choice not in ("auto", "off") and self.plan_choice not in self.paper_plans:
             self.plan_choice = "auto"
 
@@ -602,7 +602,7 @@ class DashboardNode:
     def active_plan_key(self):
         if not self.paper_trial or self.source_age("paper_trial") > SOURCE_TIMEOUT_SEC:
             return None
-        matches = [key for key, (plan_id, _, _) in self.paper_plans.items() if plan_id == self.paper_trial]
+        matches = [key for key, plan in self.paper_plans.items() if plan[0] == self.paper_trial]
         return matches[0] if len(matches) == 1 else None
 
     def _cb_imu(self, msg) -> None:
@@ -1181,7 +1181,7 @@ class Dashboard(QMainWindow):
         if hasattr(self, "_command_status"):
             self._log_text.clear()
             self._command_status.setText(self._node.last_command_msg)
-            for curve in (self._vicon_curve, self._ref_curve, self._position_dot, self._target_dot):
+            for curve in (self._vicon_curve, self._position_dot):
                 curve.setData([], [])
             for curve, _, _ in self._series_bindings:
                 curve.setData([], [])
@@ -1362,7 +1362,6 @@ class Dashboard(QMainWindow):
         layout.addWidget(self._plan_picker)
         self._picker_catalog = None
         self._drawn_plan = None
-        self._drawn_elapsed = None
         _style_plot(
             self._xy_plot,
             "",
@@ -1382,7 +1381,6 @@ class Dashboard(QMainWindow):
         self._xy_plot.addItem(self._table_perimeter, ignoreBounds=True)
         self._xy_plot.setTitle(None)
         self._plan_curve = self._xy_plot.plot(pen=pg.mkPen("#b9b9c0", width=1.5, style=Qt.DashLine))
-        self._elapsed_plan_curve = self._xy_plot.plot(pen=pg.mkPen("#cc302d", width=2.4, style=Qt.DashLine))
 
         self._vicon_curve = self._xy_plot.plot(
             pen=pg.mkPen(C_VICON, width=1.5),
@@ -1391,11 +1389,22 @@ class Dashboard(QMainWindow):
             symbolBrush=C_VICON,
             symbolPen=None,
         )
-        self._ref_curve = self._xy_plot.plot(
-            pen=pg.mkPen(C_REFERENCE, width=2.2, style=Qt.DashLine)
-        )
-
-        self._target_dot = self._xy_plot.plot(pen=None, symbol="+", symbolSize=16, symbolBrush=C_REFERENCE)
+        # The pointed nose marks body +X even when measured and target centers coincide.
+        half = BODY_HALF_W
+        self._ghost_outline = QPainterPath()
+        self._ghost_outline.moveTo(-half, -half)
+        for x, y in ((half, -half), (half, -half * .48), (half * 1.45, 0),
+                     (half, half * .48), (half, half), (-half, half)):
+            self._ghost_outline.lineTo(x, y)
+        self._ghost_outline.closeSubpath()
+        self._ghost_ring = QPainterPath()
+        self._ghost_ring.addEllipse(QRectF(-.04, -.04, .08, .08))
+        self._ghost = pg.QtWidgets.QGraphicsPathItem()
+        self._ghost.setPen(pg.mkPen(C_REFERENCE, width=2, style=Qt.DashLine))
+        self._ghost.setBrush(QColor(232, 147, 56, 42))
+        self._ghost.setZValue(1)
+        self._ghost.hide()
+        self._xy_plot.addItem(self._ghost, ignoreBounds=True)
 
         self._spacecraft_body = pg.QtWidgets.QGraphicsRectItem(
             -BODY_HALF_W, -BODY_HALF_W, BODY_HALF_W * 2, BODY_HALF_W * 2
@@ -1856,16 +1865,14 @@ class Dashboard(QMainWindow):
 
     def _choose_plan(self, index):
         self._node.plan_choice = self._plan_picker.itemData(index)
-        self._update_plan_curve()
+        self._update_trajectory()
 
-    def _update_plan_curve(self):
+    def _update_plan_and_get_target(self):
         node = self._node
         if self._picker_catalog is not node.paper_plans:
             self._picker_catalog = node.paper_plans
             self._drawn_plan = None
             self._plan_curve.clear()
-            self._drawn_elapsed = None
-            self._elapsed_plan_curve.clear()
             self._plan_picker.clear()
             self._plan_picker.addItem("계획 경로 · 자동", "auto")
             self._plan_picker.addItem("계획 경로 숨기기", "off")
@@ -1880,44 +1887,45 @@ class Dashboard(QMainWindow):
             key = None
         if key != self._drawn_plan:
             self._drawn_plan = key
-            self._drawn_elapsed = None
-            self._elapsed_plan_curve.clear()
             if key is None:
                 self._plan_curve.clear()
             else:
                 xy = node.paper_plans[key][1]
                 self._plan_curve.setData(xy[:, 0], xy[:, 1])
-        elapsed = node.paper_elapsed if key is not None and key == active else None
-        if elapsed != self._drawn_elapsed:
-            self._drawn_elapsed = elapsed
-            if elapsed is None:
-                self._elapsed_plan_curve.clear()
-            else:
-                _, xy, times = node.paper_plans[key]
-                n = times.searchsorted(elapsed, side="right")
-                reached = xy[:n]
-                if 0 < n < len(times) and elapsed > times[n - 1]:
-                    fraction = (elapsed - times[n - 1]) / (times[n] - times[n - 1])
-                    reached = np.vstack((reached, xy[n - 1] + fraction * (xy[n] - xy[n - 1])))
-                self._elapsed_plan_curve.setData(reached[:, 0], reached[:, 1])
         auto_label = "계획 경로 · 자동"
         if node.plan_choice == "auto" and key:
             auto_label += " · " + key.rsplit("/", 1)[-1]
         if self._plan_picker.itemText(0) != auto_label:
             self._plan_picker.setItemText(0, auto_label)
-        self._plan_picker.setToolTip(f"{key}\n회색 · 전체 계획   빨강 · 실험 경과 구간" if key
-                                     else "실험별 본체 계획 경로 [m]")
+        self._plan_picker.setToolTip(key or "실험별 본체 계획 경로 [m]")
+        if key is not None:
+            if key != active or node.paper_elapsed is None:
+                return None
+            _, xy, times, yaw = node.paper_plans[key]
+            t = node.paper_elapsed
+            return (np.interp(t, times, xy[:, 0]), np.interp(t, times, xy[:, 1]),
+                    np.interp(t, times, yaw) if yaw is not None else None)
+        if node.source_age("reference") < XY_TRAIL_SEC:
+            return node.latest_ref
 
     def _update_trajectory(self) -> None:
         node = self._node
-        self._update_plan_curve()
+        target = self._update_plan_and_get_target()
+        visible = target is not None and all(math.isfinite(v) for v in target[:2])
+        self._ghost.setVisible(visible)
+        if visible:
+            x, y, yaw = target
+            oriented = yaw is not None and math.isfinite(yaw)
+            self._ghost.setPath(self._ghost_outline if oriented else self._ghost_ring)
+            self._ghost.setPos(x, y)
+            self._ghost.setRotation(math.degrees(yaw) if oriented else 0.)
+            heading = f" · yaw {math.degrees(_wrap_angle_rad(yaw)):.1f}°" if oriented else ""
+            self._ghost.setToolTip(f"목표 ({x:.2f}, {y:.2f}) m{heading}")
         current = node.source_age("vicon") < XY_TRAIL_SEC
         self._spacecraft_body.setVisible(current)
         self._spacecraft_front.setVisible(current)
         self._position_dot.setVisible(current)
-        self._target_dot.setVisible(node.source_age("reference") < XY_TRAIL_SEC)
         self._vicon_curve.setData(*node.vicon_trail.coordinates())
-        self._ref_curve.setData(*node.reference_trail.coordinates())
         if current:
             x, y = node.x_v[-1], node.y_v[-1]
             heading = math.radians(node.th_v[-1])
@@ -1935,8 +1943,6 @@ class Dashboard(QMainWindow):
             y2 = y + sine * half_width + cosine * (half_width * 0.7)
             self._spacecraft_front.setLine(x1, y1, x2, y2)
             self._position_dot.setData([x], [y])
-        if node.ref_x:
-            self._target_dot.setData([node.ref_x[-1]], [node.ref_y[-1]])
 
     def _update_detail_plots(self) -> None:
         node = self._node

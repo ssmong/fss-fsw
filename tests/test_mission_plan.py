@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -23,22 +24,39 @@ class RegisteredPlanTest(unittest.TestCase):
         method.mkdir(parents=True)
         base = np.zeros((2, 9))
         base[:, :2] = [[1, 2], [3, 4]]
+        base[:, 2] = np.radians([80, 100])
         self.archive = method / "plan.npz"
         np.savez(self.archive, X_push=base, X_flight=base[::-1], frame="fss_sim_1aa9864",
                  phase_names=["push", "flight"], T=[2, 5])
-        (method / "initial_setup.json").write_text(json.dumps({"base_pose": [1, 2, 0]}))
+        (method / "initial_setup.json").write_text(json.dumps({"base_pose": [1, 2, math.radians(80)]}))
         self.manifest = method / "trial.yaml"
         self.trial = {"plan_id": "trial-1", "plan_sha256": hashlib.sha256(self.archive.read_bytes()).hexdigest(),
                       "registration": {"rotation_rad": np.pi / 2, "translation_m": [3, 7]}}
         self.manifest.write_text(json.dumps(self.trial))
 
-    def test_registered_body_xy(self):
-        (key, plan_id, xy, times), = load_table_plans(self.root)
+    def test_registered_body_pose(self):
+        (key, plan_id, xy, times, yaw), = load_table_plans(self.root)
         self.assertEqual((key, plan_id), ("trial/Nominal", "trial-1"))
         self.assertEqual(times, [0, 2, 7])
+        for actual, expected in zip(yaw, [170, 190, 170], strict=True):
+            self.assertAlmostEqual(math.degrees(actual), expected)
         for actual, expected in zip(xy, [[1, 8], [-1, 10], [1, 8]], strict=True):
             for a, e in zip(actual, expected):
                 self.assertAlmostEqual(a, e)
+
+    def test_position_only_plan_retains_xy_and_time_without_synthesizing_yaw(self):
+        import numpy as np
+        with np.load(self.archive) as archive:
+            plan = dict(archive)
+        for phase in ("X_push", "X_flight"):
+            plan[phase] = plan[phase][:, :2]
+        np.savez(self.archive, **plan)
+        self.trial["plan_sha256"] = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        self.manifest.write_text(json.dumps(self.trial))
+        (_, _, xy, times, yaw), = load_table_plans(self.root)
+        self.assertEqual(len(xy), len(times))
+        self.assertEqual(times, [0, 2, 7])
+        self.assertIsNone(yaw)
 
     def test_changed_archive_or_missing_registration_is_excluded(self):
         with self.archive.open("ab") as f:
