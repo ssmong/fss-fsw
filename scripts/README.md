@@ -77,15 +77,13 @@ D435i IMU는 카메라 알고리즘용 `/camera/camera/imu`에만 남겨 둔다.
 | `diagnostics/imu_live.py` | IMU raw/body 축 비교와 평면 yaw 확인 | 노트북 또는 Jetson GUI |
 | `diagnostics/realsense_live.py` | Depth/Color 영상 확인 | 노트북 또는 Jetson GUI |
 
-### 커스텀 미션 대시보드
+### FSS Mission Control
 
-**+ FSS 연결**로 기체를 추가하고 **로봇팔 장착** 여부를 지정합니다. 기본 화면에는 Vicon 실측과 목표, 밸브 명령(0–1), 선택한 기체의 SSH 터미널이 표시됩니다. **+**로 같은 기체의 셸을 추가하거나 **로그**를 눌러 최소 표시 등급을 고를 수 있습니다. Windows에서는 [빠른 시작](../README.md)을 따르세요.
+[Windows 실행 방법](../README.md)
 
-**로봇팔**은 실험 노드가 발행하는 테이블 좌표의 `/arm/link_poses`로 그리고, 파지점의 최근 5초는 `/arm/end_effector_pose`로 표시합니다. 파지점은 본체 자세와 관절 피드백으로 계산한 위치입니다. **상세 → 로봇팔**에서 어깨·팔꿈치·손목 각도와 본체 기준 형상을 확인할 수 있습니다. [이 저장소의 링크 치수와 좌표축](../docs/hardware/014_Mass_Properties.md#1-좌표계와-기준축)
-
-**계획 경로**는 Jetson의 `~/self_tossing_hardware/experiments/<실험>/<방법>/`에 있는 `trial.yaml`, `initial_setup.json`, `plan.npz`를 읽습니다. 회색 파선은 계획 전체입니다. 연한 주황색 기체와 팔은 실험의 현재 계획 시각에 해당하는 자세를 표시합니다. 실측 기체는 Vicon 궤적, 실측 팔은 청록색 링크로 확인하세요.
-
-**실험 시작 → 실험 종료**로 선택한 기체의 수신 데이터를 관제 PC에 기록합니다. `experiments/<이름>/YYYY-MM-DD/HH-MM-SS/`에서 `telemetry.jsonl.gz`(수신 시각과 ROS 메시지), `logs.txt`(전체 등급), `session.json`(기체·시작/종료 시각·수신 건수), `trajectory.png`(XY 궤적)를 확인하세요. 모니터링 연결에서도 기록할 수 있습니다.
+- 로봇팔 링크는 `/arm/link_poses`, 파지점은 `/arm/end_effector_pose`에서 수신합니다. [링크 치수와 좌표축](../docs/hardware/014_Mass_Properties.md#1-좌표계와-기준축)
+- 실험 계획은 Jetson의 `~/self_tossing_hardware/experiments/<실험>/<방법>/`에서 `trial.yaml`, `initial_setup.json`, `plan.npz`를 읽습니다.
+- 관제 PC의 `experiments/<이름>/YYYY-MM-DD/HH-MM-SS/`에 `telemetry.jsonl.gz`, `logs.txt`, `session.json`, `trajectory.png`가 저장됩니다.
 
 ```bash
 source /opt/ros/humble/setup.bash
