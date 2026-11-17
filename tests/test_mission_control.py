@@ -433,6 +433,52 @@ class MissionControlTest(unittest.TestCase):
         self.assertEqual((ghost.x(), ghost.y()), (1.5, 2.))
         self.assertEqual(ghost.path(), self.window._ghost_ring)
 
+    def test_ghost_has_a_square_body_and_articulated_plan_arm(self):
+        link = self.connect("first", 1)
+        pi = self.ui.math.pi
+        geometry = [[[0., -.15], [0., -.2], [0., -.2]], [0., -.1]]
+        plan = ["bundle/a", "id", [[1., 2.], [1., 2.]], [0., 2.], [pi/2, pi/2],
+                [[0., 0., 0.], [pi, 0., pi]], geometry]
+        link.inbox.put([("plans", [plan]), ("paper_trial", ["id", 1.])])
+        self.window._update()
+        body, arm = self.window._ghost, self.window._ghost_arm
+        half = self.ui.BODY_HALF_W
+        self.assertEqual(body.path().boundingRect(), self.ui.QRectF(-half, -half, 2*half, 2*half))
+        self.assertLess(body.brush().color().alpha(), 42)
+        path = arm.path()
+        self.assertEqual(path.elementCount(), 5)
+        tip = arm.mapToParent(path.currentPosition())
+        self.assertAlmostEqual(tip.x(), .4)
+        self.assertAlmostEqual(tip.y(), -.05)
+        on_table = body.mapToParent(tip)
+        self.assertAlmostEqual(on_table.x(), 1.05)
+        self.assertAlmostEqual(on_table.y(), 2.4)
+        link.data.arm_equipped = False
+        self.window._update()
+        self.assertTrue(body.isVisible())
+        self.assertTrue(arm.path().isEmpty())
+
+    def test_live_base_target_projects_fresh_measured_arm(self):
+        node = self.window._node
+        pose = self.ui.math.pi / 2
+        stamp = SimpleNamespace(sec=1, nanosec=0)
+        frame = SimpleNamespace(frame_id="table", stamp=stamp)
+        def point(x, y):
+            return SimpleNamespace(position=SimpleNamespace(x=x, y=y),
+                                   orientation=SimpleNamespace(z=self.ui.math.sin(pose/2), w=self.ui.math.cos(pose/2)))
+        node._cb_ref(SimpleNamespace(header=frame, x_ref=2., y_ref=2., theta_ref=0.))
+        node._cb_arm_table(SimpleNamespace(header=frame, poses=[point(1., 1. + v) for v in (0, .1, .2, .3)]))
+        node._cb_arm_tcp(SimpleNamespace(header=frame, pose=point(1.05, 1.4)))
+        self.window._update_trajectory()
+        path = self.window._ghost_arm.path()
+        self.assertEqual(path.elementCount(), 5)
+        self.assertAlmostEqual(path.currentPosition().x(), .4)
+        self.assertAlmostEqual(path.currentPosition().y(), -.05)
+        self.assertIn("실측 팔 자세", self.window._ghost.toolTip())
+        node._last_rx["arm_pair"] -= 5
+        self.window._update_trajectory()
+        self.assertTrue(self.window._ghost_arm.path().isEmpty())
+
     def test_switch_replaces_measured_path_target_pose_and_valve_commands(self):
         first = self.connect("first", 1)
         second = self.connect("second", 2)

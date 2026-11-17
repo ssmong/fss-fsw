@@ -83,7 +83,7 @@ D435i IMU는 카메라 알고리즘용 `/camera/camera/imu`에만 남겨 둔다.
 
 **로봇팔**은 실험 노드가 발행하는 테이블 좌표의 `/arm/link_poses`로 그리고, 파지점의 최근 5초는 `/arm/end_effector_pose`로 표시합니다. 파지점은 본체 자세와 관절 피드백으로 계산한 위치입니다. **상세 → 로봇팔**에서 어깨·팔꿈치·손목 각도와 본체 기준 형상을 확인할 수 있습니다. [이 저장소의 링크 치수와 좌표축](../docs/hardware/014_Mass_Properties.md#1-좌표계와-기준축)
 
-**계획 경로**는 Jetson의 `~/self_tossing_hardware/experiments/<실험>/<방법>/`에 있는 `trial.yaml`, `initial_setup.json`, `plan.npz`를 읽습니다. 연한 회색 파선은 선택한 계획 전체이고, 빨간 파선은 실행 중인 실험의 계획 시간이 도달한 구간입니다. 기체의 실제 움직임은 Vicon 궤적으로 비교합니다.
+**계획 경로**는 Jetson의 `~/self_tossing_hardware/experiments/<실험>/<방법>/`에 있는 `trial.yaml`, `initial_setup.json`, `plan.npz`를 읽습니다. 회색 파선은 계획 전체입니다. 연한 주황색 기체와 팔은 실험의 현재 계획 시각에 해당하는 자세를 표시합니다. 실측 기체는 Vicon 궤적, 실측 팔은 청록색 링크로 확인하세요.
 
 **실험 시작 → 실험 종료**로 선택한 기체의 수신 데이터를 관제 PC에 기록합니다. `experiments/<이름>/YYYY-MM-DD/HH-MM-SS/`에서 `telemetry.jsonl.gz`(수신 시각과 ROS 메시지), `logs.txt`(전체 등급), `session.json`(기체·시작/종료 시각·수신 건수), `trajectory.png`(XY 궤적)를 확인하세요. 모니터링 연결에서도 기록할 수 있습니다.
 

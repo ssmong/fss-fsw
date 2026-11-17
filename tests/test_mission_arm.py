@@ -9,7 +9,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from mission_arm import encoder_model, joint_angles, link_points
+from mission_arm import encoder_model, joint_angles, link_points, plan_arm_points
 
 
 def pose(x, y):
@@ -31,6 +31,28 @@ class ArmModelTest(unittest.TestCase):
         self.assertAlmostEqual(points[-1][0], 0.190250 + 0.199021)
         self.assertAlmostEqual(points[-1][1], -0.000250 + 0.199021)
         self.assertAlmostEqual(yaw, math.pi)
+
+    def test_plan_rotates_each_offset_in_its_parent_frame(self):
+        offsets = [(0.10, -0.20), (0.0, -0.40), (0.03, -0.25)]
+        angles = [math.pi / 2, -math.pi / 2, math.pi / 2]
+        expected = [(0, 0), (0.10, -0.20), (0.50, -0.20), (0.53, -0.45), (0.60, -0.44)]
+        result = plan_arm_points(angles, offsets, (0.01, -0.07))
+        self.assertEqual(len(result), len(expected))
+        for actual, reference in zip(result, expected):
+            self.assertAlmostEqual(actual[0], reference[0])
+            self.assertAlmostEqual(actual[1], reference[1])
+        self.assertEqual(plan_arm_points(angles, offsets), result[:4])
+
+    def test_plan_requires_its_own_finite_geometry(self):
+        angles = (0, 0, 0)
+        offsets = [(0.20, 0), (0.10, 0), (0.15, 0)]
+        x, y = plan_arm_points(angles, offsets)[-1]
+        self.assertAlmostEqual(x, 0.45)
+        self.assertEqual(y, 0)
+        self.assertIsNone(plan_arm_points(angles, None))
+        self.assertIsNone(plan_arm_points((0, math.nan, 0), offsets))
+        self.assertIsNone(plan_arm_points(angles, offsets[:2]))
+        self.assertIsNone(plan_arm_points(angles, offsets, (0, math.inf)))
 
     def test_pose_arrays_require_the_requested_frame_and_four_links(self):
         msg = NS(header=NS(frame_id="base_link"), poses=[pose(0, 0)] * 4)

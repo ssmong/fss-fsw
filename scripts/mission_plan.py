@@ -8,8 +8,38 @@ from pathlib import Path
 import zipfile
 
 
-def load_table_plans(root=None):
-    """Return (experiment/method, plan ID, table XY, seconds, table yaw radians or None)."""
+def _plan_joint_offsets(model_path, np):
+    if model_path is None:
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            model_path = Path(get_package_share_directory("hardware_runtime")) / "config/planar_model.json"
+        except (ImportError, LookupError):
+            model_path = Path.home() / "FSS_FSW/src/hardware/hardware_runtime/config/planar_model.json"
+    try:
+        model_path = Path(model_path)
+        if model_path.stat().st_size > 65536:
+            return None
+        model = json.loads(model_path.read_bytes())
+        source = model["provenance"]
+        if (model["schema_version"] != 1 or source["urdf_commit"] != "1aa9864b55c8a3032085244ab4e365785faf354c"
+                or source["urdf_sha256"] != "23ad70e02d040ea482776261baaae14fbf1de2fc1da3770742b2a54bbab449f3"):
+            return None
+        offsets = np.asarray(model["joint_offsets_m"], dtype=float)
+        if offsets.shape == (3, 2) and np.isfinite(offsets).all():
+            return offsets.tolist()
+    except (OSError, TypeError, KeyError, ValueError):
+        pass
+    return None
+
+
+def _matches_vector(values, actual, tolerance):
+    return (isinstance(values, list) and len(values) == len(actual)
+            and all(type(value) in (int, float) and math.isclose(value, sample, rel_tol=0, abs_tol=tolerance)
+                    for value, sample in zip(values, actual)))
+
+
+def load_table_plans(root=None, model_path=None):
+    """Return key, ID, table XY, seconds, body yaw, relative joints, and arm geometry."""
     try:
         import numpy as np
         import yaml
@@ -17,6 +47,7 @@ def load_table_plans(root=None):
         return []
 
     root = (Path(root) if root else Path.home() / "self_tossing_hardware" / "experiments").resolve()
+    joint_offsets = _plan_joint_offsets(model_path, np)
     plans = []
     for manifest in sorted(root.glob("*/*/trial.yaml")):
         try:
@@ -43,7 +74,8 @@ def load_table_plans(root=None):
                 push, flight = plan["X_push"], plan["X_flight"]
                 if any(a.ndim != 2 or len(a) < 2 or a.shape[1] not in (2, 9) for a in (push, flight)):
                     continue
-                base = json.loads(setup.read_text())["base_pose"]
+                initial = json.loads(setup.read_text())
+                base = initial["base_pose"]
                 if np.shape(base) not in ((2,), (3,)) or not np.allclose(push[0, :2], base[:2], atol=1e-6, rtol=0):
                     continue
                 durations = np.asarray(plan["T"], dtype=float)
@@ -56,6 +88,22 @@ def load_table_plans(root=None):
                               np.linspace(durations[0], durations.sum(), len(flight))[1:]]
                 xy = np.vstack((push[:, :2], flight[1:, :2]))
                 yaw = None
+                joints = None
+                geometry = None
+                if push.shape[1] == flight.shape[1] == 9:
+                    start = initial.get("joint_rad")
+                    joint_samples = np.vstack((push[:, 3:6], flight[1:, 3:6]))
+                    if (np.isfinite(joint_samples).all() and _matches_vector(start, push[0, 3:6], 1e-6)
+                            and np.allclose(push[-1, 3:6], flight[0, 3:6], atol=1e-6, rtol=0)):
+                        # The export already uses calibrated relative shoulder, elbow, wrist radians.
+                        joints = joint_samples
+                        if joint_offsets is not None:
+                            geometry = [joint_offsets, None]
+                            expected = trial.get("expected_grasp_offset_m")
+                            grasp = plan.get("grasp_offset_m")
+                            if (np.shape(grasp) == (2,) and grasp.dtype.kind in "ifu" and np.isfinite(grasp).all()
+                                    and _matches_vector(expected, grasp, 1e-10)):
+                                geometry[1] = grasp.tolist()
                 if push.shape[1] == flight.shape[1] == 9 and len(base) == 3:
                     # State columns start with body x, y, yaw, then the three joint angles.
                     headings = np.r_[push[:, 2], flight[:, 2]]
@@ -74,8 +122,11 @@ def load_table_plans(root=None):
                 xy, times = xy[indices], times[indices]
                 if yaw is not None:
                     yaw = yaw[indices]
+                if joints is not None:
+                    joints = joints[indices]
             plans.append((manifest.parent.relative_to(root).as_posix(), trial["plan_id"], xy.tolist(),
-                          times.tolist(), yaw.tolist() if yaw is not None else None))
+                          times.tolist(), yaw.tolist() if yaw is not None else None,
+                          joints.tolist() if joints is not None else None, geometry))
         except (OSError, RuntimeError, KeyError, ValueError, TypeError, IndexError,
                 EOFError, zipfile.BadZipFile, yaml.YAMLError):
             continue

@@ -42,6 +42,31 @@ def encoder_model(angles):
     return points, shoulder + elbow + wrist
 
 
+def plan_arm_points(joints, offsets, grasp_offset=None):
+    """Base-frame XY in metres, ordered base, shoulder, elbow, wrist, optional grasp.
+
+    Each offset is expressed in its parent link's frame. Relative joint angles
+    turn about +Z after reaching that joint. The plan supplies its own geometry.
+    """
+    try:
+        if len(joints) != 3 or len(offsets) != 3 or not all(math.isfinite(q) for q in joints):
+            return None
+        segments = tuple(offsets) if grasp_offset is None else (*offsets, grasp_offset)
+        points = [(0.0, 0.0)]
+        x = y = heading = 0.0
+        for turn, (dx, dy) in zip((0.0, *joints), segments):
+            heading += turn
+            c, s = math.cos(heading), math.sin(heading)
+            x += c * dx - s * dy
+            y += s * dx + c * dy
+            if not math.isfinite(x) or not math.isfinite(y):
+                return None
+            points.append((x, y))
+        return tuple(points)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def feedback_source(status):
     fields = dict(part.strip().split("=", 1) for part in status.split(";") if "=" in part)
     return {"True": "모의", "False": "엔코더"}.get(fields.get("dry_run"), "출처 미확인")

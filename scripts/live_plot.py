@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mission_arm import JOINT_LABELS, encoder_model, feedback_source, joint_angles, link_points
+from mission_arm import JOINT_LABELS, encoder_model, feedback_source, joint_angles, link_points, plan_arm_points
 from mission_link import JetsonLink, PREFERRED_WORKSPACE
 from mission_recording import ExperimentRecorder
 from mission_terminal import TerminalView
@@ -548,6 +548,18 @@ class DashboardNode:
             self.arm_gripper_pair = self.arm_table, self.arm_tcp
             self._mark_rx("arm_pair")
 
+    def measured_arm_in_base(self):
+        pair = self.arm_gripper_pair
+        if (pair and pair[0] is self.arm_table and self.arm_table_origin is not None
+                and self.source_age("arm_pair") < ARM_TIMEOUT_SEC):
+            x, y, yaw_deg = self.arm_table_origin
+            yaw = math.radians(yaw_deg)
+            c, s = math.cos(yaw), math.sin(yaw)
+            return tuple((c * (px - x) + s * (py - y), -s * (px - x) + c * (py - y))
+                         for px, py in (*pair[0][0], pair[1]))
+        if self.arm_base and self.source_age("arm_base") < ARM_TIMEOUT_SEC:
+            return self.arm_base[0]
+
     def _cb_ekf(self, msg) -> None:
         timestamp = self._relative_time(msg.header.stamp)
         self.t_e.append(timestamp)
@@ -591,7 +603,9 @@ class DashboardNode:
         self.paper_plans = {}
         for key, plan_id, xy, times, *optional in entries:
             yaw = np.asarray(optional[0]) if optional and optional[0] is not None else None
-            self.paper_plans[key] = (plan_id, np.asarray(xy), np.asarray(times), yaw)
+            joints = np.asarray(optional[1]) if len(optional) >= 2 and optional[1] is not None else None
+            geometry = optional[2] if len(optional) >= 3 else None
+            self.paper_plans[key] = (plan_id, np.asarray(xy), np.asarray(times), yaw, joints, geometry)
         if self.plan_choice not in ("auto", "off") and self.plan_choice not in self.paper_plans:
             self.plan_choice = "auto"
 
@@ -1389,19 +1403,16 @@ class Dashboard(QMainWindow):
             symbolBrush=C_VICON,
             symbolPen=None,
         )
-        # The pointed nose marks body +X even when measured and target centers coincide.
         half = BODY_HALF_W
         self._ghost_outline = QPainterPath()
-        self._ghost_outline.moveTo(-half, -half)
-        for x, y in ((half, -half), (half, -half * .48), (half * 1.45, 0),
-                     (half, half * .48), (half, half), (-half, half)):
-            self._ghost_outline.lineTo(x, y)
-        self._ghost_outline.closeSubpath()
+        self._ghost_outline.addRect(QRectF(-half, -half, 2 * half, 2 * half))
         self._ghost_ring = QPainterPath()
         self._ghost_ring.addEllipse(QRectF(-.04, -.04, .08, .08))
         self._ghost = pg.QtWidgets.QGraphicsPathItem()
-        self._ghost.setPen(pg.mkPen(C_REFERENCE, width=2, style=Qt.DashLine))
-        self._ghost.setBrush(QColor(232, 147, 56, 42))
+        self._ghost.setPen(pg.mkPen(QColor(175, 111, 47, 126), width=1.5, style=Qt.DashLine))
+        self._ghost.setBrush(QColor(232, 147, 56, 18))
+        self._ghost_arm = pg.QtWidgets.QGraphicsPathItem(self._ghost)
+        self._ghost_arm.setPen(pg.mkPen(QColor(175, 111, 47, 146), width=2))
         self._ghost.setZValue(1)
         self._ghost.hide()
         self._xy_plot.addItem(self._ghost, ignoreBounds=True)
@@ -1901,12 +1912,18 @@ class Dashboard(QMainWindow):
         if key is not None:
             if key != active or node.paper_elapsed is None:
                 return None
-            _, xy, times, yaw = node.paper_plans[key]
+            _, xy, times, yaw, joints, geometry = node.paper_plans[key]
             t = node.paper_elapsed
+            arm = None
+            if node.arm_equipped and yaw is not None and joints is not None and geometry is not None:
+                angles = [np.interp(t, times, column) for column in joints.T]
+                arm = plan_arm_points(angles, *geometry)
             return (np.interp(t, times, xy[:, 0]), np.interp(t, times, xy[:, 1]),
-                    np.interp(t, times, yaw) if yaw is not None else None)
+                    np.interp(t, times, yaw) if yaw is not None else None, arm)
         if node.source_age("reference") < XY_TRAIL_SEC:
-            return node.latest_ref
+            # A base-only target preserves the latest measured articulation for comparison.
+            arm = node.measured_arm_in_base() if node.arm_equipped else None
+            return (*node.latest_ref, arm)
 
     def _update_trajectory(self) -> None:
         node = self._node
@@ -1914,13 +1931,21 @@ class Dashboard(QMainWindow):
         visible = target is not None and all(math.isfinite(v) for v in target[:2])
         self._ghost.setVisible(visible)
         if visible:
-            x, y, yaw = target
+            x, y, yaw, arm = target
             oriented = yaw is not None and math.isfinite(yaw)
             self._ghost.setPath(self._ghost_outline if oriented else self._ghost_ring)
             self._ghost.setPos(x, y)
             self._ghost.setRotation(math.degrees(yaw) if oriented else 0.)
             heading = f" · yaw {math.degrees(_wrap_angle_rad(yaw)):.1f}°" if oriented else ""
-            self._ghost.setToolTip(f"목표 ({x:.2f}, {y:.2f}) m{heading}")
+            path = QPainterPath()
+            arm_label = ""
+            if oriented and arm is not None:
+                path.moveTo(*arm[0])
+                for point in arm[1:]:
+                    path.lineTo(*point)
+                arm_label = " · 계획 관절각" if self._drawn_plan else " · 실측 팔 자세"
+            self._ghost_arm.setPath(path)
+            self._ghost.setToolTip(f"목표 ({x:.2f}, {y:.2f}) m{heading}{arm_label}")
         current = node.source_age("vicon") < XY_TRAIL_SEC
         self._spacecraft_body.setVisible(current)
         self._spacecraft_front.setVisible(current)
