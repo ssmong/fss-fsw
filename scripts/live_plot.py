@@ -333,6 +333,7 @@ class DashboardNode:
         self.tracking_since = None
         self.target_draft = ("PID", 0.0, 0.0, 0.0)
         self.toss_method = "Nominal"
+        self.control_view = "position"
         self.toss_options = ""
         self.toss_phase = self.toss_phase_label = ""
         self.toss_gripper = self.toss_alignment = ""
@@ -952,6 +953,17 @@ class Dashboard(QMainWindow):
         panels.addWidget(self._build_trajectory_panel(), stretch=1)
         sidebar = QVBoxLayout()
         sidebar.setSpacing(6)
+        view_row = QHBoxLayout()
+        self._control_views = QButtonGroup(self)
+        for index, label in enumerate(("위치 제어", "Self-tossing")):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setStyleSheet("min-height:18px; padding:2px 10px; border-radius:12px;")
+            self._control_views.addButton(button, index)
+            view_row.addWidget(button)
+        self._control_views.button(0).setChecked(True)
+        self._control_views.idClicked.connect(self._select_control_view)
+        sidebar.addLayout(view_row)
         self._controls = self._build_control_bar()
         self._controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         sidebar.addWidget(self._controls)
@@ -1135,7 +1147,7 @@ class Dashboard(QMainWindow):
     def _update_body_button(self, index, endpoint, link, label):
         side = QTabBar.RightSide
         button = self._vehicles.tabButton(index, side)
-        if link.workflow == "toss" or not self._can_start_body(endpoint, link):
+        if not self._can_start_body(endpoint, link):
             if button is not None:
                 button.setEnabled(False)
                 self._vehicles.setTabButton(index, side, None)
@@ -1154,6 +1166,10 @@ class Dashboard(QMainWindow):
     def _reset_estop(self):
         if self._node.mode_name == "EMERGENCY_STOP" and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC:
             self._node.request_mode(MODE_IDLE)
+
+    def _select_control_view(self, index):
+        self._node.control_view = "position" if index == 0 else "toss"
+        self._update()
 
     def _read_target(self):
         for editor in (self._target_x, self._target_y, self._target_yaw):
@@ -1348,6 +1364,7 @@ class Dashboard(QMainWindow):
             self._bind_console(link)
         if changed and hasattr(self, "_target_x"):
             controller, x, y, yaw = self._node.target_draft
+            self._control_views.button(1 if self._node.control_view == "toss" else 0).setChecked(True)
             self._controller.button(0 if controller == "PID" else 1).setChecked(True)
             self._toss_method.setCurrentText(self._node.toss_method)
             self._toss_options.setText(self._node.toss_options)
@@ -1476,7 +1493,7 @@ class Dashboard(QMainWindow):
         layout = QGridLayout(panel)
         layout.setContentsMargins(12, 9, 12, 10)
         layout.setSpacing(5)
-        layout.addWidget(QLabel("작업"), 0, 0)
+        layout.addWidget(QLabel("경로"), 0, 0)
         self._toss_status = QLabel()
         self._toss_status.setTextFormat(Qt.PlainText)
         self._toss_status.setStyleSheet(f"color:{C_TEXT_DIM};")
@@ -1484,7 +1501,7 @@ class Dashboard(QMainWindow):
         self._toss_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._toss_status, 0, 1, 1, 3)
         self._toss_method = QComboBox()
-        self._toss_method.setAccessibleName("준비할 실험 또는 위치 제어")
+        self._toss_method.setAccessibleName("Self-tossing 경로")
         self._toss_method.addItems(("Nominal", "JF_only", "Proposed"))
         self._toss_method.activated.connect(lambda _: self._update())
         layout.addWidget(self._toss_method, 1, 0)
@@ -1492,7 +1509,7 @@ class Dashboard(QMainWindow):
         for col, (action, label) in enumerate((
                 ("toss_prepare", "준비"), ("toss_start", "출발"), ("toss_stop", "정지")), start=1):
             button = QPushButton(label)
-            button.setAccessibleName("선택한 작업 준비" if action == "toss_prepare" else f"Self-tossing {label}")
+            button.setAccessibleName("선택한 실험 준비" if action == "toss_prepare" else f"Self-tossing {label}")
             if action == "toss_start":
                 button.setObjectName("sendTarget")
             button.clicked.connect(lambda checked=False, name=action: self._send_toss(name))
@@ -1510,18 +1527,14 @@ class Dashboard(QMainWindow):
         return panel
 
     def _can_send_toss(self, link, action):
-        return link and link.data is self._node and not self._shared_domain(link) and link.can_toss(action)
+        return (self._node.control_view == "toss" and link and link.data is self._node
+                and not self._shared_domain(link) and link.can_toss(action))
 
     def _send_toss(self, action):
         endpoint = self._vehicles.tabData(self._vehicles.currentIndex())
         link = self._links.get(endpoint)
         for connected in self._links.values():
             connected.drain()
-        if action == "toss_prepare" and self._toss_method.currentText() == "위치 제어":
-            if link and link.workflow == "toss" and link.data is self._node and self._can_start_body(endpoint, link):
-                link.data.send_command("start_body", True)
-            self._update()
-            return
         if self._can_send_toss(link, action):
             value = self._toss_method.currentText() if action == "toss_prepare" else True
             if action == "toss_prepare" and self._toss_options.text().strip():
@@ -1547,24 +1560,11 @@ class Dashboard(QMainWindow):
         return ""
 
     def _update_toss_controls(self, link):
-        endpoint = self._vehicles.tabData(self._vehicles.currentIndex())
-        body = self._can_start_body(endpoint, link)
-        body_item = self._toss_method.findText("위치 제어")
-        offers_body = link.can_start_body and link.profile in ("auto", "control") and not link.read_only
-        if offers_body and body_item < 0:
-            self._toss_method.addItem("위치 제어")
-            if self._node.toss_method == "위치 제어":
-                self._toss_method.setCurrentText("위치 제어")
-        elif not offers_body and body_item >= 0:
-            self._toss_method.removeItem(body_item)
         for action, button in self._toss_buttons.items():
             button.setEnabled(bool(self._can_send_toss(link, action)))
         prepare = self._toss_buttons["toss_prepare"]
-        prepare.setToolTip("본체를 PID/LQR 목표 대기로 기동합니다." if self._toss_method.currentText() == "위치 제어"
-                           else "실험 본체와 계획 실행기를 준비합니다. 기체 설정에 따라 에어베어링이 열립니다.")
-        self._toss_method.setEnabled(body or prepare.isEnabled())
-        if self._toss_method.currentText() == "위치 제어":
-            prepare.setEnabled(body)
+        prepare.setToolTip("실험 본체와 계획 실행기를 준비합니다. 기체 설정에 따라 에어베어링이 열립니다.")
+        self._toss_method.setEnabled(prepare.isEnabled())
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
         start = self._toss_buttons["toss_start"]
         grasp_first = (phase_fresh and self._node.toss_phase in ("IDLE", "STOPPED", "MISSED")
@@ -1574,10 +1574,10 @@ class Dashboard(QMainWindow):
                          else "실험 실행기에 출발을 요청합니다.")
         choosing = not phase_fresh or self._toss_method.isEnabled()
         self._toss_method.setVisible(choosing)
-        self._toss_options.setVisible(choosing and self._toss_method.currentText() != "위치 제어")
+        self._toss_options.setVisible(choosing)
         self._toss_options.setEnabled(prepare.isEnabled())
         prepare.setVisible(choosing)
-        if not link.ready or link.stopped.is_set() or link.bridge_error:
+        if not link or not link.ready or link.stopped.is_set() or link.bridge_error:
             status = "연결 대기"
         elif phase_fresh:
             plan = self._node.active_plan_key()
@@ -1589,7 +1589,7 @@ class Dashboard(QMainWindow):
         else:
             status = "상태 미수신"
         self._toss_status.setText(status)
-        self._toss_status.setToolTip(link.read_only or link.toss_state or status)
+        self._toss_status.setToolTip((link.read_only or link.toss_state or status) if link else status)
         alignment = self._live_toss_alignment(link)
         self._toss_alignment.setText(alignment)
         self._toss_alignment.setVisible(bool(alignment))
@@ -2489,7 +2489,7 @@ class Dashboard(QMainWindow):
             detail = self._link_errors.get(endpoint) or link.bridge_error or link.read_only
             tooltip = f"{link.ssh_user}@{endpoint}"
             if status == "Missing" and link.ready:
-                tooltip += "\n기체 위치 미수신 (5초)"
+                tooltip += "\nSSH 연결됨 · 위치 데이터 미수신 (5초)"
             short_label = self._vehicles.fontMetrics().elidedText(label, Qt.ElideMiddle, 148)
             if label != short_label:
                 tooltip = f"{label}\n{tooltip}"
@@ -2507,7 +2507,8 @@ class Dashboard(QMainWindow):
                     marker.show_vehicle(data, label if len(self._links) > 1 else "")
         self._terminal.refresh()
         selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
-        toss = selected is not None and selected.workflow == "toss"
+        toss = self._node.control_view == "toss"
+        toss_running = selected is not None and selected.workflow == "toss"
         if selected and self._console_tabs.tabData(self._console_tabs.currentIndex()) != selected.shells.selected:
             self._bind_console(selected)
         self._controls.setVisible(not toss)
@@ -2515,15 +2516,15 @@ class Dashboard(QMainWindow):
         if toss:
             self._update_toss_controls(selected)
         enabled = (selected.ready and not selected.read_only and not selected.bridge_error
-                   and not selected.stopped.is_set() and not toss) if selected else bool(self._node.request)
+                   and not selected.stopped.is_set() and not toss_running) if selected else bool(self._node.request)
         shared_domain = selected and self._shared_domain(selected)
         if shared_domain:
             enabled = False
-        self._btn_estop.setVisible(not toss)
+        self._btn_estop.setVisible(not toss_running)
         self._btn_estop.setEnabled(enabled)
         self._release_estop.setVisible(enabled and self._node.mode_name == "EMERGENCY_STOP"
                                        and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC)
-        self._send_target_button.setEnabled(enabled)
+        self._send_target_button.setEnabled(enabled and not toss)
         recorder = self._node.recorder
         self._report_recording_error(self._default_node)
         self._experiment_button.setEnabled(recorder.active or self._selected_can_record())
