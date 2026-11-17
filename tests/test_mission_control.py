@@ -606,7 +606,9 @@ class MissionControlTest(unittest.TestCase):
         self.window._plan_picker.setCurrentIndex(2)
         self.window._choose_plan(2)
         self.assertEqual(self.window._plan_curve.xData.tolist(), [1, 2])
-        self.assertFalse(ghost.isVisible())
+        self.assertTrue(ghost.isVisible())
+        self.assertEqual((ghost.x(), ghost.y()), (1., 0.))
+        self.assertAlmostEqual(ghost.rotation(), 170.)
         self.window._vehicles.setCurrentIndex(1)
         self.assertIsNone(self.window._plan_curve.xData)
         self.window._vehicles.setCurrentIndex(0)
@@ -628,6 +630,79 @@ class MissionControlTest(unittest.TestCase):
         first.peers, second.peers = ["a"], ["b"]
         self.window._update()
         self.assertTrue(self.window._send_target_button.isEnabled())
+
+    def test_monitor_plan_preview_uses_its_own_initial_pose_and_joints(self):
+        w = self.window
+        w.add_jetson("observer", "operator", None, "", monitor_only=True)
+        link = w._links["observer"]
+        self.body_status(link, workflow="toss", can_start_body=False)
+        geometry = [[[0., -.15], [0., -.2], [0., -.2]], [0., -.1]]
+        entries = [
+            ["a/Nominal", "a", [[1., 1.], [2., 1.]], [0., 2.], [0., 1.],
+             [[0., 0., 0.], [1., 1., 1.]], geometry],
+            ["b/Proposed", "b", [[2., 2.], [3., 2.]], [0., 2.], [1., 2.],
+             [[.3, .2, .1], [1., 1., 1.]], geometry],
+        ]
+        link.inbox.put([("plans", entries), ("paper_trial", ["a", 1.])])
+        w._control_views.button(1).click()
+        w._update()
+        self.assertTrue(w._toss_method.isEnabled())
+        self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
+        self.assertFalse(w._toss_buttons["toss_start"].isEnabled())
+        index = w._plan_picker.findData("b/Proposed")
+        w._plan_picker.setCurrentIndex(index)
+        w._choose_plan(index)
+        first = w._update_plan_and_get_target()
+        self.assertEqual(first[:3], (2., 2., 1.))
+        self.ui.np.testing.assert_allclose(first[3], self.ui.plan_arm_points([.3, .2, .1], *geometry))
+        link.inbox.put([("paper_trial", ["a", 2.])])
+        w._update()
+        self.assertEqual(w._update_plan_and_get_target()[:3], (2., 2., 1.))
+        self.assertTrue(link.commands.empty())
+
+    def test_method_preview_uses_defaults_and_running_clock_without_sending_commands(self):
+        w = self.window
+        first = self.connect("first", 1)
+        entries = [[key, key, [[x, 1.], [x + .5, 2.]], [0., 1.]]
+                   for key, x in (("old/Nominal", 0.), ("current/Nominal", 1.),
+                                  ("current/Proposed", 2.))]
+        first.inbox.put([("plans", entries)])
+        w._control_views.button(1).click()
+        w._update()
+        self.assertFalse(w._ghost.isVisible())  # Two families cannot choose a Nominal automatically.
+        w._toss_method.setCurrentText("Proposed")
+        self.assertEqual(w._update_plan_and_get_target()[:2], (2., 1.))
+        w._toss_method.setCurrentText("Nominal")
+        first.inbox.put([("plan_defaults", SimpleNamespace(
+            Nominal="current/Nominal", Proposed="current/Proposed", JF_only=42))])
+        w._update()
+        self.assertEqual(w._update_plan_and_get_target()[:2], (1., 1.))
+        w._toss_method.setCurrentText("Proposed")
+        self.assertEqual(w._update_plan_and_get_target()[:2], (2., 1.))
+        w._toss_options.setText('trial_file:="/custom/plan.yaml"')
+        self.assertIsNone(w._update_plan_and_get_target())
+        w._toss_options.clear()
+        first.inbox.put([("paper_trial", ["current/Nominal", .5, "current/Nominal"])])
+        w._update()
+        self.assertEqual(w._update_plan_and_get_target()[:2], (1.25, 1.5))
+        for phase in ("STOPPED", "MISSED", "FAULT", "IDLE", "PREPARING", "A_HELD"):
+            first.inbox.put([("paper_status", SimpleNamespace(phase=phase)),
+                             ("paper_trial", ["current/Nominal", .75, "current/Nominal"])])
+            w._update()
+            self.assertEqual(w._update_plan_and_get_target()[:2], (2., 1.))
+        first.inbox.put([("paper_status", SimpleNamespace(phase="LAUNCH")),
+                         ("paper_trial", ["current/Nominal", .5, "current/Nominal"])])
+        w._update()
+        second = self.connect("second", 2)
+        second.inbox.put([("plans", entries)])
+        w._update()
+        self.assertFalse(w._ghost.isVisible())
+        w._vehicles.setCurrentIndex(0)
+        self.assertEqual(w._toss_method.currentText(), "Proposed")
+        self.assertEqual(w._update_plan_and_get_target()[:2], (1.25, 1.5))
+        first.data._last_rx["paper_trial"] -= 10
+        self.assertEqual(w._update_plan_and_get_target()[:2], (2., 1.))
+        self.assertTrue(first.commands.empty() and second.commands.empty())
 
     def test_executed_registration_overrides_matching_archive_id(self):
         node = self.window._node
@@ -794,13 +869,15 @@ class MissionControlTest(unittest.TestCase):
         self.window._vehicles.setCurrentIndex(0)
         self.assertTrue(self.window._send_target_button.isEnabled())
 
-    def test_position_only_plan_has_no_heading_and_waits_for_executor_clock(self):
+    def test_position_only_plan_previews_initial_pose_then_follows_executor_clock(self):
         link = self.connect("first", 1)
         link.inbox.put([("plans", [["bundle/old", "id", [[1., 2.], [2., 2.]], [0., 1.]]]),
                         ("paper_trial", ["id", None])])
         self.window._update()
         ghost = self.window._ghost
-        self.assertFalse(ghost.isVisible())
+        self.assertTrue(ghost.isVisible())
+        self.assertEqual((ghost.x(), ghost.y()), (1., 2.))
+        self.assertEqual(ghost.path(), self.window._ghost_ring)
         link.inbox.put([("paper_trial", ["id", .5])])
         self.window._update()
         self.assertTrue(ghost.isVisible())

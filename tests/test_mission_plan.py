@@ -5,9 +5,10 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from mission_plan import load_table_plans, paper_plan_elapsed
+from mission_plan import load_table_plans, paper_plan_elapsed, PlanCatalog
 
 
 class RegisteredPlanTest(unittest.TestCase):
@@ -55,6 +56,88 @@ class RegisteredPlanTest(unittest.TestCase):
                 self.assertAlmostEqual(a, e)
         self.assertEqual(joints, [[0.23, -1.15, -0.68], [0.42, -1.1, -0.72], [0.23, -1.15, -0.68]])
         self.assertEqual(geometry, [self.offsets, [0, -0.1157]])
+
+    def test_catalog_detects_registration_and_added_deleted_plans_with_cached_reads(self):
+        import shutil
+        catalog = PlanCatalog(self.root, self.model)
+        self.assertTrue(catalog.refresh())
+        with patch("mission_plan.load_table_plans", wraps=load_table_plans) as reader:
+            self.assertFalse(catalog.refresh())
+            reader.assert_not_called()
+            self.trial["registration"]["translation_m"][0] -= .1
+            self.manifest.write_text(json.dumps(self.trial))
+            self.assertTrue(catalog.refresh())
+            self.assertEqual(reader.call_count, 1)
+            self.assertAlmostEqual(catalog.plans[0][2][0][0], .9)
+            alternate = self.manifest.parent.with_name("Proposed")
+            shutil.copytree(self.manifest.parent, alternate)
+            self.assertTrue(catalog.refresh())
+            self.assertEqual(reader.call_count, 2)
+            self.assertEqual(len(catalog.plans), 2)
+            (alternate / "trial.yaml").unlink()
+            self.assertTrue(catalog.refresh())
+            self.assertEqual(reader.call_count, 2)
+            self.assertEqual(len(catalog.plans), 1)
+
+    def test_catalog_recovers_partial_update_and_reloads_setup_archive_and_model(self):
+        catalog = PlanCatalog(self.root, self.model)
+        catalog.refresh()
+        original = self.archive.read_bytes()
+        self.archive.write_bytes(b"partial")
+        self.assertTrue(catalog.refresh())
+        self.assertEqual(catalog.plans, [])
+        self.archive.write_bytes(original)
+        self.assertTrue(catalog.refresh())
+        setup = json.loads(self.setup_path.read_text())
+        del setup["joint_rad"]
+        self.setup_path.write_text(json.dumps(setup))
+        self.assertTrue(catalog.refresh())
+        self.assertIsNone(catalog.plans[0][5])
+        self.setup_path.write_text(json.dumps(dict(setup, joint_rad=[.23, -1.15, -.68])))
+        self.assertTrue(catalog.refresh())
+        model = json.loads(self.model.read_text())
+        model["joint_offsets_m"][0][0] += .001
+        self.model.write_text(json.dumps(model))
+        self.assertTrue(catalog.refresh())
+        self.assertAlmostEqual(catalog.plans[0][6][0][0][0], .00075)
+
+    def test_catalog_reads_static_launch_default_and_detects_default_only_changes(self):
+        import shutil
+        experiments = self.root / "experiments"
+        experiments.mkdir()
+        shutil.copytree(self.manifest.parent.parent, experiments / "trial")
+        shutil.copytree(self.manifest.parent.parent, experiments / "alternate")
+        launch = self.root / "src/self_tossing_hils/launch/paper_toss.launch.py"
+        launch.parent.mkdir(parents=True)
+        code = (
+            "def generate_launch_description():\n"
+            "    root = Path(os.environ.get('SELF_TOSSING_HARDWARE_ROOT', Path(__file__).resolve().parents[3]))\n"
+            "    bundle = root / 'experiments/trial'\n"
+            "    return LaunchDescription([DeclareLaunchArgument('trial_file', "
+            "default_value=PathJoinSubstitution([str(bundle), LaunchConfiguration('method'), 'trial.yaml']))])\n"
+        )
+        launch.write_text(code)
+        catalog = PlanCatalog(experiments, self.model)
+        self.assertTrue(catalog.refresh())
+        self.assertEqual(catalog.defaults, {"Nominal": "trial/Nominal"})
+        with patch("mission_plan.load_table_plans", wraps=load_table_plans) as reader:
+            launch.write_text(code.replace("experiments/trial", "experiments/alternate"))
+            self.assertTrue(catalog.refresh())
+            reader.assert_not_called()
+            self.assertEqual(catalog.defaults, {"Nominal": "alternate/Nominal"})
+            launch.write_text(code.replace("root / 'experiments/trial'", "compute_bundle()"))
+            self.assertTrue(catalog.refresh())
+            self.assertEqual(catalog.defaults, {})
+            self.assertFalse(catalog.refresh())
+            launch.write_text(code.replace("experiments/trial", "../outside"))
+            catalog.refresh()
+            self.assertEqual(catalog.defaults, {})
+            launch.write_text(code.replace("LaunchConfiguration('method')", "choose_method()"))
+            catalog.refresh()
+            self.assertEqual(catalog.defaults, {})
+            launch.write_text(code.replace("Path(__file__).resolve().parents[3]", "different_root()"))
+            catalog.refresh()
+            self.assertEqual(catalog.defaults, {})
 
     def test_unknown_joint_initial_condition_preserves_body_pose(self):
         setup = json.loads(self.setup_path.read_text())

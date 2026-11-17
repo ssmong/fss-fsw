@@ -19,6 +19,7 @@ class _Nominal:
         import numpy as np
 
         self.key, self.plan_id, xy, times, *optional = entry
+        self.entry = entry
         self.t = np.asarray(times, dtype=float)
         self.xy = np.asarray(xy, dtype=float)
         if (self.t.ndim != 1 or len(self.t) < 2 or self.xy.shape != (len(self.t), 2)
@@ -110,6 +111,24 @@ class PaperTracking:
         self.plan = self.active_key = self.extra_plan = self.bound_extra = None
         self.offset = 0
         self.last_t = -math.inf
+
+    def refresh_catalog(self, plans, signatures):
+        """Refresh idle choices while retaining the bound run and its read cursor."""
+        self.plans, self.signatures = plans, signatures
+        if self.plan is None:
+            return
+        old = self.plan
+        current = next((p for p in plans if p[0] == old.key), None)
+        if current == old.entry:
+            return
+        if self.bound_extra is None:
+            experiment, method = old.key.rsplit("/", 1)
+            key = f"{experiment} (실행 기록)/{method}"
+            while any(p[0] == key for p in plans):
+                key = key.rsplit("/", 1)[0] + " (기록)/" + method
+            self.bound_extra = [key, *old.entry[1:]]
+        self.extra_plan = self.bound_extra
+        self.active_key = self.bound_extra[0]
 
     def _bind(self, plan_id, meta, manifest):
         self.plan = self.active_key = self.extra_plan = None
@@ -203,7 +222,8 @@ class PaperTracking:
                     self.offset = self._initial_offset(stream, end)
                 if self.plan is None:
                     return []
-                self.active_key, self.extra_plan = self.plan.key, self.bound_extra
+                self.active_key = self.bound_extra[0] if self.bound_extra else self.plan.key
+                self.extra_plan = self.bound_extra
                 if end < self.offset:
                     self.offset = end
                     return []

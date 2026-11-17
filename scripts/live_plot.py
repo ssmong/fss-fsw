@@ -376,6 +376,7 @@ class DashboardNode:
         self.ref_th: deque[float] = deque(maxlen=history_size)
         self.latest_ref: tuple[float, float, float] | None = None
         self.paper_plans = {}
+        self.plan_defaults = None
         self.paper_trial = ""
         self.paper_elapsed = None
         self.paper_match = []
@@ -642,6 +643,11 @@ class DashboardNode:
     def _cb_paper_trial(self, status) -> None:
         self.paper_trial, self.paper_elapsed, *self.paper_match = status
         self._mark_rx("paper_trial")
+
+    def _cb_plan_defaults(self, defaults):
+        values = defaults if isinstance(defaults, dict) else getattr(defaults, "__dict__", {})
+        self.plan_defaults = {method: key for method, key in values.items()
+                              if method in ("Nominal", "Proposed", "JF_only") and isinstance(key, str)}
 
     def _cb_paper_status(self, status):
         data = status if isinstance(status, dict) else getattr(status, "__dict__", {})
@@ -1366,7 +1372,9 @@ class Dashboard(QMainWindow):
             controller, x, y, yaw = self._node.target_draft
             self._control_views.button(1 if self._node.control_view == "toss" else 0).setChecked(True)
             self._controller.button(0 if controller == "PID" else 1).setChecked(True)
+            self._toss_method.blockSignals(True)
             self._toss_method.setCurrentText(self._node.toss_method)
+            self._toss_method.blockSignals(False)
             self._toss_options.setText(self._node.toss_options)
             for field, value in ((self._target_x, x), (self._target_y, y), (self._target_yaw, yaw)):
                 field.setValue(value)
@@ -1503,7 +1511,7 @@ class Dashboard(QMainWindow):
         self._toss_method = QComboBox()
         self._toss_method.setAccessibleName("Self-tossing 경로")
         self._toss_method.addItems(("Nominal", "JF_only", "Proposed"))
-        self._toss_method.activated.connect(lambda _: self._update())
+        self._toss_method.currentTextChanged.connect(self._choose_toss_method)
         layout.addWidget(self._toss_method, 1, 0)
         self._toss_buttons = {}
         for col, (action, label) in enumerate((
@@ -1518,6 +1526,7 @@ class Dashboard(QMainWindow):
         self._toss_options = QLineEdit()
         self._toss_options.setAccessibleName("toss_run 추가 옵션")
         self._toss_options.setPlaceholderText("추가 옵션 (선택)   이름:=값")
+        self._toss_options.textChanged.connect(self._choose_toss_options)
         layout.addWidget(self._toss_options, 2, 0, 1, 4)
         self._toss_alignment = QLabel()
         self._toss_alignment.setTextFormat(Qt.PlainText)
@@ -1529,6 +1538,16 @@ class Dashboard(QMainWindow):
     def _can_send_toss(self, link, action):
         return (self._node.control_view == "toss" and link and link.data is self._node
                 and not self._shared_domain(link) and link.can_toss(action))
+
+    def _choose_toss_method(self, method):
+        self._node.toss_method = method
+        self._node.plan_choice = "auto"
+        self._plan_picker.setCurrentIndex(self._plan_picker.findData("auto"))
+        self._update_trajectory()
+
+    def _choose_toss_options(self, text):
+        self._node.toss_options = text
+        self._update_trajectory()
 
     def _send_toss(self, action):
         endpoint = self._vehicles.tabData(self._vehicles.currentIndex())
@@ -1564,7 +1583,7 @@ class Dashboard(QMainWindow):
             button.setEnabled(bool(self._can_send_toss(link, action)))
         prepare = self._toss_buttons["toss_prepare"]
         prepare.setToolTip("실험 본체와 계획 실행기를 준비합니다. 기체 설정에 따라 에어베어링이 열립니다.")
-        self._toss_method.setEnabled(prepare.isEnabled())
+        self._toss_method.setEnabled(True)
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
         start = self._toss_buttons["toss_start"]
         grasp_first = (phase_fresh and self._node.toss_phase in ("IDLE", "STOPPED", "MISSED")
@@ -1572,8 +1591,8 @@ class Dashboard(QMainWindow):
         start.setText("파지 후 출발" if grasp_first else "출발")
         start.setToolTip("시작 위치·Yaw에 도달하면 자동으로 파지하고 출발합니다." if grasp_first
                          else "실험 실행기에 출발을 요청합니다.")
-        choosing = not phase_fresh or self._toss_method.isEnabled()
-        self._toss_method.setVisible(choosing)
+        choosing = not phase_fresh or prepare.isEnabled()
+        self._toss_method.setVisible(True)
         self._toss_options.setVisible(choosing)
         self._toss_options.setEnabled(prepare.isEnabled())
         prepare.setVisible(choosing)
@@ -2276,6 +2295,19 @@ class Dashboard(QMainWindow):
         self._node.plan_choice = self._plan_picker.itemData(index)
         self._update_trajectory()
 
+    def _preview_plan_key(self):
+        node = self._node
+        try:
+            options = shlex.split(node.toss_options)
+        except ValueError:
+            return None
+        if any(option.split(":=", 1)[0] == "trial_file" for option in options):
+            return None
+        if node.plan_defaults is not None:
+            return node.plan_defaults.get(node.toss_method)
+        matches = [key for key in node.paper_plans if key.rsplit("/", 1)[-1] == node.toss_method]
+        return matches[0] if len(matches) == 1 else None
+
     def _update_plan_and_get_target(self):
         node = self._node
         if self._picker_catalog is not node.paper_plans:
@@ -2293,7 +2325,15 @@ class Dashboard(QMainWindow):
             self._plan_picker.setCurrentIndex(self._plan_picker.findData(node.plan_choice))
             self._plan_picker.setVisible(bool(node.paper_plans))
         active = node.active_plan_key()
+        elapsed = node.paper_elapsed if node.source_age("paper_trial") <= SOURCE_TIMEOUT_SEC else None
+        if node.toss_phase and node.toss_phase not in (
+                "LAUNCH", "COAST", "CAPTURING", "CLOSING", "LOCAL_BRAKE",
+                "PLANNED_BRAKE", "HOLDING", "STOPPING"):
+            elapsed = None
         key = active if node.plan_choice == "auto" else node.plan_choice
+        if (node.plan_choice == "auto" and node.control_view == "toss"
+                and elapsed is None):
+            key = self._preview_plan_key()
         if key not in node.paper_plans:
             key = None
         if key != self._drawn_plan:
@@ -2308,13 +2348,12 @@ class Dashboard(QMainWindow):
             auto_label += " · " + key.rsplit("/", 1)[-1]
         if self._plan_picker.itemText(0) != auto_label:
             self._plan_picker.setItemText(0, auto_label)
-        self._plan_picker.setToolTip("실행 중인 실험의 계획" if node.plan_choice == "auto" else
-                                     f"저장 계획 미리보기 · {key}" if key else "계획 경로 숨기기")
+        following = key is not None and key == active and elapsed is not None
+        self._plan_picker.setToolTip("실행 중인 실험의 계획" if following else
+                                     f"계획 초기 자세 · {key}" if key else "계획 경로 숨기기")
         if key is not None:
-            if key != active or node.paper_elapsed is None:
-                return None
             _, xy, times, yaw, joints, geometry = node.paper_plans[key]
-            t = node.paper_elapsed
+            t = elapsed if following else 0.0
             arm = None
             if node.arm_equipped and yaw is not None and joints is not None and geometry is not None:
                 angles = [np.interp(t, times, column) for column in joints.T]

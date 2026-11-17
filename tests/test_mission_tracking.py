@@ -61,6 +61,27 @@ class PaperTrackingTest(unittest.TestCase):
         self.assertAlmostEqual(sample["error_wrist_rad"], -.15)
         self.assertEqual(self.poll(), [])
 
+    def test_catalog_refresh_preserves_bound_run_and_cursor_after_plan_update_and_deletion(self):
+        self.write(self.row(1100, .5))
+        first, = self.poll()
+        offset = self.tracker.offset
+        moved = [self.key, "A", [[-.1, 0.], [1.9, 4.]], *self.entry[3:]]
+        self.tracker.refresh_catalog([moved], {self.key: ("sha", 0., [-.1, 0.])})
+        self.assertEqual(self.tracker.offset, offset)
+        self.assertIsNotNone(self.tracker.extra_plan)
+        self.assertEqual(self.tracker.extra_plan[2], self.entry[2])
+        self.write(self.row(1101, 1.))
+        second, = self.poll()
+        self.assertEqual(second["planned_x_m"], 1.)
+        self.assertEqual(second["plan_key"], first["plan_key"])
+        self.assertNotEqual(self.tracker.active_key, self.key)
+        self.tracker.refresh_catalog([], {})
+        self.write(self.row(1102, 1.5))
+        third, = self.poll()
+        self.assertEqual(third["planned_x_m"], 1.5)
+        self.assertEqual(third["plan_key"], second["plan_key"])
+        self.assertEqual(self.poll(), [])
+
     def test_connection_freshness_duplicate_out_of_order_and_postplan(self):
         good = self.row(1100, .5)
         self.write(self.row(999., .25), self.row(1005., -.1), self.row(1006., .1, control_stamp=1006.5),

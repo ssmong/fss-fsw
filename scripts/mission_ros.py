@@ -275,20 +275,42 @@ def open_node(receive, reply, args=None, reject=None):
     read_elapsed = globals().get("paper_plan_elapsed")
     read_run = globals().get("paper_run_files")
     tracker_type = globals().get("PaperTracking")
+    catalog_type = globals().get("PlanCatalog")
     if read_plans is None:
         from mission_plan import load_table_plans as read_plans
         from mission_plan import paper_plan_elapsed as read_elapsed
         from mission_plan import paper_run_files as read_run
         from mission_tracking import PaperTracking as tracker_type
-    signatures = {}
-    plans = read_plans(signatures=signatures)
-    tracking = tracker_type(plans, signatures, node.get_clock().now().nanoseconds / 1e9)
-    receive("plans", plans)
+        from mission_plan import PlanCatalog as catalog_type
+    catalog = catalog_type()
+    catalog.refresh()
+    tracking = tracker_type(catalog.plans, catalog.signatures, node.get_clock().now().nanoseconds / 1e9)
+    receive("plans", catalog.plans)
+    receive("plan_defaults", catalog.defaults)
     last_run = None
     published_extra = None
+    last_paper_status = None
+    last_paper_status_at = 0.0
+    last_elapsed = None
+
+    def refresh_plans():
+        nonlocal published_extra
+        if not catalog.refresh():
+            return
+        tracking.refresh_catalog(catalog.plans, catalog.signatures)
+        published_extra = tracking.extra_plan
+        receive("plans", catalog.plans + ([published_extra] if published_extra else []))
+        receive("plan_defaults", catalog.defaults)
+        if last_paper_status and time.monotonic() - last_paper_status_at <= 2.5:
+            status = last_paper_status
+            if not status.get("log_directory"):
+                tracking.poll(status, node.get_clock().now().nanoseconds / 1e9, None)
+            receive("paper_trial", [status.get("plan_id", ""), last_elapsed, tracking.active_key])
+
+    node.create_timer(1.0, refresh_plans)
 
     def paper_status(msg):
-        nonlocal last_run, published_extra
+        nonlocal last_run, published_extra, last_paper_status, last_paper_status_at, last_elapsed
         try:
             status = json.loads(msg.data)
         except (ValueError, TypeError):
@@ -296,26 +318,29 @@ def open_node(receive, reply, args=None, reject=None):
         receive("paper_status", status)
         plan_id = status.get("plan_id") if isinstance(status, dict) and status.get("frame_id") == "table" else None
         if isinstance(plan_id, str) and plan_id:
+            last_paper_status, last_paper_status_at = status, time.monotonic()
             source = read_run(status)
             identity = (source[0], plan_id) if source else None
             catalog_changed = False
             if identity and identity != last_run:
                 last_run = identity
-                current_signatures = {}
-                current = read_plans(signatures=current_signatures)
-                catalog_changed = current != tracking.plans
-                tracking.set_catalog(current, current_signatures)
+                catalog_changed = catalog.refresh()
+                tracking.set_catalog(catalog.plans, catalog.signatures)
             errors = tracking.poll(status, node.get_clock().now().nanoseconds / 1e9, source)
             if catalog_changed or published_extra is not tracking.extra_plan:
                 published_extra = tracking.extra_plan
                 receive("plans", tracking.plans + ([published_extra] if published_extra else []))
-            receive("paper_trial", [plan_id, read_elapsed(status, source=source) if source else None, tracking.active_key])
+                receive("plan_defaults", catalog.defaults)
+            last_elapsed = read_elapsed(status, source=source) if source else None
+            receive("paper_trial", [plan_id, last_elapsed, tracking.active_key])
             for sample in errors:
                 receive("tracking_error", sample)
         else:
+            last_paper_status, last_elapsed = None, None
             if published_extra is not None:
                 published_extra = None
                 receive("plans", tracking.plans)
+                receive("plan_defaults", catalog.defaults)
             receive("paper_trial", ["", None, None])
 
     node.create_subscription(String, "/paper_toss/status", paper_status, qos_profile_sensor_data)
@@ -404,7 +429,7 @@ def serve():
         # The dashboard uses IMU arrivals only to measure the incoming rate.
         if name == "imu" and not recording:
             data = {}
-        elif name in ("plans", "paper_trial", "paper_status", "tracking_error", "arm_registration"):
+        elif name in ("plans", "plan_defaults", "paper_trial", "paper_status", "tracking_error", "arm_registration"):
             data = msg
         elif name == "valve_output":
             data = {"duty_cycles": msg.duty_cycles}
