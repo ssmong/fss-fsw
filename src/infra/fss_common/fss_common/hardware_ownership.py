@@ -54,7 +54,10 @@ def claim_hardware(lock_path=HARDWARE_LOCK, probe=None):
         raise
 
 
-def claim_launch(context):
+def claim_launch(context, *, share_imu=False):
     # The launching process retains the lease until its LaunchContext is released.
     if getattr(context, "_fss_hardware_lease", None) is None:
-        context._fss_hardware_lease = claim_hardware()
+        from functools import partial
+        from fss_common.mission_device_probe import device_resource_owner
+        context._fss_hardware_lease = claim_hardware(
+            probe=partial(device_resource_owner, share_imu=share_imu))

@@ -158,6 +158,54 @@ TEST_F(GncNodeTest, NonfiniteNavigationStateProducesZeroAndRecovers) {
     ASSERT_TRUE(spin_until([this] { return command_ && command_->thrust_n[0] > 0.1; }));
 }
 
+TEST_F(GncNodeTest, OldFutureAndMalformedNavigationStampsDoNotProduceThrust) {
+    start();
+    State state;
+    for (int age_ms : {1000, -1000}) {
+        state.header.stamp = observer_->now() - rclcpp::Duration::from_seconds(age_ms / 1000.0);
+        const auto count = commands_received_;
+        state_pub_->publish(state);
+        ASSERT_TRUE(spin_until([&] { return commands_received_ >= count + 3; }));
+        EXPECT_TRUE(zero_command());
+        EXPECT_FALSE(reference_);
+    }
+    state.header.stamp = observer_->now();
+    state.header.stamp.nanosec = 1000000000U;
+    const auto count = commands_received_;
+    state_pub_->publish(state);
+    ASSERT_TRUE(spin_until([&] { return commands_received_ >= count + 3; }));
+    EXPECT_TRUE(zero_command());
+    EXPECT_FALSE(reference_);
+    publish();
+    EXPECT_TRUE(spin_until([&] { return command_ && command_->thrust_n[0] > 0.1; }));
+}
+
+TEST_F(GncNodeTest, DuplicateAndReorderedNavigationCannotReplaceOrRefreshTheLastSample) {
+    start();
+    State state;
+    state.header.stamp = observer_->now();
+    state_pub_->publish(state);
+    ASSERT_TRUE(spin_until([&] { return command_ && command_->thrust_n[0] > 0.1; }));
+    const auto accepted_stamp = rclcpp::Time(state.header.stamp);
+    // A changed position with the same or earlier timestamp must not replace the
+    // accepted state, nor keep it alive by repeated receipt after its expiry.
+    state.x = 1.0;
+    for (int64_t offset_ns : {0, -1}) {
+        state.header.stamp = accepted_stamp + rclcpp::Duration::from_nanoseconds(offset_ns);
+        const auto count = commands_received_;
+        state_pub_->publish(state);
+        ASSERT_TRUE(spin_until([&] { return commands_received_ >= count + 2; }, 40ms));
+        EXPECT_GT(command_->thrust_n[0], 0.1);
+    }
+    state.header.stamp = accepted_stamp;
+    state.x = 0.0;
+    auto duplicate_timer = observer_->create_wall_timer(5ms, [&] { state_pub_->publish(state); });
+    ASSERT_TRUE(spin_until([&] { return zero_command(); }, 200ms));
+    duplicate_timer->cancel();
+    publish();
+    EXPECT_TRUE(spin_until([&] { return command_ && command_->thrust_n[0] > 0.1; }));
+}
+
 TEST_F(GncNodeTest, ServicesRejectUnsupportedRequestsAndSwitchResetControllers) {
     start();
     ASSERT_TRUE(controller_client_->wait_for_service(1s));
@@ -313,6 +361,47 @@ TEST_F(GncNodeTest, ControlTimerUsesRosClockAndPausesWithSimulation) {
     clock.clock.nanosec = 20000000;
     clock_pub->publish(clock);
     EXPECT_TRUE(spin_until([this, count] { return commands_received_ > count; }));
+}
+
+TEST_F(GncNodeTest, ClockRewindRequiresNewNavigationAndRestartsTrajectoryTime) {
+    auto overrides = parameters();
+    overrides.emplace_back("use_sim_time", true);
+    for (auto& parameter : overrides)
+        if (parameter.get_name() == "guidance.mode")
+            parameter = rclcpp::Parameter("guidance.mode", "trajectory");
+    overrides.emplace_back("guidance.traj_t", std::vector<double>{0, 10});
+    overrides.emplace_back("guidance.traj_x", std::vector<double>{1, 2});
+    overrides.emplace_back("guidance.traj_y", std::vector<double>{0, 0});
+    overrides.emplace_back("guidance.traj_theta", std::vector<double>{0, 0});
+    start(overrides);
+    const auto clock_pub = observer_->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
+    ASSERT_TRUE(spin_until([&] { return clock_pub->get_subscription_count() > 0; }));
+    const auto clock_at = [&](int64_t milliseconds) {
+        rosgraph_msgs::msg::Clock clock;
+        clock.clock = rclcpp::Time(milliseconds * 1000000);
+        clock_pub->publish(clock);
+        ASSERT_TRUE(spin_until([&] { return gnc_->now().nanoseconds() == milliseconds * 1000000; }));
+    };
+    clock_at(10000);
+    State state;
+    state.header.stamp = gnc_->now();
+    state_pub_->publish(state);
+    spin_until([] { return false; }, 20ms);
+    clock_at(10020);
+    ASSERT_TRUE(spin_until([&] { return reference_ && command_ && command_->thrust_n[0] > 0.1; }));
+    spin_until([] { return false; }, 20ms);
+    reference_.reset();
+    const auto count = commands_received_;
+    clock_at(1000);
+    clock_at(1020);
+    ASSERT_TRUE(spin_until([&] { return commands_received_ > count && zero_command(); }));
+    EXPECT_FALSE(reference_);
+    state.header.stamp = gnc_->now();
+    state_pub_->publish(state);
+    spin_until([] { return false; }, 20ms);
+    clock_at(1040);
+    ASSERT_TRUE(spin_until([&] { return reference_ && command_ && command_->thrust_n[0] > 0.1; }));
+    EXPECT_DOUBLE_EQ(reference_->x_ref, 1.0);
 }
 
 }  // namespace

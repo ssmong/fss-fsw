@@ -190,7 +190,7 @@ def generate_launch_description() -> LaunchDescription:
             actuator_rt_priority_arg,
             log_level_arg,
             use_realsense_arg,
-            OpaqueFunction(function=claim_launch, condition=UnlessCondition(use_sim)),
+            OpaqueFunction(function=claim_launch, kwargs={"share_imu": True}, condition=UnlessCondition(use_sim)),
             actuators_launch,
             arm_launch,
             sensors_launch,

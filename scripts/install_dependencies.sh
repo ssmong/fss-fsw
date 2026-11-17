@@ -38,7 +38,6 @@ sudo apt-get update
 sudo apt-get install -y \
     ros-humble-realsense2-camera \
     ros-humble-foxglove-bridge \
-    ros-humble-rosbridge-server \
     ros-humble-dynamixel-sdk \
     fonts-noto-cjk \
     libeigen3-dev \

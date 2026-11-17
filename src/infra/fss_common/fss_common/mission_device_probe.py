@@ -10,6 +10,19 @@ _HARDWARE_DRIVERS = ("arm_driver", "arm_driver_node", "vicon_bridge_node", "valv
                      "xsens_mti_node", "xsens_mti_driver")
 
 
+def _shared_xsens(process):
+    argv = (process / "cmdline").read_bytes().split(b"\0")
+    if Path(os.fsdecode(argv[0])).name not in ("xsens_mti_node", "xsens_mti_driver"):
+        return False
+    environment = dict(item.split("=", 1) for item in
+                       os.fsdecode((process / "environ").read_bytes()).split("\0") if "=" in item)
+    defaults = {"ROS_DOMAIN_ID": "0", "ROS_LOCALHOST_ONLY": "0", "RMW_IMPLEMENTATION": "",
+                "CYCLONEDDS_URI": "", "FASTRTPS_DEFAULT_PROFILES_FILE": "",
+                "FASTDDS_DEFAULT_PROFILES_FILE": ""}
+    return all(environment.get(key, default) == os.environ.get(key, default)
+               for key, default in defaults.items())
+
+
 def _restricted_driver(process):
     try:
         argv = (process / "cmdline").read_bytes().split(b"\0", 3)
@@ -61,7 +74,7 @@ def _network_resources(proc, vicon_port, plc_ip, plc_port):
 
 
 def device_resource_owner(proc=Path("/proc"), *, dev=Path("/dev"), vicon_port=9870,
-                          plc_ip="192.168.1.2", plc_port=502, arm_port=None):
+                          plc_ip="192.168.1.2", plc_port=502, arm_port=None, share_imu=False):
     """Return the occupied resource and PID, or None when the visible devices are free."""
     proc, dev = Path(proc), Path(dev)
     try:
@@ -75,6 +88,7 @@ def device_resource_owner(proc=Path("/proc"), *, dev=Path("/dev"), vicon_port=98
                     serial[str(link.resolve())] = name
         if arm_port and Path(arm_port).exists():
             serial[str(Path(arm_port).resolve())] = "팔 FTDI"
+        imu_owner = None
         for process in proc.iterdir():
             if not process.name.isdecimal():
                 continue
@@ -89,6 +103,13 @@ def device_resource_owner(proc=Path("/proc"), *, dev=Path("/dev"), vicon_port=98
                     except FileNotFoundError:
                         continue
                     resource = serial.get(target)
+                    # Native FSW subscribes to the vendor driver's ROS topic. It
+                    # never opens this serial port, so one matching driver can be reused.
+                    if resource == "Xsens" and share_imu and _shared_xsens(process):
+                        if imu_owner not in (None, process.name):
+                            return "Xsens 드라이버 중복 실행"
+                        imu_owner = process.name
+                        continue
                     if resource:
                         resource = f"{resource} {target}"
                     elif target.startswith("socket:["):

@@ -272,11 +272,12 @@ def guarded_full_launch(workspace):
 
 def claim_installed_hardware():
     try:
+        __import__("fss_common.flight_runner")  # Verify the supervisor before starting hardware.
         from fss_common.hardware_ownership import claim_hardware
         from fss_common.mission_device_probe import device_resource_owner
     except ImportError as exc:
         raise RuntimeError("Jetson FSW 하드웨어 잠금 모듈을 업데이트하세요.") from exc
-    return claim_hardware(probe=device_resource_owner)
+    return claim_hardware(probe=lambda: device_resource_owner(share_imu=True))
 
 
 def prepare_hardware(*, only_if_idle=False):
@@ -339,24 +340,23 @@ def prepare_hardware(*, only_if_idle=False):
 
         # Keep the stack alive across SSH/UI reconnects. Concurrent sessions see
         # the same ros2 launch process under the startup lock.
-        def start(command, filename, fd):
-            with (state / filename).open("ab") as log:
+        with claim_installed_hardware() as lease:
+            fd = lease.fileno()
+            command = ["python3", "-m", "fss_common.flight_runner"]
+            if not stacks["imu"] and (Path.home() / "xsens_mti_ros2_driver/install/setup.bash").is_file():
+                command += ["--imu-script", str(work / "scripts/launch/start_imu.sh"),
+                            "--imu-log", str(state / "imu.log")]
+            flight = ([str(profile), "use_sim:=false"] if profile
+                      else ["fss_bringup", "fss_full.launch.py", "gnc_backend:=cpp", "use_arm:=false"])
+            command += ["--", "ros2", "launch", *flight, "require_explicit_target:=true"]
+            with (state / "flight.log").open("ab") as log:
                 child = subprocess.Popen(command, cwd=work, stdin=subprocess.DEVNULL,
                                          stdout=log, stderr=subprocess.STDOUT,
                                          start_new_session=True, pass_fds=(fd,),
                                          env={**os.environ, "FSS_HARDWARE_LEASE_FD": str(fd)})
             time.sleep(0.35)
             if child.poll() is not None:
-                raise RuntimeError(f"기동 실패: {state / filename}")
-            return child
-
-        with claim_installed_hardware() as lease:
-            fd = lease.fileno()
-            if not stacks["imu"] and (Path.home() / "xsens_mti_ros2_driver/install/setup.bash").is_file():
-                start(["bash", "scripts/launch/start_imu.sh"], "imu.log", fd)
-            flight = ([str(profile), "use_sim:=false"] if profile
-                      else ["fss_bringup", "fss_full.launch.py", "gnc_backend:=cpp", "use_arm:=false"])
-            child = start(["ros2", "launch", *flight, "require_explicit_target:=true"], "flight.log", fd)
+                raise RuntimeError(f"기동 실패: {state / 'flight.log'}")
         _starting_flight = (child, state / "flight.log", time.monotonic())
         return "기체 소프트웨어 기동"
 

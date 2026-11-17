@@ -1,6 +1,7 @@
 """Passive hardware-owner discovery against synthetic procfs and device metadata."""
 
 from pathlib import Path
+import os
 import sys
 import tempfile
 import unittest
@@ -26,8 +27,42 @@ class DeviceResourceOwner(unittest.TestCase):
         with (self.net / protocol).open("a") as stream:
             stream.write(f"0: {local} {remote} {state} 0:0 0:0 0 1000 0 {inode}\n")
 
-    def inspect(self):
-        return device_resource_owner(self.proc, dev=self.dev)
+    def inspect(self, **options):
+        return device_resource_owner(self.proc, dev=self.dev, **options)
+
+    def test_native_imu_reuse_requires_one_vendor_driver_on_the_same_ros_network(self):
+        port = self.dev / "ttyUSB9"
+        port.touch()
+        link = self.dev / "serial/by-id/usb-Xsens_fixture"
+        process = self.proc / "712"
+        fd = process / "fd/1"
+        fd.parent.mkdir(parents=True)
+        try:
+            link.symlink_to(port)
+            fd.symlink_to(port)
+        except OSError as exc:
+            self.skipTest(f"Symbolic links unavailable: {exc}")
+        (process / "cmdline").write_bytes(b"/opt/vendor/xsens_mti_node\0")
+        (process / "environ").write_bytes(b"ROS_DOMAIN_ID=0\0ROS_LOCALHOST_ONLY=1\0")
+        with patch.dict(os.environ, {"ROS_DOMAIN_ID": "0", "ROS_LOCALHOST_ONLY": "1"}, clear=True):
+            self.assertIn("Xsens", self.inspect())  # Legacy launch still owns its own raw driver.
+            self.assertIsNone(self.inspect(share_imu=True))
+            for key, value in (("ROS_DOMAIN_ID", "7"), ("ROS_LOCALHOST_ONLY", "0"),
+                               ("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")):
+                with patch.dict(os.environ, {key: value}):
+                    self.assertIn("Xsens", self.inspect(share_imu=True))
+            (process / "cmdline").write_bytes(b"/usr/bin/unrelated-reader\0")
+            self.assertIn("Xsens", self.inspect(share_imu=True))
+            (process / "cmdline").write_bytes(b"/opt/vendor/xsens_mti_node\0")
+            self.line("udp", "00000000:268E", "00000000:0000", "07")
+            self.assertIn("Vicon", self.inspect(share_imu=True))
+            (self.net / "udp").write_text("header\n")
+            second = self.proc / "713"
+            (second / "fd").mkdir(parents=True)
+            (second / "fd/1").symlink_to(port)
+            (second / "cmdline").write_bytes((process / "cmdline").read_bytes())
+            (second / "environ").write_bytes((process / "environ").read_bytes())
+            self.assertIn("중복", self.inspect(share_imu=True))
 
     def test_bound_udp_reported_even_with_no_visible_pid(self):
         self.line("udp", "00000000:268E", "00000000:0000", "07")

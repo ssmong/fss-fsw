@@ -73,6 +73,8 @@ ros2 launch xsens_mti_ros2_driver xsens_mti_node.launch.py
 ros2 launch fss_bringup fss_full.launch.py use_arm:=true use_thrusters:=true
 ```
 
+두 터미널은 같은 ROS 도메인과 DDS 설정을 사용한다. 본체는 실행 중인 Xsens 드라이버의 데이터를 구독한다.
+
 실제 팔 연결은 모델·ID·직렬 포트·영점·방향·감속비·한계를 확인한 후
 `dry_run: false`, `hardware_confirmed: true`를 적용한다.
 하드웨어 조건은 [팔 드라이버](../hardware/006_Arm.md)를 따른다.

@@ -266,9 +266,13 @@ class Discovery(unittest.TestCase):
                     else:
                         prepare_hardware()
                         commands = [call.args[0] for call in spawn.call_args_list]
-                        self.assertEqual(commands[-1], ["ros2", "launch", str(work.parent / "base.launch.py"),
-                                                        "use_sim:=false", "require_explicit_target:=true"])
-                        self.assertEqual(commands[:-1], [] if existing_imu else [["bash", "scripts/launch/start_imu.sh"]])
+                        self.assertEqual(len(commands), 1)
+                        command = commands[0]
+                        self.assertEqual(command[:3], ["python3", "-m", "fss_common.flight_runner"])
+                        self.assertEqual(command[command.index("--") + 1:],
+                                         ["ros2", "launch", str(work.parent / "base.launch.py"),
+                                          "use_sim:=false", "require_explicit_target:=true"])
+                        self.assertEqual("--imu-script" in command, not existing_imu)
                         self.assertTrue(all(call.kwargs["cwd"] == work for call in spawn.call_args_list))
 
     def test_only_normal_auto_domain_native_connection_starts_on_idle_device(self):
@@ -500,8 +504,10 @@ class Discovery(unittest.TestCase):
                 self.assertEqual(prepare_session(start_if_idle=True), ("기체 소프트웨어 기동", ""))
                 self.assertEqual(prepare_session(start_if_idle=True), ("기체 연결", ""))
                 self.assertEqual([args.args[0] for args in popen.call_args_list],
-                                 [["bash", "scripts/launch/start_imu.sh"],
-                                  ["ros2", "launch", "fss_bringup", "fss_full.launch.py",
+                                 [["python3", "-m", "fss_common.flight_runner",
+                                   "--imu-script", str(home / PUBLIC / "scripts/launch/start_imu.sh"),
+                                   "--imu-log", str(home / ".ros/mission-control/imu.log"),
+                                   "--", "ros2", "launch", "fss_bringup", "fss_full.launch.py",
                                    "gnc_backend:=cpp", "use_arm:=false", "require_explicit_target:=true"]])
                 self.assertEqual(os.environ["ROS_LOCALHOST_ONLY"], "1")
                 self.lease.assert_called_once()

@@ -13,7 +13,7 @@
 #   4. RealSense D435i
 #   5. PLC 네트워크 (Modbus TCP)
 #   6. Vicon 네트워크 (FSS_VICON UDP)
-#   7. 잔여 프로세스 정리
+#   7. 실행 중인 프로세스
 #   8. 빌드 상태
 # ═══════════════════════════════════════════════════════════════
 
@@ -92,18 +92,24 @@ else
     fail "Xsens USB 미감지 — USB 케이블 확인 (Micro-B, 데이터 케이블)"
 fi
 
-if [ -e /dev/ttyUSB0 ]; then
-    pass "/dev/ttyUSB0 존재"
-    # 포트 잠김 확인
-    FUSER_OUT=$(fuser /dev/ttyUSB0 2>/dev/null)
-    if [ -n "$FUSER_OUT" ]; then
-        warn "/dev/ttyUSB0 잠김 (PID: $FUSER_OUT)"
-        info "해제: fuser -k /dev/ttyUSB0"
-    else
-        pass "/dev/ttyUSB0 사용 가능 (잠김 없음)"
+IMU_FOUND=false
+for IMU_PORT in /dev/serial/by-id/usb-Xsens_*; do
+    [ -e "$IMU_PORT" ] || continue
+    IMU_FOUND=true
+    pass "Xsens 포트 감지: $IMU_PORT → $(readlink -f "$IMU_PORT")"
+    if ! command -v fuser >/dev/null 2>&1; then
+        warn "fuser 미설치 — Xsens 포트 사용 여부 확인 불가"
+        continue
     fi
-else
-    fail "/dev/ttyUSB0 없음"
+    FUSER_OUT=$(fuser "$IMU_PORT" 2>/dev/null)
+    if [ -n "$FUSER_OUT" ]; then
+        info "Xsens 사용 중 (PID: $FUSER_OUT) — 현재 운영자와 확인하세요."
+    else
+        info "Xsens 포트를 사용하는 프로세스가 현재 권한에서 확인되지 않음"
+    fi
+done
+if [ "$IMU_FOUND" = false ]; then
+    fail "Xsens 고정 포트 없음 — /dev/serial/by-id/usb-Xsens_* 확인"
 fi
 
 # Xsens 드라이버 설치 확인
@@ -192,22 +198,21 @@ info "지상국 FSS_VICON의 UDP 목적지를 Jetson IP와 config/hardware/vicon
 info "UDP는 TCP 포트 검사로 확인할 수 없음 — 브릿지 기동 후 /sensors/vicon_state 수신 확인"
 
 # ─────────────────────────────
-header "7/8" "잔여 프로세스 정리"
+header "7/8" "실행 중인 프로세스"
 # ─────────────────────────────
-STALE=""
+ACTIVE_NODES=""
 for PROC in xsens_mti_node imu_bridge_node vicon_bridge_node realsense2_camera_node ekf_node gnc_node valve_driver_node plant_model_node manager_node; do
     PID=$(pgrep -f "$PROC" 2>/dev/null)
     if [ -n "$PID" ]; then
-        STALE="$STALE $PROC($PID)"
+        ACTIVE_NODES="$ACTIVE_NODES $PROC($PID)"
     fi
 done
 
-if [ -n "$STALE" ]; then
-    warn "잔여 ROS2 노드 발견:$STALE"
-    info "정리: pkill -f '<노드명>' 또는 아래 명령으로 전체 정리"
-    info "  pkill -f 'ros2|xsens_mti|fss_'"
+if [ -n "$ACTIVE_NODES" ]; then
+    info "실행 중인 ROS2 노드:$ACTIVE_NODES"
+    info "장치 중복 실행을 피하려면 현재 운영자의 실행 상태를 확인하세요."
 else
-    pass "잔여 ROS2 노드 없음"
+    pass "확인 대상 ROS2 노드 실행 중인 항목 없음"
 fi
 
 # ─────────────────────────────

@@ -100,6 +100,7 @@ public:
             mode_sub_ = create_subscription<SystemMode>("/system/mode", 1,
                 [this](SystemMode::ConstSharedPtr mode) {
                     const auto now_ns = now().nanoseconds();
+                    observe_clock(now_ns);
                     if (!active_mode_fresh(now_ns))
                         pipeline_->reset();
                     active_mode_stamp_ns_ = static_cast<int64_t>(mode->header.stamp.sec) * 1000000000
@@ -112,8 +113,18 @@ public:
         }
         state_sub_ = create_subscription<SpacecraftState>("/navigation/state", 10,
             [this](SpacecraftState::ConstSharedPtr state) {
+                const auto now_ns = get_clock()->now().nanoseconds();
+                observe_clock(now_ns);
+                const auto& stamp = state->header.stamp;
+                if (stamp.sec < 0 || stamp.nanosec >= 1000000000U)
+                    return;
+                const int64_t sample_ns = static_cast<int64_t>(stamp.sec) * 1000000000 + stamp.nanosec;
+                if (sample_ns > now_ns || now_ns - sample_ns > state_age_limit_ns_ ||
+                    (latest_state_ && sample_ns <= latest_sample_ns_))
+                    return;
                 latest_state_ = std::move(state);
-                latest_received_ns_ = get_clock()->now().nanoseconds();
+                latest_sample_ns_ = sample_ns;
+                latest_received_ns_ = now_ns;
             });
         guidance_service_ = create_service<SetGuidanceMode>("/gnc/set_guidance_mode",
             [this](const std::shared_ptr<SetGuidanceMode::Request> request,
@@ -205,6 +216,7 @@ private:
 
     void control_loop() {
         const auto now_ns = get_clock()->now().nanoseconds();
+        observe_clock(now_ns);
         if (require_explicit_target_ && (!target_received_ || !active_mode_fresh(now_ns))) {
             pipeline_->reset();
             publish_zero();
@@ -215,7 +227,9 @@ private:
             return;
         }
         const auto age_ns = now_ns - latest_received_ns_;
-        if (age_ns < 0 || age_ns > state_age_limit_ns_) {
+        const auto sample_age_ns = now_ns - latest_sample_ns_;
+        if (age_ns < 0 || age_ns > state_age_limit_ns_ ||
+            sample_age_ns < 0 || sample_age_ns > state_age_limit_ns_) {
             pipeline_->reset();
             publish_zero();
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Navigation state is stale; thrust is zero");
@@ -256,10 +270,21 @@ private:
                now_ns - *active_mode_stamp_ns_ <= mode_timeout_ns;
     }
 
+    void observe_clock(int64_t now_ns) {
+        if (last_clock_ns_ && now_ns < *last_clock_ns_) {
+            // A simulator rewind starts a new measurement and trajectory timeline.
+            latest_state_.reset();
+            active_mode_stamp_ns_.reset();
+            t0_.reset();
+            pipeline_->reset();
+        }
+        last_clock_ns_ = now_ns;
+    }
+
     bool require_explicit_target_{}, target_received_{};
-    std::optional<int64_t> active_mode_stamp_ns_;
+    std::optional<int64_t> active_mode_stamp_ns_, last_clock_ns_;
     double dt_{};
-    int64_t state_age_limit_ns_{}, latest_received_ns_{};
+    int64_t state_age_limit_ns_{}, latest_received_ns_{}, latest_sample_ns_{};
     std::optional<double> t0_;
     std::unique_ptr<ControlPipeline> pipeline_;
     SpacecraftState::ConstSharedPtr latest_state_;
