@@ -713,6 +713,56 @@ class MissionControlTest(unittest.TestCase):
         self.assertTrue(first.commands.empty() and second.commands.empty())
         recorder.active = False
 
+    def test_auto_recording_stops_five_seconds_after_active_plan_without_stopping_hardware(self):
+        w = self.window
+        first, second = self.connect("first", 1), self.connect("second", 2)
+        node = first.data
+        recorder = Mock(active=False, error="", video_error="")
+        node.recorder = recorder
+        w._recorders.add(recorder)
+        recorder.start.side_effect = lambda *args: setattr(recorder, "active", True) or Path("saved")
+        recorder.stop.side_effect = lambda *args: setattr(recorder, "active", False) or Path("saved")
+        node.receive("plans", [["active/Proposed", "p", [[1., 1.], [2., 2.]], [0., 10.]],
+                               ["preview/Nominal", "n", [[1., 1.], [2., 2.]], [0., 100.]]])
+        node.plan_choice = "preview/Nominal"
+        def report(phase, run="one"):
+            node.receive("paper_status", dict(frame_id="table", plan_id="p",
+                                              log_directory=f"/logs/{run}", phase=phase))
+        with patch.object(self.ui.time, "monotonic", return_value=100.):
+            report("PREPARING")
+            node.receive("paper_trial", ["p", None, "active/Proposed"])
+            w._update()
+        with patch.object(self.ui.time, "monotonic", return_value=200.):
+            w._update()
+            self.assertTrue(recorder.active)
+            self.assertIsNone(node.auto_recording_deadline)
+            report("LAUNCH")
+            node.receive("paper_trial", ["p", 2., "active/Proposed"])
+            w._update()
+            self.assertEqual(node.auto_recording_deadline, 213.)
+        # A stale or stopped plan clock cannot leave the archive open forever.
+        with patch.object(self.ui.time, "monotonic", return_value=212.99):
+            w._update()
+            self.assertTrue(recorder.active)
+        with patch.object(self.ui.time, "monotonic", return_value=213.):
+            w._update()
+            recorder.stop.assert_called_once_with("plan_finished_plus_5s")
+            self.assertFalse(recorder.active)
+            report("HOLDING")
+            self.assertFalse(recorder.active)
+            # Joining a different run after its deadline saves and immediately closes it.
+            report("HOLDING", "two")
+            node.receive("paper_trial", ["p", 16., "active/Proposed"])
+            w._update()
+            self.assertEqual(recorder.stop.call_count, 2)
+            self.assertFalse(recorder.active)
+            recorder.active = True  # Manual recording has no automatic deadline.
+            w._update()
+            self.assertTrue(recorder.active)
+            recorder.active = False
+        self.assertIs(w._node, second.data)
+        self.assertTrue(first.commands.empty() and second.commands.empty())
+
     def test_recording_snapshot_uses_each_fss_vicon_and_live_plan_independent_of_preview(self):
         w = self.window
         first, second = self.connect("first", 1), self.connect("second", 2)

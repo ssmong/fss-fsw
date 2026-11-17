@@ -2,7 +2,9 @@
 
 from collections import deque
 import math
+import os
 from pathlib import Path
+import sys
 
 from PySide6.QtCore import QObject, QPointF, QRectF, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen
@@ -147,6 +149,11 @@ class VideoRecorder(QObject):
                 raise ValueError("Video fps must be between 1 and 60")
             if self.path.exists():
                 raise FileExistsError(self.path)
+            # Qt's FFmpeg plugin also needs Conda's DLLs when Python is launched directly.
+            dlls = Path(sys.prefix) / "Library" / "bin"
+            if sys.platform == "win32" and dlls.is_dir() and str(dlls) not in os.environ.get("PATH", "").split(os.pathsep):
+                os.environ["PATH"] = str(dlls) + os.pathsep + os.environ.get("PATH", "")
+            os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
             from PySide6.QtMultimedia import QMediaCaptureSession, QMediaFormat, QMediaRecorder, QVideoFrameInput
             self._session = QMediaCaptureSession(self)
             self._input = QVideoFrameInput(self)
