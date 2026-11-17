@@ -39,6 +39,7 @@ class JetsonLink(QObject):
         self.workspace = None
         self.private_arm = False
         self.can_start_body = False
+        self.last_body_status_at = float("-inf")
         self.read_only = "모니터링 전용" if monitor_only else ""
         self.observer = None
         self.peers = ()
@@ -75,6 +76,7 @@ class JetsonLink(QObject):
                         self.workspace = getattr(value, "workspace", None)
                         self.private_arm = getattr(value, "private_arm", False)
                         self.can_start_body = getattr(value, "can_start_body", False)
+                        self.last_body_status_at = getattr(value, "received_at", float("-inf"))
                         self.read_only = getattr(value, "read_only", "") or (
                             "모니터링 전용" if self.monitor_only else "")
                 elif name == "bridge_error":
@@ -143,21 +145,30 @@ class JetsonLink(QObject):
     def _telemetry(self, client, domain):
         code = Path(__file__).with_name("mission_ros.py").read_text(encoding="utf-8")
         code = Path(__file__).with_name("mission_plan.py").read_text(encoding="utf-8") + "\n" + code
+        code = Path(__file__).with_name("mission_tracking.py").read_text(encoding="utf-8") + "\n" + code
         runtime = Path(__file__).with_name("mission_runtime.py").read_text(encoding="utf-8")
         domain = None if domain is None else int(domain)
-        code = (runtime + f"\nstartup_status, read_only = prepare_session({bool(self.monitor_only)!r}, {domain!r})\n"
+        auto_start = not self.monitor_only and domain is None
+        code = (runtime + '\nfirst_attach = os.environ["FSS_MISSION_REATTACH"] == "0"\n'
+                + f"startup_status, read_only = prepare_session({bool(self.monitor_only)!r}, "
+                f"{domain!r}, start_if_idle={auto_start!r} and first_attach)\n"
+                + f"if {auto_start!r} and first_attach and native_overlay_changed(read_only):\n    raise SystemExit(75)\n"
                 + "private_arm = private_base() is not None\n"
                 + code)
         preferred = PREFERRED_WORKSPACE
         select = runtime + f"\nprint(select_workspace({preferred!r}, monitor_only={bool(self.monitor_only)!r}))\n"
         # Native processes must not resolve a missing package from a legacy underlay.
-        cmd = (f"export FSS_MISSION_PREFERRED={shlex.quote(preferred)} && "
+        # Concurrent normal connections can choose different native overlays
+        # before either starts. Re-source the winning overlay in a fresh shell.
+        cmd = (f"export FSS_MISSION_PREFERRED={shlex.quote(preferred)}; "
+               'connect_bridge() (export FSS_MISSION_REATTACH="$1"; '
                f"FSS_MISSION_WORKSPACE=$(python3 -c {shlex.quote(select)}) && export FSS_MISSION_WORKSPACE && "
                'if [[ "$FSS_MISSION_WORKSPACE" == FSS_FSW ]]; then setup=setup.bash; '
                'else unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH ROS_PACKAGE_PATH PYTHONPATH LD_LIBRARY_PATH FSS_CONFIG_DIR; '
                'setup=local_setup.bash; fi && '
                'source /opt/ros/humble/setup.bash && source "$HOME/$FSS_MISSION_WORKSPACE/install/$setup" '
-               f"&& exec python3 -u -c {shlex.quote(code)}")
+               f"&& exec python3 -u -c {shlex.quote(code)}); "
+               'connect_bridge 0; rc=$?; if [[ $rc == 75 ]]; then connect_bridge 1; else exit "$rc"; fi')
         with client.get_transport().open_session(timeout=8) as ch:
             ch.exec_command("bash -c " + shlex.quote(cmd))
             ch.settimeout(0.1)
@@ -199,6 +210,8 @@ class JetsonLink(QObject):
                         error = line.decode(errors="replace")[-350:]
                         continue
                     if isinstance(event, list) and len(event) == 2:
+                        if event[0] == "connected" and isinstance(event[1], SimpleNamespace):
+                            event[1].received_at = last_rx
                         batch.append(event)
                 if batch:
                     self.inbox.put(batch, timeout=2)

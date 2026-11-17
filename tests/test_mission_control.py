@@ -63,17 +63,59 @@ class MissionControlTest(unittest.TestCase):
         fixed = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         self.assertEqual(self.window._terminal.font().family(), fixed.family())
 
-    def test_flight_start_requires_a_click_in_a_writable_idle_session(self):
-        link = self.connect("host", 0)
-        link.can_start_body = True
-        self.window._update()
-        self.assertFalse(self.window._start_body.isHidden())
-        self.assertTrue(link.commands.empty())
-        self.window._start_body.click()
-        self.assertEqual(link.commands.get_nowait()[1:], ("start_body", True))
-        link.read_only = "모니터링 전용"
-        self.window._update()
-        self.assertTrue(self.window._start_body.isHidden())
+    def body_status(self, link, *, age=0, **fields):
+        status = dict(observer="observer_" + link.display_id, peers=[], can_start_body=True,
+                      received_at=self.ui.time.monotonic() - age)
+        status.update(fields)
+        link.inbox.put([("connected", SimpleNamespace(**status))])
+
+    def test_body_start_uses_its_own_fss_even_when_another_is_selected(self):
+        from PySide6.QtTest import QTest
+
+        w = self.window
+        for endpoint in ("first", "second"):
+            w.add_jetson(endpoint, "smrl", None, "", f"FSS-{endpoint}")
+            self.body_status(w._links[endpoint])
+        first, second = w._links.values()
+        w.show()
+        self.app.processEvents()
+        w._update()
+        buttons = [w._vehicles.tabButton(i, self.ui.QTabBar.RightSide) for i in range(2)]
+        self.assertTrue(all(b.isEnabled() for b in buttons))
+        self.assertEqual(buttons[0].accessibleName(), "FSS-first 본체 FSW 시작")
+        self.assertTrue(first.commands.empty() and second.commands.empty())
+        QTest.mouseClick(buttons[0], self.ui.Qt.LeftButton)
+        self.assertEqual(w._vehicles.currentIndex(), 1)
+        self.assertEqual(first.commands.get_nowait()[1:], ("start_body", True))
+        self.assertTrue(second.commands.empty())
+        buttons[0].click()
+        self.assertTrue(first.commands.empty())
+
+    def test_body_start_rechecks_pending_status_stale_link_and_reused_endpoint(self):
+        w = self.window
+        first, second = self.connect("host", 0), self.connect("other", 1)
+        button = w._vehicles.tabButton(0, self.ui.QTabBar.RightSide)
+        for update in (dict(age=10), dict(read_only="모니터링"), dict(can_start_body=False),
+                       dict(peers=["other_observer"])):
+            self.body_status(first)
+            self.body_status(second, observer="other_observer")
+            w._update()
+            self.assertTrue(button.isEnabled())
+            self.body_status(first, **update)
+            button.click()
+            self.assertFalse(button.isEnabled())
+            self.assertTrue(first.commands.empty())
+        self.body_status(first)
+        w._update()
+        first.inbox.put([("bridge_error", "connection lost")])
+        button.click()
+        self.assertTrue(first.commands.empty())
+        w._disconnect_jetson(0)
+        replacement = self.connect("host", 0)
+        self.body_status(replacement)
+        w._update()
+        w._start_vehicle_body("host / 0", first, button)
+        self.assertTrue(first.commands.empty() and replacement.commands.empty())
 
     def test_air_bearing_shows_telemetry_without_optimistic_switch_on_click(self):
         w = self.window
@@ -339,6 +381,44 @@ class MissionControlTest(unittest.TestCase):
         first.peers, second.peers = ["a"], ["b"]
         self.window._update()
         self.assertTrue(self.window._send_target_button.isEnabled())
+
+    def test_executed_registration_overrides_matching_archive_id(self):
+        node = self.window._node
+        current, executed = "bundle/Nominal", "bundle (실행 기록)/Nominal"
+        node.receive("plans", [[current, "id", [[1.9, 0.], [1.9, 1.]], [0., 1.]],
+                               [executed, "id", [[2., 0.], [2., 1.]], [0., 1.]]])
+        node.receive("paper_trial", ["id", 0.5, executed])
+        self.assertEqual(self.window._update_plan_and_get_target()[:2], (2.0, 0.5))
+        node.receive("paper_trial", ["id", 0.5, None])
+        self.assertIsNone(self.window._update_plan_and_get_target())
+
+    def test_plan_error_graph_stays_with_vehicle_and_run(self):
+        w = self.window
+        first = self.connect("first", 1)
+        second = self.connect("second", 2)
+        w._vehicles.setCurrentIndex(0)
+        sample = dict(run_id="run1", plan_key="bundle/Nominal", plan_time_s=1.,
+                      error_x_m=0.03, error_y_m=0.04, error_xy_m=0.05,
+                      error_yaw_rad=-math.pi / 6, error_shoulder_rad=math.pi / 3)
+        first.data.receive("tracking_error", SimpleNamespace(**sample))
+        first.data.plan_choice = "off"
+        w._update_error_view()
+        self.assertEqual(w._error_curves[2].yData.tolist(), [0.05])
+        self.assertAlmostEqual(w._error_curves[3].yData[-1], -30.)
+        self.assertAlmostEqual(w._error_curves[4].yData[-1], 60.)
+        self.assertTrue(math.isnan(w._error_curves[5].yData[-1]))
+        second.data.latest_ref = (0., 0., 0.)
+        w._vehicles.setCurrentIndex(1)
+        w._update_error_view()
+        self.assertEqual(w._error_pages.currentIndex(), 1)
+        w._choose_error_view(0)
+        self.assertIsNone(w._error_curves[2].xData)
+        w._vehicles.setCurrentIndex(0)
+        first.data.receive("paper_status", {"frame_id": "table", "plan_id": "id", "log_directory": "/run2"})
+        first.data.receive("tracking_error", {**sample, "run_id": "run2", "plan_time_s": 0.2})
+        w._update_error_view()
+        self.assertEqual(w._error_curves[0].xData.tolist(), [0.2])
+        self.assertEqual(w._error_caption.toolTip(), "run2")
 
     def test_main_log_tracks_the_selected_vehicle_and_repeated_messages(self):
         first = self.connect("first", 1)

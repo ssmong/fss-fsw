@@ -38,7 +38,7 @@ def _matches_vector(values, actual, tolerance):
                     for value, sample in zip(values, actual)))
 
 
-def load_table_plans(root=None, model_path=None):
+def load_table_plans(root=None, model_path=None, *, signatures=None):
     """Return key, ID, table XY, seconds, body yaw, relative joints, and arm geometry."""
     try:
         import numpy as np
@@ -124,20 +124,19 @@ def load_table_plans(root=None, model_path=None):
                     yaw = yaw[indices]
                 if joints is not None:
                     joints = joints[indices]
-            plans.append((manifest.parent.relative_to(root).as_posix(), trial["plan_id"], xy.tolist(),
+            key = manifest.parent.relative_to(root).as_posix()
+            plans.append((key, trial["plan_id"], xy.tolist(),
                           times.tolist(), yaw.tolist() if yaw is not None else None,
                           joints.tolist() if joints is not None else None, geometry))
+            if signatures is not None:
+                signatures[key] = (trial["plan_sha256"], angle, offset.tolist())
         except (OSError, RuntimeError, KeyError, ValueError, TypeError, IndexError,
                 EOFError, zipfile.BadZipFile, yaml.YAMLError):
             continue
     return plans
 
 
-def paper_plan_elapsed(status, root=None):
-    """Read the executor's plan clock from the last complete record of this run."""
-    if status.get("phase") not in ("LAUNCH", "COAST", "CAPTURING", "CLOSING", "LOCAL_BRAKE",
-                                   "PLANNED_BRAKE", "HOLDING", "STOPPING", "STOPPED", "MISSED", "FAULT"):
-        return None
+def paper_run_files(status, root=None):
     directory = status.get("log_directory")
     if not isinstance(directory, str) or not Path(directory).is_absolute():
         return None
@@ -151,9 +150,26 @@ def paper_plan_elapsed(status, root=None):
             return None
         if config.stat().st_size > 262144:
             return None
-        trial = json.loads(config.read_bytes()).get("paper_plan")
+        metadata = json.loads(config.read_bytes())
+        trial = metadata.get("paper_plan")
         if not isinstance(trial, dict) or trial.get("plan_id") != status.get("plan_id"):
             return None
+        return run.relative_to(root).as_posix(), samples, metadata
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def paper_plan_elapsed(status, root=None, *, source=None):
+    """Read the executor's plan clock from the last complete record of this run."""
+    if status.get("phase") not in ("LAUNCH", "COAST", "CAPTURING", "CLOSING", "LOCAL_BRAKE",
+                                   "PLANNED_BRAKE", "HOLDING", "STOPPING", "STOPPED", "MISSED", "FAULT"):
+        return None
+    if source is None:
+        source = paper_run_files(status, root)
+    if source is None:
+        return None
+    _, samples, _ = source
+    try:
         with samples.open("rb") as stream:
             offset = max(0, stream.seek(0, 2) - 65536)
             stream.seek(offset)

@@ -217,12 +217,22 @@ def open_node(receive, reply, args=None, reject=None):
     # Standalone SSH code includes the reader; local ROS imports its sibling.
     read_plans = globals().get("load_table_plans")
     read_elapsed = globals().get("paper_plan_elapsed")
+    read_run = globals().get("paper_run_files")
+    tracker_type = globals().get("PaperTracking")
     if read_plans is None:
         from mission_plan import load_table_plans as read_plans
         from mission_plan import paper_plan_elapsed as read_elapsed
-    receive("plans", read_plans())
+        from mission_plan import paper_run_files as read_run
+        from mission_tracking import PaperTracking as tracker_type
+    signatures = {}
+    plans = read_plans(signatures=signatures)
+    tracking = tracker_type(plans, signatures, node.get_clock().now().nanoseconds / 1e9)
+    receive("plans", plans)
+    last_run = None
+    published_extra = None
 
     def paper_status(msg):
+        nonlocal last_run, published_extra
         try:
             status = json.loads(msg.data)
         except (ValueError, TypeError):
@@ -230,9 +240,27 @@ def open_node(receive, reply, args=None, reject=None):
         receive("paper_status", status)
         plan_id = status.get("plan_id") if isinstance(status, dict) and status.get("frame_id") == "table" else None
         if isinstance(plan_id, str) and plan_id:
-            receive("paper_trial", [plan_id, read_elapsed(status)])
+            source = read_run(status)
+            identity = (source[0], plan_id) if source else None
+            catalog_changed = False
+            if identity and identity != last_run:
+                last_run = identity
+                current_signatures = {}
+                current = read_plans(signatures=current_signatures)
+                catalog_changed = current != tracking.plans
+                tracking.set_catalog(current, current_signatures)
+            errors = tracking.poll(status, node.get_clock().now().nanoseconds / 1e9, source)
+            if catalog_changed or published_extra is not tracking.extra_plan:
+                published_extra = tracking.extra_plan
+                receive("plans", tracking.plans + ([published_extra] if published_extra else []))
+            receive("paper_trial", [plan_id, read_elapsed(status, source=source) if source else None, tracking.active_key])
+            for sample in errors:
+                receive("tracking_error", sample)
         else:
-            receive("paper_trial", ["", None])
+            if published_extra is not None:
+                published_extra = None
+                receive("plans", tracking.plans)
+            receive("paper_trial", ["", None, None])
 
     node.create_subscription(String, "/paper_toss/status", paper_status, qos_profile_sensor_data)
     valve_output = ValveOutput(node, receive, GetParameters)
@@ -316,7 +344,7 @@ def serve():
         # The dashboard uses IMU arrivals only to measure the incoming rate.
         if name == "imu" and not recording:
             data = {}
-        elif name in ("plans", "paper_trial", "paper_status"):
+        elif name in ("plans", "paper_trial", "paper_status", "tracking_error"):
             data = msg
         elif name == "valve_output":
             data = {"duty_cycles": msg.duty_cycles}
@@ -334,7 +362,10 @@ def serve():
     node, request = open_node(forward, lambda text: emit("reply", text),
                               reject=lambda text: emit("reply_error", text))
     if status := globals().get("startup_status"):
-        emit("log", {"level": 20, "name": "Mission Control", "msg": status})
+        failed = status.startswith("FSW 자동 시작 실패")
+        emit("log", {"level": 40 if failed else 20, "name": "Mission Control", "msg": status})
+        if failed:
+            emit("reply_error", status)
     heartbeat = 0.0
     pending = b""
     def can_start_body():

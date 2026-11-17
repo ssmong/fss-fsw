@@ -1,5 +1,6 @@
 """Select or start the flight stack on the Jetson hosting this SSH session."""
 
+import ast
 import os
 import subprocess
 import time
@@ -239,8 +240,19 @@ def local_stacks(proc=Path("/proc"), monitor=False, domain=None):
     return stacks
 
 
-def prepare_hardware():
-    """Start or reuse hardware after an explicit operator request."""
+def forwards_target_wait(path):
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return False
+    return any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "LaunchConfiguration" and node.args
+               and isinstance(node.args[0], ast.Constant) and node.args[0].value == "require_explicit_target"
+               for node in ast.walk(tree))
+
+
+def prepare_hardware(*, only_if_idle=False):
+    """Serialize startup and check ownership again before opening any devices."""
     from fcntl import LOCK_EX, flock
 
     selected = os.getenv("FSS_MISSION_WORKSPACE", PUBLIC)
@@ -265,6 +277,8 @@ def prepare_hardware():
             return "기존 기체 소프트웨어 연결"
         if stacks["imu"] and environment.get("ROS_LOCALHOST_ONLY", "0") != "1":
             raise HardwareBusy(environment, "공유 ROS 네트워크의 IMU")
+        if only_if_idle and stacks["imu"]:
+            return "기존 IMU 연결"
         profile = private_base()
         if profile and not profile.is_file():
             raise RuntimeError("실험실 기체 설정 필요 · cd ~/FSS_FSW && bash scripts/cpp_fsw.sh build")
@@ -274,6 +288,21 @@ def prepare_hardware():
                    "require_explicit_target" in (prefix / feature).read_text().splitlines()
                    for prefix in (install / "fss_gnc", install)):
             raise RuntimeError("목표 전송 대기를 지원하는 Jetson C++ FSW로 업데이트하고 빌드하세요.")
+        launch = install / "fss_bringup/share/fss_bringup/launch"
+        if not launch.is_dir():
+            launch = install / "share/fss_bringup/launch"
+        launch_files = [launch / "fss_full.launch.py", launch / "gnc.launch.py"]
+        if profile:
+            launch_files.append(profile)
+        if not all(forwards_target_wait(path) for path in launch_files):
+            raise RuntimeError("기체 런처에 목표 대기 설정이 없습니다. Jetson FSW를 업데이트하세요.")
+        if only_if_idle:
+            # A second SSH client may connect just after a launcher has failed.
+            # An explicit operator retry can still run immediately.
+            attempt = state / "last-auto-start"
+            if attempt.exists() and 0 <= time.time() - attempt.stat().st_mtime < 10:
+                raise RuntimeError("최근 기동 요청이 있습니다. 실행 상태를 확인하고 FSW 시작을 누르세요.")
+            attempt.touch()
 
         # Keep the stack alive across SSH/UI reconnects. Concurrent sessions see
         # the same ros2 launch process under the startup lock.
@@ -295,8 +324,8 @@ def prepare_hardware():
         return "기체 소프트웨어 기동"
 
 
-def prepare_session(monitor_only=False, domain=None):
-    """Attach the bridge without starting flight software or device drivers."""
+def prepare_session(monitor_only=False, domain=None, *, start_if_idle=False):
+    """Select the ROS environment, optionally starting an idle native Jetson on connection."""
     selected = os.getenv("FSS_MISSION_WORKSPACE", PUBLIC)
     reason = ""
     try:
@@ -319,4 +348,25 @@ def prepare_session(monitor_only=False, domain=None):
     os.environ.update(environment)
     if domain is not None:
         os.environ["ROS_DOMAIN_ID"] = str(domain)
+    if (start_if_idle and not reason and not monitor_only and domain is None
+            and selected in (PUBLIC, PRIVATE_CPP) and not stacks["flight"] and not stacks["imu"]):
+        try:
+            return prepare_hardware(only_if_idle=True), ""
+        except HardwareBusy as busy:
+            for key in ROS_ENV_KEYS:
+                os.environ.pop(key, None)
+            os.environ.update(busy.environment)
+            return str(busy), str(busy)
+        except (OSError, RuntimeError) as exc:
+            return f"FSW 자동 시작 실패 · {exc}", ""
     return reason or "기체 연결", reason
+
+
+def native_overlay_changed(reason):
+    selected = os.environ.get("FSS_MISSION_WORKSPACE")
+    if selected not in (PRIVATE_CPP, PUBLIC):
+        return False
+    alternate = PUBLIC if selected == PRIVATE_CPP else PRIVATE_CPP
+    if reason != str(HardwareBusy({}, alternate)):
+        return False
+    return select_workspace(os.environ.get("FSS_MISSION_PREFERRED", PUBLIC)) == alternate

@@ -1,3 +1,4 @@
+import csv
 import gzip
 import json
 import math
@@ -84,6 +85,41 @@ class RecordingTest(unittest.TestCase):
             self.assertEqual(json.loads((b / "session.json").read_text(encoding="utf8"))["status"], "error")
             with gzip.open(a / "telemetry.jsonl.gz") as fp:
                 self.assertEqual(fp.read(), b"")
+
+    def test_tracking_export_retains_aligned_samples_and_missing_angles(self):
+        with tempfile.TemporaryDirectory() as root:
+            first_node, second_node = self.gui.DashboardNode(), self.gui.DashboardNode()
+            a, b = first_node.recorder, second_node.recorder
+            a_dir, b_dir = a.start(root, "demo", "FSS-A"), b.start(root, "demo", "FSS-B")
+            point = {"run_id": "run-1", "plan_key": "trial/Nominal", "plan_id": "T1", "phase": "COAST",
+                     "sample_stamp_s": 12.0, "control_stamp_s": 12.02, "feedback_age_s": 0.02, "plan_time_s": 3.5,
+                     "actual_x_m": 1.3, "actual_y_m": 0.6, "planned_x_m": 1.0, "planned_y_m": 1.0,
+                     "error_x_m": 0.3, "error_y_m": -0.4, "error_xy_m": 0.5, "planned_yaw_rad": math.nan,
+                     "actual_elbow_rad": 0.2, "planned_elbow_rad": 0.5, "error_elbow_rad": -0.3}
+            a.record("tracking_error", {**point, "sample_stamp_s": None})
+            a.record("tracking_error", {**point, "actual_x_m": math.inf})
+            first_node.receive("tracking_error", NS(**point))
+            second_node.receive("tracking_error", {**point, "run_id": "run-B", "plan_time_s": 4})
+            a.stop()
+            b.stop()
+            a.record("tracking_error", point)
+            with (a_dir / "tracking_error.csv").open(encoding="utf-8", newline="") as fp:
+                first, = csv.DictReader(fp)
+            with (b_dir / "tracking_error.csv").open(encoding="utf-8", newline="") as fp:
+                second, = csv.DictReader(fp)
+            self.assertEqual((first["run_id"], second["run_id"]), ("run-1", "run-B"))
+            self.assertEqual((first["plan_time_s"], second["plan_time_s"]), ("3.5", "4"))
+            self.assertEqual(first["error_xy_m"], "0.5")
+            self.assertEqual(first_node.plan_errors[-1][:4], (3.5, 0.3, -0.4, 0.5))
+            self.assertEqual(first["error_y_m"], "-0.4")
+            self.assertEqual(first["error_elbow_rad"], "-0.3")
+            for field in ("planned_yaw_rad", "error_yaw_rad", "error_shoulder_rad", "error_wrist_rad"):
+                self.assertEqual(first[field], "")
+            with gzip.open(a_dir / "telemetry.jsonl.gz", "rt", encoding="utf-8") as fp:
+                event, = (r for line in fp if (r := json.loads(line))["kind"] == "tracking_error")
+            self.assertEqual(event["received_unix_ns"], int(first["received_unix_ns"]))
+            self.assertEqual(event["elapsed_s"], float(first["elapsed_s"]))
+            self.assertIsNone(event["data"]["planned_yaw_rad"])
 
 
 if __name__ == "__main__":

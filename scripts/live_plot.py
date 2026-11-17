@@ -21,7 +21,6 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
-from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -369,12 +368,16 @@ class DashboardNode:
         self.paper_plans = {}
         self.paper_trial = ""
         self.paper_elapsed = None
+        self.paper_match = []
         self.plan_choice = "auto"
 
         # 추종 오차
         self.t_err: deque[float] = deque(maxlen=history_size)
         self.pos_err: deque[float] = deque(maxlen=history_size)
         self.hdg_err: deque[float] = deque(maxlen=history_size)
+        self.plan_errors = deque(maxlen=history_size)
+        self.error_run = self.error_plan = self.trial_directory = ""
+        self.error_view = None
 
         # 밸브 명령
         self.valve_cmd = None
@@ -421,8 +424,7 @@ class DashboardNode:
                 if hasattr(msg, "header"):
                     payload["header"] = msg.header
             self.recorder.record(name, payload)
-        if name != "paper_status":
-            getattr(self, "_cb_" + name)(msg)
+        getattr(self, "_cb_" + name)(msg)
 
     def send_command(self, name, value):
         if self.request:
@@ -620,11 +622,37 @@ class DashboardNode:
             self.plan_choice = "auto"
 
     def _cb_paper_trial(self, status) -> None:
-        self.paper_trial, self.paper_elapsed = status
+        self.paper_trial, self.paper_elapsed, *self.paper_match = status
         self._mark_rx("paper_trial")
+
+    def _cb_paper_status(self, status):
+        data = status if isinstance(status, dict) else getattr(status, "__dict__", {})
+        directory = data.get("log_directory")
+        if (data.get("frame_id") == "table" and data.get("plan_id")
+                and directory and directory != self.trial_directory):
+            self.trial_directory = directory
+            self.plan_errors.clear()
+            self.error_run = self.error_plan = ""
+
+    def _cb_tracking_error(self, sample):
+        data = sample if isinstance(sample, dict) else vars(sample)
+        run, plan = data["run_id"], data["plan_key"]
+        if (run, plan) != (self.error_run, self.error_plan):
+            self.plan_errors.clear()
+            self.error_run, self.error_plan = run, plan
+        angles = (data.get(f"error_{name}_rad") for name in ("yaw", "shoulder", "elbow", "wrist"))
+        self.plan_errors.append((
+            data["plan_time_s"], data["error_x_m"], data["error_y_m"], data["error_xy_m"],
+            *(math.nan if angle is None else math.degrees(angle) for angle in angles),
+        ))
 
     def active_plan_key(self):
         if not self.paper_trial or self.source_age("paper_trial") > SOURCE_TIMEOUT_SEC:
+            return None
+        if self.paper_match:
+            key = self.paper_match[0]
+            if key in self.paper_plans and self.paper_plans[key][0] == self.paper_trial:
+                return key
             return None
         matches = [key for key, plan in self.paper_plans.items() if plan[0] == self.paper_trial]
         return matches[0] if len(matches) == 1 else None
@@ -824,6 +852,10 @@ class Dashboard(QMainWindow):
             QComboBox::drop-down {{ width:22px; border:none; }}
             QPushButton {{ color:{C_INFO}; border-radius:15px; padding:4px 13px; }}
             QPushButton:hover {{ border-color:{C_INFO}; }}
+            QPushButton#bodyStart {{ background:{C_PANEL}; border:1px solid {C_BORDER};
+                border-radius:10px; min-height:18px; padding:1px 7px; margin-right:6px; font-size:12px; }}
+            QPushButton#bodyStart:hover {{ border-color:{C_INFO}; }}
+            QPushButton#bodyStart:disabled {{ background:{C_PANEL_ALT}; color:{C_IDLE}; }}
             QPushButton:focus, QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus {{
                 border:2px solid {C_FOCUS}; }}
             QDoubleSpinBox QLineEdit {{
@@ -990,6 +1022,8 @@ class Dashboard(QMainWindow):
         self._vehicles.setObjectName("vehicleSelector")
         self._vehicles.setExpanding(False)
         self._vehicles.setDrawBase(False)
+        self._vehicles.setElideMode(Qt.ElideNone)
+        self._vehicles.setUsesScrollButtons(True)
         self._disconnect_button = QPushButton("연결 해제")
         self._disconnect_button.hide()
         self._disconnect_button.clicked.connect(lambda: self._disconnect_jetson(self._vehicles.currentIndex()))
@@ -1001,10 +1035,6 @@ class Dashboard(QMainWindow):
         row.addWidget(add)
         row.addWidget(self._vehicles)
         row.addWidget(self._disconnect_button)
-        self._start_body = QPushButton("본체 FSW 시작")
-        self._start_body.hide()
-        self._start_body.clicked.connect(lambda: self._node.send_command("start_body", True))
-        row.addWidget(self._start_body)
         row.addStretch()
         self._release_estop = QPushButton("정지 해제")
         self._release_estop.clicked.connect(self._reset_estop)
@@ -1015,6 +1045,25 @@ class Dashboard(QMainWindow):
         self._btn_estop.clicked.connect(lambda: self._node.request_mode(MODE_ESTOP))
         row.addWidget(self._btn_estop)
         return row
+
+    def _shared_domain(self, link):
+        return any(other is not link and not other.stopped.is_set()
+                   and (other.observer in link.peers or link.observer in other.peers)
+                   for other in self._links.values())
+
+    def _can_start_body(self, endpoint, link):
+        return (self._links.get(endpoint) is link and link.ready and not link.stopped.is_set()
+                and not link.read_only and not link.bridge_error and link.can_start_body
+                and time.monotonic() - link.last_body_status_at <= SOURCE_TIMEOUT_SEC
+                and not self._shared_domain(link))
+
+    def _start_vehicle_body(self, endpoint, link, button):
+        for connected in self._links.values():
+            connected.drain()
+        button.setEnabled(False)
+        if self._can_start_body(endpoint, link):
+            link.can_start_body = False
+            link.data.send_command("start_body", True)
 
     def _reset_estop(self):
         if self._node.mode_name == "EMERGENCY_STOP" and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC:
@@ -1105,10 +1154,12 @@ class Dashboard(QMainWindow):
                              ("SSH 계정", user), ("암호", password)):
             form.addRow(label, field)
         monitor = QCheckBox("모니터링만")
+        monitor.setToolTip("체크하면 실행 중인 FSS의 데이터만 수신합니다.")
         form.addRow("", arm)
         form.addRow("", monitor)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("연결")
+        buttons.button(QDialogButtonBox.Ok).setToolTip("일반 연결은 유휴 FSS를 목표 대기 상태로 시작합니다.")
         buttons.button(QDialogButtonBox.Cancel).setText("취소")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -1161,6 +1212,12 @@ class Dashboard(QMainWindow):
         link.changed.connect(self._connection_error)
         index = self._vehicles.addTab(endpoint)
         self._vehicles.setTabData(index, endpoint)
+        start = QPushButton("본체 시작", self._vehicles)
+        start.setObjectName("bodyStart")
+        start.setEnabled(False)
+        start.adjustSize()
+        start.clicked.connect(lambda: self._start_vehicle_body(endpoint, link, start))
+        self._vehicles.setTabButton(index, QTabBar.RightSide, start)
         self._vehicles.setCurrentIndex(index)
         self._select_vehicle(index)
         colors = [C_EKF, C_WARN, C_VICON, "#7048a2", "#a7376d"]
@@ -1229,7 +1286,10 @@ class Dashboard(QMainWindow):
             self._link_errors.pop(endpoint, None)
             for item in self._trails.pop(endpoint):
                 self._xy_plot.removeItem(item)
+            start = self._vehicles.tabButton(index, QTabBar.RightSide)
             self._vehicles.removeTab(index)
+            if start is not None:
+                start.deleteLater()
             self._select_vehicle(self._vehicles.currentIndex())
 
     def closeEvent(self, event):
@@ -1665,6 +1725,58 @@ class Dashboard(QMainWindow):
             )
         return plot
 
+    def _build_plan_errors(self):
+        panel = QWidget()
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(0, 0, 0, 0)
+        self._error_curves = []
+        self._error_sample_shown = None
+        for row, column, span, title, units, series in (
+            (0, 0, 1, "본체 위치 오차", "m", (("X", C_VICON), ("Y", C_ARM), ("거리", C_ERROR))),
+            (0, 1, 1, "Yaw 오차", "°", (("Yaw", C_WARN),)),
+            (1, 0, 2, "관절각 오차", "°", (("J1", C_VICON), ("J2", C_ARM), ("J3", C_WARN))),
+        ):
+            plot = pg.PlotWidget()
+            _style_plot(plot, title, x_label="계획 시간 [s]", y_label=units)
+            if len(series) > 1:
+                _add_readable_legend(plot, (8, 8), len(series))
+            for label, color in series:
+                self._error_curves.append(plot.plot(name=label, pen=pg.mkPen(color, width=2)))
+            grid.addWidget(plot, row, column, 1, span)
+        self._joint_error_plot = plot
+        return panel
+
+    def _choose_error_view(self, index):
+        self._node.error_view = index
+        self._update_error_view()
+
+    def _update_error_view(self):
+        node = self._node
+        index = node.error_view
+        if index is None:
+            index = int(not (node.paper_trial or node.plan_errors) and node.latest_ref is not None)
+        self._error_source.setCurrentIndex(index)
+        self._error_pages.setCurrentIndex(index)
+        if index != 0:
+            self._error_caption.clear()
+            return
+        last = node.plan_errors[-1] if node.plan_errors else None
+        caption = (f"{node.error_plan.rsplit('/', 1)[-1]}   ·   {last[0]:.2f} s" if last else
+                   "실측 대기" if node.paper_trial else "실행 계획 대기")
+        self._error_caption.setText(caption)
+        self._error_caption.setToolTip(node.error_run)
+        self._joint_error_plot.setVisible(node.arm_equipped)
+        if last is self._error_sample_shown:
+            return
+        self._error_sample_shown = last
+        if last is None:
+            for curve in self._error_curves:
+                curve.clear()
+            return
+        times, *signals = np.asarray(node.plan_errors, dtype=float).T
+        for curve, signal in zip(self._error_curves, signals):
+            curve.setData(times, signal, connect="finite")
+
     def _build_detail_tabs(self) -> QTabWidget:
         """상세 탭을 구성한다.
 
@@ -1673,9 +1785,22 @@ class Dashboard(QMainWindow):
         """
         tabs = QTabWidget()
 
-        # 초기 탭: 운용 판단에 가장 중요한 추종 오차
         error_tab = QWidget()
-        error_layout = QHBoxLayout(error_tab)
+        errors = QVBoxLayout(error_tab)
+        sources = QHBoxLayout()
+        self._error_source = QComboBox()
+        self._error_source.setAccessibleName("추종 오차 기준")
+        self._error_source.addItems(["실험 계획", "제어기 목표"])
+        self._error_source.activated.connect(self._choose_error_view)
+        sources.addWidget(self._error_source)
+        self._error_caption = QLabel()
+        sources.addWidget(self._error_caption)
+        sources.addStretch()
+        errors.addLayout(sources)
+        self._error_pages = QStackedWidget()
+        self._error_pages.addWidget(self._build_plan_errors())
+        controller_errors = QWidget()
+        error_layout = QHBoxLayout(controller_errors)
         error_layout.setContentsMargins(6, 6, 6, 6)
         error_layout.addWidget(
             self._make_plot(
@@ -1693,6 +1818,8 @@ class Dashboard(QMainWindow):
                 (-15.0, 15.0),
             )
         )
+        self._error_pages.addWidget(controller_errors)
+        errors.addWidget(self._error_pages)
         tabs.addTab(error_tab, "추종 오차")
 
         state_tab = QWidget()
@@ -1923,6 +2050,8 @@ class Dashboard(QMainWindow):
             for key in node.paper_plans:
                 experiment, method = key.rsplit("/", 1)
                 self._plan_picker.addItem(f"{method}  ·  {experiment}", key)
+                self._plan_picker.setItemData(self._plan_picker.count() - 1,
+                                              f"저장 계획 미리보기 · {key}", Qt.ToolTipRole)
             self._plan_picker.setCurrentIndex(self._plan_picker.findData(node.plan_choice))
             self._plan_picker.setVisible(bool(node.paper_plans))
         active = node.active_plan_key()
@@ -1941,7 +2070,8 @@ class Dashboard(QMainWindow):
             auto_label += " · " + key.rsplit("/", 1)[-1]
         if self._plan_picker.itemText(0) != auto_label:
             self._plan_picker.setItemText(0, auto_label)
-        self._plan_picker.setToolTip(key or "실험별 본체 계획 경로 [m]")
+        self._plan_picker.setToolTip("실행 중인 실험의 계획" if node.plan_choice == "auto" else
+                                     f"저장 계획 미리보기 · {key}" if key else "계획 경로 숨기기")
         if key is not None:
             if key != active or node.paper_elapsed is None:
                 return None
@@ -2009,6 +2139,11 @@ class Dashboard(QMainWindow):
             values = getattr(node, value_attr)
             if times and len(times) == len(values):
                 curve.setData(list(times), list(values))
+            elif curve.xData is not None:
+                curve.clear()
+
+        if self._error_source.isVisible():
+            self._update_error_view()
 
         duties = node.fresh_valve_command()
         if duties is not None:
@@ -2097,9 +2232,9 @@ class Dashboard(QMainWindow):
             if rate_due:
                 data._tick_hz()
             if endpoint in self._link_errors:
-                status = "Missing" if data.tracking_since is not None else "연결 오류"
+                status = "연결 끊김" if data.tracking_since is not None else "연결 오류"
             elif link.bridge_error:
-                status = "Missing" if data.tracking_since is not None else "ROS 미연결"
+                status = "ROS 미연결"
             elif not link.ready:
                 status = "연결 중"
             else:
@@ -2111,8 +2246,17 @@ class Dashboard(QMainWindow):
             tooltip = f"{link.ssh_user}@{endpoint}"
             if status == "Missing" and link.ready:
                 tooltip += "\n기체 위치 미수신 (5초)"
+            short_label = self._vehicles.fontMetrics().elidedText(label, Qt.ElideMiddle, 148)
+            if label != short_label:
+                tooltip = f"{label}\n{tooltip}"
             self._vehicles.setTabToolTip(i, f"{tooltip}\n{detail}" if detail else tooltip)
-            self._vehicles.setTabText(i, f"{label} · {status}".replace("&", "&&"))
+            self._vehicles.setTabText(i, f"{short_label} · {status}".replace("&", "&&"))
+            start = self._vehicles.tabButton(i, QTabBar.RightSide)
+            if start is not None:
+                action = f"{label} 본체 FSW 시작"
+                start.setAccessibleName(action)
+                start.setToolTip(action)
+                start.setEnabled(self._can_start_body(endpoint, link))
             if endpoint in self._trails:
                 trail, marker = self._trails[endpoint]
                 xs, ys = data.vicon_trail.coordinates()
@@ -2125,14 +2269,9 @@ class Dashboard(QMainWindow):
         self._terminal.refresh()
         selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
         enabled = selected.ready and not selected.read_only and not selected.stopped.is_set() if selected else bool(self._node.request)
-        shared_domain = selected and any(
-            other is not selected and not other.stopped.is_set()
-            and (other.observer in selected.peers or selected.observer in other.peers)
-            for other in self._links.values()
-        )
+        shared_domain = selected and self._shared_domain(selected)
         if shared_domain:
             enabled = False
-        self._start_body.setVisible(bool(enabled and selected and selected.can_start_body))
         self._btn_estop.setEnabled(enabled)
         self._release_estop.setVisible(enabled and self._node.mode_name == "EMERGENCY_STOP"
                                        and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC)

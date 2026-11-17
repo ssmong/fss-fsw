@@ -2,18 +2,20 @@
 
 import sys
 import os
+import ast
+import shlex
 import tempfile
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from mission_ros import MissionActions, ValveOutput
 from mission_runtime import (
     PUBLIC, PRIVATE, PRIVATE_CPP, HardwareBusy, checkout_for, local_service_owner,
-    local_stacks, prepare_hardware, prepare_session, process_role, select_workspace,
+    local_stacks, native_overlay_changed, prepare_hardware, prepare_session, process_role, select_workspace,
 )
 
 
@@ -127,6 +129,20 @@ class FlightCommands(unittest.TestCase):
 
 
 class Discovery(unittest.TestCase):
+    @staticmethod
+    def install_launch_fixture(prefix):
+        launch = prefix / "share/fss_bringup/launch"
+        launch.mkdir(parents=True, exist_ok=True)
+        repo = Path(__file__).resolve().parents[1]
+        if (repo / "runtime/cpp/base.launch.py").is_file():
+            repo = repo / "runtime/cpp/source"
+        source = repo / "src/infra/fss_bringup/launch"
+        for name in ("fss_full.launch.py", "gnc.launch.py"):
+            if source.is_dir():
+                (launch / name).write_bytes((source / name).read_bytes())
+            else:  # Private clone before its native submodule is initialized.
+                (launch / name).write_text('LaunchConfiguration("require_explicit_target")')
+
     def test_portable_overlay_selection_from_installs_and_live_processes(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -189,7 +205,8 @@ class Discovery(unittest.TestCase):
                 home = Path(tmp)
                 work = home / PRIVATE_CPP / "source"
                 work.mkdir(parents=True)
-                (work.parent / "base.launch.py").touch()
+                (work.parent / "base.launch.py").write_text('LaunchConfiguration("require_explicit_target")')
+                self.install_launch_fixture(work.parent / "install")
                 marker = work.parent / "install/share/ament_index/resource_index/fss_mission_control/fss_gnc"
                 marker.parent.mkdir(parents=True)
                 marker.write_text("require_explicit_target")
@@ -214,7 +231,7 @@ class Discovery(unittest.TestCase):
                         self.assertEqual(commands[:-1], [] if existing_imu else [["bash", "scripts/launch/start_imu.sh"]])
                         self.assertTrue(all(call.kwargs["cwd"] == work for call in spawn.call_args_list))
 
-    def test_idle_connections_never_start_flight_or_imu(self):
+    def test_only_normal_auto_domain_native_connection_starts_on_idle_device(self):
         for workspace in (PUBLIC, PRIVATE_CPP):
             for monitor in (False, True):
                 for domain in (None, 23):
@@ -224,14 +241,78 @@ class Discovery(unittest.TestCase):
                           patch("mission_runtime.device_processes", return_value=[]),
                           patch("mission_runtime.prepare_hardware") as hardware,
                           patch("mission_runtime.subprocess.Popen") as spawn):
-                        for _ in range(2):
-                            _, reason = prepare_session(monitor_only=monitor, domain=domain)
-                            self.assertEqual(bool(reason), monitor)
+                        _, reason = prepare_session(monitor_only=monitor, domain=domain, start_if_idle=True)
+                        self.assertEqual(bool(reason), monitor)
                         expected_domain = str(domain) if domain is not None else ("4" if monitor else "0")
                         self.assertEqual(os.environ["ROS_DOMAIN_ID"], expected_domain)
                         self.assertEqual(os.environ["ROS_LOCALHOST_ONLY"], "0" if monitor else "1")
-                        hardware.assert_not_called()
+                        if not monitor and domain is None:
+                            hardware.assert_called_once_with(only_if_idle=True)
+                        else:
+                            hardware.assert_not_called()
                         spawn.assert_not_called()
+
+    def test_auto_start_requires_known_idle_owner_and_preserves_retry_after_error(self):
+        with (patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": PUBLIC}),
+              patch("mission_runtime.private_base", return_value=None), patch("mission_runtime.device_processes") as scan,
+              patch("mission_runtime.prepare_hardware") as start):
+            scan.return_value = []
+            start.side_effect = OSError("fixture launch failure")
+            message, reason = prepare_session(start_if_idle=True)
+            self.assertIn("FSW 자동 시작 실패", message)
+            self.assertIn("fixture launch failure", message)
+            self.assertFalse(reason)
+            start.assert_called_once()
+            start.reset_mock()
+            for name in ("manager_node", "xsens_mti_node", "capture_executor"):
+                scan.return_value = [([f"/home/smrl/fss-fsw/install/test/lib/{name}"],
+                                      {"ROS_DOMAIN_ID": "0", "ROS_LOCALHOST_ONLY": "1"})]
+                status, reason = prepare_session(start_if_idle=True)
+                self.assertEqual(bool(reason), name == "capture_executor")
+                start.assert_not_called()
+
+    def test_switch_overlay_only_for_single_active_alternate_native(self):
+        for selected, alternate in ((PUBLIC, PRIVATE_CPP), (PRIVATE_CPP, PUBLIC)):
+            with patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": selected}), patch(
+                    "mission_runtime.select_workspace", return_value=alternate) as select:
+                reason = str(HardwareBusy({}, alternate))
+                self.assertTrue(native_overlay_changed(reason))
+                select.return_value = selected
+                self.assertFalse(native_overlay_changed(reason))
+                for owner in ("self_tossing_hils", PRIVATE, "FSS_FSW/hardware_runtime", alternate + " · self_tossing_hils"):
+                    self.assertFalse(native_overlay_changed(str(HardwareBusy({}, owner))))
+
+    def test_ssh_bootstrap_enables_autostart_only_on_first_normal_attach(self):
+        try:
+            from mission_link import JetsonLink
+        except ModuleNotFoundError as exc:
+            if exc.name == "PySide6":
+                self.skipTest("PySide6 unavailable")
+            raise
+        for monitor, domain in ((False, None), (True, None), (False, 3)):
+            client = MagicMock()
+            link = JetsonLink(Mock(), monitor_only=monitor)
+            link.stopped.set()
+            link._telemetry(client, domain)
+            channel = client.get_transport.return_value.open_session.return_value.__enter__.return_value
+            shell = shlex.split(channel.exec_command.call_args.args[0])[2]
+            bridge = next(arg.removesuffix(");") for arg in shlex.split(shell) if "first_attach =" in arg)
+            tree = ast.parse(bridge)
+            begin = next(i for i, line in enumerate(tree.body) if isinstance(line, ast.Assign)
+                         and getattr(line.targets[0], "id", None) == "first_attach")
+            startup = compile(ast.Module(tree.body[begin:begin+3], []), "<bootstrap>", "exec")
+            for first in (True, False):
+                attach = Mock(return_value=("기체 연결", ""))
+                scope = {"os": os, "prepare_session": attach, "native_overlay_changed": lambda _: True}
+                with patch.dict(os.environ, {"FSS_MISSION_REATTACH": "0" if first else "1"}):
+                    should_start = first and not monitor and domain is None
+                    if should_start:
+                        with self.assertRaises(SystemExit) as result:
+                            exec(startup, scope)
+                        self.assertEqual(result.exception.code, 75)
+                    else:
+                        exec(startup, scope)
+                    attach.assert_called_once_with(monitor, domain, start_if_idle=should_start)
 
     def test_mismatched_discovery_profiles_cannot_start_or_attach_for_commands(self):
         peers = [{"ROS_DOMAIN_ID": "8", "CYCLONEDDS_URI": uri} for uri in ("file:///a", "file:///b")]
@@ -347,6 +428,7 @@ class Discovery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             (home / "fss-fsw").mkdir()
+            self.install_launch_fixture(home / PUBLIC / "install/fss_bringup")
             marker = home / PUBLIC / "install/fss_gnc/share/ament_index/resource_index/fss_mission_control/fss_gnc"
             marker.parent.mkdir(parents=True)
             marker.write_text("require_explicit_target")
@@ -358,17 +440,48 @@ class Discovery(unittest.TestCase):
                   patch.dict(os.environ, {}),
                   patch.dict(sys.modules, fcntl=SimpleNamespace(LOCK_EX=2, flock=lambda *_: None)),
                   patch("mission_runtime.local_stacks", side_effect=[
-                      {"flight": [], "imu": []}, {"flight": [isolated], "imu": [isolated]}]),
+                      {"flight": [], "imu": [], "monitor": {}}, {"flight": [], "imu": []},
+                      {"flight": [isolated], "imu": [isolated], "monitor": isolated}]),
                   patch("mission_runtime.time.sleep"),
                   patch("mission_runtime.subprocess.Popen") as popen):
                 popen.return_value.poll.return_value = None
-                self.assertEqual(prepare_hardware(), "기체 소프트웨어 기동")
-                self.assertEqual(prepare_hardware(), "기존 기체 소프트웨어 연결")
+                self.assertEqual(prepare_session(start_if_idle=True), ("기체 소프트웨어 기동", ""))
+                self.assertEqual(prepare_session(start_if_idle=True), ("기체 연결", ""))
                 self.assertEqual([args.args[0] for args in popen.call_args_list],
                                  [["bash", "scripts/launch/start_imu.sh"],
                                   ["ros2", "launch", "fss_bringup", "fss_full.launch.py",
                                    "gnc_backend:=cpp", "require_explicit_target:=true"]])
                 self.assertEqual(os.environ["ROS_LOCALHOST_ONLY"], "1")
+
+    def test_failed_auto_launch_retains_manual_retry_and_rejects_old_launch_files_before_spawning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            install = home / PUBLIC / "install"
+            marker = install / "share/ament_index/resource_index/fss_mission_control/fss_gnc"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("require_explicit_target")
+            with (patch.object(Path, "home", return_value=home),
+                  patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": PUBLIC}),
+                  patch.dict(sys.modules, fcntl=SimpleNamespace(LOCK_EX=2, flock=lambda *_: None)),
+                  patch("mission_runtime.device_processes", return_value=[]),
+                  patch("mission_runtime.time.sleep"), patch("mission_runtime.subprocess.Popen") as spawn):
+                status, reason = prepare_session(start_if_idle=True)
+                self.assertIn("기체 런처에 목표 대기 설정", status)
+                self.assertFalse(reason)
+                spawn.assert_not_called()
+                self.install_launch_fixture(install)
+                spawn.return_value.poll.return_value = 2
+                status, reason = prepare_session(start_if_idle=True)
+                self.assertIn("flight.log", status)
+                self.assertFalse(reason)
+                spawn.assert_called_once()
+                status, reason = prepare_session(start_if_idle=True)
+                self.assertIn("최근 기동 요청", status)
+                self.assertFalse(reason)
+                spawn.assert_called_once()
+                spawn.return_value.poll.return_value = None
+                self.assertEqual(prepare_hardware(), "기체 소프트웨어 기동")
+                self.assertEqual(spawn.call_count, 2)
 
     def test_match_launch_argv_not_python_source_or_shell_text(self):
         self.assertIsNone(process_role(["python3", "-c", "ros2 launch self_tossing_hils"]))

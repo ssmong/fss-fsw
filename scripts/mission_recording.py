@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import ExitStack
+import csv
 from datetime import datetime
 import gzip
 import json
 import math
+from numbers import Real
 from pathlib import Path, PureWindowsPath
 import re
 import time
@@ -15,6 +17,33 @@ from types import SimpleNamespace
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
+
+
+TRACKING_IDS = ("run_id", "plan_key", "plan_id", "phase")
+TRACKING_VALUES = (
+    "sample_stamp_s", "control_stamp_s", "feedback_age_s", "plan_time_s",
+    "actual_x_m", "actual_y_m", "actual_yaw_rad", "planned_x_m", "planned_y_m", "planned_yaw_rad",
+    "error_x_m", "error_y_m", "error_xy_m", "error_yaw_rad",
+    *(f"{source}_{joint}_rad" for joint in ("shoulder", "elbow", "wrist")
+      for source in ("actual", "planned", "error")),
+)
+TRACKING_COLUMNS = ("received_unix_ns", "elapsed_s", *TRACKING_IDS, *TRACKING_VALUES)
+
+
+def _tracking_sample(value):
+    if isinstance(value, SimpleNamespace):
+        value = vars(value)
+    if not isinstance(value, dict):
+        return None
+    result = {name: value.get(name) for name in TRACKING_IDS}
+    for name in TRACKING_VALUES:
+        v = value.get(name)
+        result[name] = v if isinstance(v, Real) and not isinstance(v, bool) and math.isfinite(v) else None
+    required = ("sample_stamp_s", "control_stamp_s", "plan_time_s", "actual_x_m", "actual_y_m",
+                "planned_x_m", "planned_y_m", "error_x_m", "error_y_m", "error_xy_m")
+    if any(result[name] is None for name in required):
+        return None
+    return result
 
 
 def _plain(value):
@@ -74,6 +103,10 @@ class ExperimentRecorder:
         try:
             self._data = self._files.enter_context((self.directory / "telemetry.jsonl.gz").open("xb"))
             self._logs = self._files.enter_context((self.directory / "logs.txt").open("x", encoding="utf-8", buffering=1))
+            tracking_file = self._files.enter_context((self.directory / "tracking_error.csv").open(
+                "x", encoding="utf-8", newline="", buffering=1))
+            self._tracking = csv.DictWriter(tracking_file, fieldnames=TRACKING_COLUMNS)
+            self._tracking.writeheader()
             self._buffer = bytearray()
             self._start_ns = time.monotonic_ns()
             self._last_flush_ns = 0
@@ -128,6 +161,13 @@ class ExperimentRecorder:
         try:
             row = {"received_unix_ns": time.time_ns(), "elapsed_s": (now - self._start_ns) * 1e-9,
                    "kind": kind, "data": value}
+            if kind == "tracking_error":
+                sample = _tracking_sample(value)
+                if sample is None:
+                    return
+                row["data"] = sample
+                self._tracking.writerow({"received_unix_ns": row["received_unix_ns"],
+                                         "elapsed_s": row["elapsed_s"], **sample})
             self._buffer.extend((_json(row) + "\n").encode("utf-8"))
             self._counts[kind] += 1
             if now - self._last_flush_ns >= 250_000_000 or len(self._buffer) >= 262144:
