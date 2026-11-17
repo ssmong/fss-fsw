@@ -63,6 +63,72 @@ class MissionControlTest(unittest.TestCase):
         fixed = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         self.assertEqual(self.window._terminal.font().family(), fixed.family())
 
+    def test_air_bearing_shows_telemetry_without_optimistic_switch_on_click(self):
+        w = self.window
+        link = self.connect("first", 1)
+        buttons = (w._btn_air_on, w._btn_air_off)
+
+        def checked():
+            w._update()
+            return tuple(button.isChecked() for button in buttons)
+
+        def report(name, **values):
+            link.inbox.put([(name, SimpleNamespace(**values))])
+
+        self.assertEqual(checked(), (False, False))
+        report("mode", mode_name="READY")
+        self.assertEqual(checked(), (False, False))
+        report("valve", commanded_duty_cycles=[0] * 8, main_valve_open=False, modbus_rtt_ms=1)
+        self.assertEqual(checked(), (False, True))
+        self.assertTrue(w._btn_air_on.isEnabled())
+        w._btn_air_on.click()
+        self.assertEqual(link.commands.get_nowait()[1:], ("valve", True))
+        self.assertEqual(tuple(b.isChecked() for b in buttons), (False, True))
+        link.inbox.put([("reply", "에어베어링 ON")])
+        self.assertEqual(checked(), (False, True))
+        report("valve", commanded_duty_cycles=[0] * 8, main_valve_open=True, modbus_rtt_ms=1)
+        self.assertEqual(checked(), (True, False))
+
+        w.add_jetson("monitor", "operator", None, "", monitor_only=True)
+        monitor = w._links["monitor"]
+        monitor.inbox.put([("connected", SimpleNamespace(observer="b", peers=[], read_only=""))])
+        self.assertEqual(checked(), (False, False))
+        monitor.inbox.put([("valve", SimpleNamespace(
+            commanded_duty_cycles=[0] * 8, main_valve_open=False, modbus_rtt_ms=1))])
+        self.assertEqual(checked(), (False, True))
+        self.assertFalse(any(b.isEnabled() for b in buttons))
+        w._btn_air_on.click()
+        self.assertTrue(monitor.commands.empty())
+        w._vehicles.setCurrentIndex(0)
+        self.assertEqual(checked(), (True, False))
+        link.changed.emit("disconnected")
+        self.assertEqual(checked(), (False, False))
+
+    def test_air_bearing_only_falls_back_to_health_with_fresh_actuators(self):
+        w = self.window
+        link = self.connect("first", 1)
+        health = dict(navigation_ok=True, navigation_degraded=False, navigation_age_sec=0.01,
+                      control_loop_rate_hz=50, modbus_rtt_ms=1, warnings=[], errors=[])
+
+        def report(opened, ready):
+            link.inbox.put([("health", SimpleNamespace(
+                **health, actuators_ok=ready, main_valve_open=opened))])
+            w._update()
+            return w._btn_air_on.isChecked(), w._btn_air_off.isChecked()
+
+        self.assertEqual(report(False, False), (False, False))
+        self.assertEqual(report(True, True), (True, False))
+        link.inbox.put([("valve", SimpleNamespace(
+            commanded_duty_cycles=[0] * 8, main_valve_open=False, modbus_rtt_ms=1))])
+        self.assertEqual(report(True, True), (False, True))
+        link.data._last_rx["valve"] -= self.ui.SOURCE_TIMEOUT_SEC + 1
+        self.assertEqual(report(True, False), (False, False))
+        self.assertEqual(report(False, True), (False, True))
+        link.data._last_rx["health"] -= self.ui.SOURCE_TIMEOUT_SEC + 1
+        w._update()
+        self.assertFalse(w._btn_air_off.isChecked())
+        self.assertFalse(w._btn_air_on.isChecked())
+
     def test_monitor_profile_blocks_commands_and_changes_mode_on_reconnect(self):
         self.window.add_jetson("observer", "operator", None, "", monitor_only=True)
         observer = self.window._links["observer"]
@@ -448,17 +514,11 @@ class MissionControlTest(unittest.TestCase):
             self.assertAlmostEqual(view.width() / 3, view.height() / 4)
             self.assertEqual(view.state["mouseEnabled"], [False, False])
 
-    def test_table_corner_marks_point_inward_below_trajectories(self):
-        marks = self.window._table_corners
-        self.assertLess(marks.zValue(), self.window._vicon_curve.zValue())
-        path = marks.path()
-        self.assertEqual(path.elementCount(), 12)
-        for i, (x, y) in enumerate(((0, 0), (0, 4), (3, 0), (3, 4))):
-            a, b, c = (path.elementAt(3 * i + j) for j in range(3))
-            self.assertTrue(a.isMoveTo())
-            self.assertEqual((b.x, b.y), (x, y))
-            self.assertEqual((a.y, c.x), (y, x))
-            self.assertTrue(0 < a.x < 3 and 0 < c.y < 4)
+    def test_table_perimeter_follows_table_edges_below_trajectories(self):
+        border = self.window._table_perimeter
+        self.assertEqual(border.rect().getRect(), (0, 0, 3, 4))
+        self.assertLess(border.zValue(), self.window._vicon_curve.zValue())
+        self.assertTrue(border.pen().isCosmetic())
 
     def test_ekf_only_does_not_draw_a_measured_pose(self):
         link = self.connect("vehicle", 1)

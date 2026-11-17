@@ -266,6 +266,7 @@ def serve():
                 peers = [name for name in node.get_node_names() if name.startswith("fss_mission_")]
                 emit("connected", {"observer": node.get_name(), "peers": peers,
                                    "workspace": os.getenv("FSS_MISSION_WORKSPACE"),
+                                   "private_arm": globals().get("private_arm", False),
                                    "read_only": globals().get("read_only", "")})
                 heartbeat = time.monotonic() + 1
             if select.select([sys.stdin], [], [], 0)[0]:

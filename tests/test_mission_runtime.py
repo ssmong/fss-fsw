@@ -11,7 +11,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from mission_ros import MissionActions
-from mission_runtime import HardwareBusy, local_service_owner, local_stacks, prepare_hardware, prepare_session, process_role
+from mission_runtime import (
+    PUBLIC, PRIVATE, PRIVATE_CPP, HardwareBusy, checkout_for, local_service_owner,
+    local_stacks, prepare_hardware, prepare_session, process_role, select_workspace,
+)
 
 
 class FlightCommands(unittest.TestCase):
@@ -81,56 +84,87 @@ class FlightCommands(unittest.TestCase):
 
 class Discovery(unittest.TestCase):
     def test_portable_overlay_selection_from_installs_and_live_processes(self):
-        from mission_runtime import PRIVATE, PUBLIC, select_workspace
-
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             proc = home / "proc"
             proc.mkdir()
             (home / PRIVATE / "install").mkdir(parents=True)
             (home / PRIVATE / "install/setup.bash").touch()
-            self.assertEqual(select_workspace(PUBLIC, home, proc), PRIVATE)
-            (home / PUBLIC / "install").mkdir(parents=True)
-            (home / PUBLIC / "install/setup.bash").touch()
+            with self.assertRaisesRegex(RuntimeError, "scripts/cpp_fsw.sh build"):
+                select_workspace(PRIVATE, home, proc)
+            self.assertEqual(select_workspace(PRIVATE, home, proc, monitor_only=True), PRIVATE)
+            for workspace in (PUBLIC, PRIVATE_CPP):
+                install = home / workspace / "install"
+                libdir = install / ("lib" if workspace == PRIVATE_CPP else "fss_gnc/lib") / "fss_gnc"
+                libdir.mkdir(parents=True)
+                (install / "local_setup.bash").touch()
+                gnc = libdir / "gnc_node"
+                gnc.write_bytes(b"#!/usr/bin/python3\n")
+                if workspace == PUBLIC:
+                    with self.assertRaisesRegex(RuntimeError, "colcon build"):
+                        select_workspace(PUBLIC, home, proc)
+                gnc.write_bytes(b"\x7fELF")
+                self.assertEqual(select_workspace(PRIVATE, home, proc), workspace)
             self.assertEqual(select_workspace(PUBLIC, home, proc), PUBLIC)
-            self.assertEqual(select_workspace(PRIVATE, home, proc), PRIVATE)
+            self.assertEqual(select_workspace(PRIVATE, home, proc), PRIVATE_CPP)
             child = proc / "99"
             child.mkdir()
-            (child / "cmdline").write_bytes(b"/home/smrl/FSS_FSW/install/fss_gnc/lib/fss_gnc/gnc_node\x00")
             (child / "environ").write_bytes(b"ROS_DOMAIN_ID=31\x00")
-            self.assertEqual(select_workspace(PUBLIC, home, proc), PRIVATE)
-            with patch.dict(os.environ, {"FSS_MISSION_PREFERRED": PRIVATE}):
-                self.assertEqual(local_stacks(proc)["flight"], [{"ROS_DOMAIN_ID": "31"}])
-            with patch.dict(os.environ, {"FSS_MISSION_PREFERRED": PUBLIC, "FSS_MISSION_WORKSPACE": PRIVATE}):
-                with patch("mission_runtime.local_stacks", return_value={"flight": [], "imu": []}), patch("mission_runtime.prepare_hardware") as start:
+            for active in (PUBLIC, PRIVATE_CPP, PRIVATE):
+                (child / "cmdline").write_bytes(f"/home/smrl/{active}/install/fss_gnc/lib/fss_gnc/gnc_node\0".encode())
+                self.assertEqual(select_workspace(PUBLIC, home, proc), active)
+                self.assertEqual(select_workspace(PRIVATE, home, proc), active)
+            with patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": PRIVATE}):
+                with patch("mission_runtime.local_stacks", side_effect=lambda: local_stacks(proc)), patch("mission_runtime.prepare_hardware") as start:
                     self.assertTrue(prepare_session()[1])
                     start.assert_not_called()
 
-    def test_private_checkout_keeps_foreign_experiment_and_public_stack_guards(self):
-        with patch.dict(os.environ, {"FSS_MISSION_PREFERRED": "FSS_FSW"}):
-            self.assertEqual(process_role(["/home/smrl/FSS_FSW/install/hardware_runtime/lib/hardware_runtime/arm_driver"]), "flight")
-            self.assertEqual(process_role(["/home/smrl/fss-fsw/install/fss_gnc/lib/fss_gnc/gnc_node"]), "competing")
-            self.assertEqual(process_role(["ros2", "launch", "self_tossing_hils", "paper_toss.launch.py"]), "competing")
-            self.assertEqual(process_role(["python3", "/home/smrl/self_tossing_hardware/scripts/run_arm_reference_ros.py"]), "competing")
-            self.assertIsNone(process_role(["python3", "/home/smrl/self_tossing_hardware/scripts/plot_arm_tracking.py"]))
+    def test_process_owners_and_overlay_launchers(self):
+        self.assertEqual(process_role(["/home/smrl/FSS_FSW/install/hardware_runtime/lib/hardware_runtime/arm_driver"]), "competing")
+        node = "/home/smrl/FSS_FSW/runtime/cpp/install/fss_gnc/lib/fss_gnc/gnc_node"
+        self.assertEqual(process_role([node], PRIVATE_CPP), "flight")
+        self.assertEqual(process_role([node], PUBLIC), "competing")
+        self.assertEqual(process_role(["python3", node + ".py"], PRIVATE_CPP), "competing")
+        self.assertEqual(process_role(["ros2", "launch", "self_tossing_hils", "paper_toss.launch.py"]), "competing")
+        self.assertEqual(process_role(["python3", "/home/smrl/self_tossing_hardware/scripts/run_arm_reference_ros.py"]), "competing")
+        self.assertIsNone(process_role(["python3", "/home/smrl/self_tossing_hardware/scripts/plot_arm_tracking.py"]))
+        launch = ["python3", "/opt/ros/humble/bin/ros2", "launch", "fss_bringup", "fss_full.launch.py"]
+        env = {"AMENT_PREFIX_PATH": "/home/smrl/FSS_FSW/runtime/cpp/install/fss_bringup:/opt/ros/humble"}
+        self.assertEqual(checkout_for(launch, env), PRIVATE_CPP)
+        self.assertEqual(process_role(launch, PRIVATE_CPP, env), "flight")
+        arm = ["ros2", "launch", "/home/smrl/FSS_FSW/runtime/cpp/arm.launch.py", "use_sim:=false"]
+        self.assertEqual(checkout_for(arm, {}), PRIVATE_CPP)
+        self.assertEqual(process_role(arm, PRIVATE_CPP, {}), "competing")
+        base = ["ros2", "launch", "/home/smrl/FSS_FSW/runtime/cpp/base.launch.py", "use_sim:=false"]
+        self.assertEqual(process_role(base, PRIVATE_CPP, env), "flight")
+        self.assertEqual(checkout_for(base, {"AMENT_PREFIX_PATH": "/home/smrl/fss-fsw/install/fss_gnc"}), PUBLIC)
 
-    def test_private_bringup_owns_vendor_imu(self):
-        for existing_imu in ([], [{}]):
+    def test_nested_native_bringup_uses_pinned_source_and_reuses_isolated_vendor_imu(self):
+        for existing_imu in ([], [{"ROS_LOCALHOST_ONLY": "1"}], [{}]):
             with self.subTest(existing_imu=existing_imu), tempfile.TemporaryDirectory() as tmp:
                 home = Path(tmp)
-                (home / "FSS_FSW").mkdir()
+                work = home / PRIVATE_CPP / "source"
+                work.mkdir(parents=True)
+                (work.parent / "base.launch.py").touch()
+                vendor = home / "xsens_mti_ros2_driver/install/setup.bash"
+                vendor.parent.mkdir(parents=True)
+                vendor.touch()
                 with (patch.object(Path, "home", return_value=home),
-                      patch.dict(os.environ, {"FSS_MISSION_PREFERRED": "FSS_FSW", "FSS_MISSION_WORKSPACE": "FSS_FSW"}),
+                      patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": PRIVATE_CPP}),
                       patch.dict(sys.modules, fcntl=SimpleNamespace(LOCK_EX=2, flock=lambda *_: None)),
                       patch("mission_runtime.local_stacks", return_value={"flight": [], "imu": existing_imu}),
                       patch("mission_runtime.time.sleep"), patch("mission_runtime.subprocess.Popen") as spawn):
                     spawn.return_value.poll.return_value = None
-                    prepare_hardware()
-                    self.assertEqual(spawn.call_count, 1)
-                    command = spawn.call_args.args[0]
-                    self.assertEqual(command[:4], ["ros2", "launch", "fss_bringup", "fss_full.launch.py"])
-                    self.assertEqual(command[4:], ["start_imu_driver:=false"] if existing_imu else [])
-                    self.assertEqual(spawn.call_args.kwargs["cwd"], home / "FSS_FSW")
+                    _, reason = prepare_session()
+                    if existing_imu == [{}]:
+                        self.assertTrue(reason)
+                        spawn.assert_not_called()
+                    else:
+                        self.assertFalse(reason)
+                        commands = [call.args[0] for call in spawn.call_args_list]
+                        self.assertEqual(commands[-1], ["ros2", "launch", str(work.parent / "base.launch.py"), "use_sim:=false"])
+                        self.assertEqual(commands[:-1], [] if existing_imu else [["bash", "scripts/launch/start_imu.sh"]])
+                        self.assertTrue(all(call.kwargs["cwd"] == work for call in spawn.call_args_list))
 
     def test_explicit_monitor_on_an_unused_host_never_starts_flight_or_imu(self):
         with (patch("mission_runtime.local_stacks", return_value={"flight": [], "imu": []}),
@@ -141,6 +175,46 @@ class Discovery(unittest.TestCase):
             self.assertTrue(reason)
             hardware.assert_not_called()
             spawn.assert_not_called()
+
+    def test_mismatched_discovery_profiles_cannot_start_or_attach_for_commands(self):
+        peers = [{"ROS_DOMAIN_ID": "8", "CYCLONEDDS_URI": uri} for uri in ("file:///a", "file:///b")]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)):
+            with (patch.dict(sys.modules, fcntl=SimpleNamespace(LOCK_EX=2, flock=lambda *_: None)),
+                  patch("mission_runtime.local_stacks", return_value={"flight": peers, "imu": []}),
+                  patch("mission_runtime.subprocess.Popen") as spawn):
+                with self.assertRaisesRegex(RuntimeError, "서로 다른 ROS 환경"):
+                    prepare_session()
+                spawn.assert_not_called()
+
+    def test_standalone_native_on_private_host_requires_lab_profile_for_startup_and_commands(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)):
+            home = Path(tmp)
+            proc = home / "proc"
+            proc.mkdir()
+            with (patch.dict(os.environ, {"FSS_MISSION_PREFERRED": PRIVATE, "FSS_MISSION_WORKSPACE": PUBLIC}),
+                  patch.dict(sys.modules, fcntl=SimpleNamespace(LOCK_EX=2, flock=lambda *_: None)),
+                  patch("mission_runtime.local_stacks", side_effect=lambda: local_stacks(proc)),
+                  patch("mission_runtime.time.sleep"), patch("mission_runtime.subprocess.Popen") as spawn):
+                with self.assertRaisesRegex(RuntimeError, "scripts/cpp_fsw.sh build"):
+                    prepare_session()
+                spawn.assert_not_called()
+                child = proc / "41"
+                child.mkdir()
+                (child / "cmdline").write_bytes(b"/home/smrl/fss-fsw/install/fss_manager/lib/fss_manager/manager_node\0")
+                (child / "environ").write_bytes(b"ROS_DOMAIN_ID=0\0")
+                self.assertTrue(prepare_session()[1])
+                self.assertFalse(local_service_owner("manager_node", proc))
+                spawn.assert_not_called()
+                profile = home / PRIVATE_CPP / "base.launch.py"
+                profile.parent.mkdir(parents=True)
+                profile.touch()
+                launch = proc / "42"
+                launch.mkdir()
+                (launch / "cmdline").write_bytes(f"ros2\0launch\0{profile.as_posix()}\0use_sim:=false\0".encode())
+                (launch / "environ").write_bytes(b"AMENT_PREFIX_PATH=/home/smrl/fss-fsw/install\0")
+                self.assertTrue(local_service_owner("manager_node", proc))
+                self.assertFalse(prepare_session()[1])
+                spawn.assert_not_called()
 
     def test_legacy_stack_blocks_hardware_and_commands_without_capture_executor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -193,20 +267,20 @@ class Discovery(unittest.TestCase):
                 self.assertEqual(prepare_hardware(), "기존 기체 소프트웨어 연결")
                 self.assertEqual([args.args[0] for args in popen.call_args_list],
                                  [["bash", "scripts/launch/start_imu.sh"],
-                                  ["ros2", "launch", "fss_bringup", "fss_full.launch.py"]])
+                                  ["ros2", "launch", "fss_bringup", "fss_full.launch.py", "gnc_backend:=cpp"]])
                 self.assertEqual(os.environ["ROS_LOCALHOST_ONLY"], "1")
 
     def test_match_launch_argv_not_python_source_or_shell_text(self):
         self.assertIsNone(process_role(["python3", "-c", "ros2 launch self_tossing_hils"]))
         self.assertEqual(process_role(["/usr/bin/python3", "/opt/ros/humble/bin/ros2", "launch",
                                        "self_tossing_hils", "paper_toss.launch.py"]), "competing")
-        self.assertEqual(process_role(["/work/install/fss_gnc/lib/fss_gnc/gnc_node"]), "flight")
+        self.assertEqual(process_role(["/work/install/fss_gnc/lib/fss_gnc/gnc_node"]), "competing")
 
     def test_local_environment_and_competing_experiment(self):
         with tempfile.TemporaryDirectory() as tmp:
             process = Path(tmp) / "140"
             process.mkdir()
-            (process / "cmdline").write_bytes(b"/bin/manager_node\0--ros-args\0")
+            (process / "cmdline").write_bytes(b"/home/smrl/fss-fsw/install/fss_manager/lib/fss_manager/manager_node\0--ros-args\0")
             (process / "environ").write_bytes(b"ROS_DOMAIN_ID=7\0IGNORED=secret\0")
             self.assertEqual(local_stacks(Path(tmp))["flight"], [{"ROS_DOMAIN_ID": "7"}])
             with patch.dict(os.environ, {"ROS_DOMAIN_ID": "7", "ROS_LOCALHOST_ONLY": "0"}):

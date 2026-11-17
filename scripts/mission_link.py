@@ -37,6 +37,7 @@ class JetsonLink(QObject):
         self.bridge_error = ""
         self.monitor_only = monitor_only
         self.workspace = None
+        self.private_arm = False
         self.read_only = "모니터링 전용" if monitor_only else ""
         self.observer = None
         self.peers = ()
@@ -71,6 +72,7 @@ class JetsonLink(QObject):
                         self.observer = value.observer
                         self.peers = value.peers
                         self.workspace = getattr(value, "workspace", None)
+                        self.private_arm = getattr(value, "private_arm", False)
                         self.read_only = getattr(value, "read_only", "") or (
                             "모니터링 전용" if self.monitor_only else "")
                 elif name == "bridge_error":
@@ -142,12 +144,17 @@ class JetsonLink(QObject):
         runtime = Path(__file__).with_name("mission_runtime.py").read_text(encoding="utf-8")
         domain = None if domain is None else int(domain)
         code = (runtime + f"\nstartup_status, read_only = prepare_session({bool(self.monitor_only)!r}, {domain!r})\n"
+                + "private_arm = private_base() is not None\n"
                 + code)
         preferred = PREFERRED_WORKSPACE
-        select = runtime + f"\nprint(select_workspace({preferred!r}))\n"
+        select = runtime + f"\nprint(select_workspace({preferred!r}, monitor_only={bool(self.monitor_only)!r}))\n"
+        # Native processes must not resolve a missing package from a legacy underlay.
         cmd = (f"export FSS_MISSION_PREFERRED={shlex.quote(preferred)} && "
                f"FSS_MISSION_WORKSPACE=$(python3 -c {shlex.quote(select)}) && export FSS_MISSION_WORKSPACE && "
-               'source /opt/ros/humble/setup.bash && source "$HOME/$FSS_MISSION_WORKSPACE/install/setup.bash" '
+               'if [[ "$FSS_MISSION_WORKSPACE" == FSS_FSW ]]; then setup=setup.bash; '
+               'else unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH ROS_PACKAGE_PATH PYTHONPATH LD_LIBRARY_PATH FSS_CONFIG_DIR; '
+               'setup=local_setup.bash; fi && '
+               'source /opt/ros/humble/setup.bash && source "$HOME/$FSS_MISSION_WORKSPACE/install/$setup" '
                f"&& exec python3 -u -c {shlex.quote(code)}")
         with client.get_transport().open_session(timeout=8) as ch:
             ch.exec_command("bash -c " + shlex.quote(cmd))

@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QCoreApplication, QEvent, QLocale, QRectF, QSettings, QTimer, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QFontDatabase, QFontMetricsF, QPainterPath, QTransform
+from PySide6.QtGui import QBrush, QColor, QFont, QFontDatabase, QFontMetricsF, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -383,7 +383,8 @@ class DashboardNode:
         self.mode_name = "NO DATA"
         self.navigation_ok = False
         self.actuators_ok = False
-        self.main_valve_open = False
+        self._driver_air_open = None
+        self._health_air_open = None
         self.navigation_degraded = False
         self.navigation_age_sec = math.inf
         self.control_loop_rate_hz = 0.0
@@ -445,8 +446,15 @@ class DashboardNode:
             "nav": health_fresh and ekf_fresh and self.navigation_ok
             and not self.navigation_degraded,
             "act": health_fresh and self.actuators_ok,
-            "main_valve": self.main_valve_open,
+            "main_valve": self.reported_air_state() is True,
         }
+
+    def reported_air_state(self):
+        if self.source_age("valve") <= SOURCE_TIMEOUT_SEC:
+            return self._driver_air_open
+        if self.actuators_ok and self.source_age("health") <= SOURCE_TIMEOUT_SEC:
+            return self._health_air_open
+        return None
 
     def source_age(self, source: str) -> float:
         """마지막 토픽 수신 이후 경과 시간을 wall-clock 기준으로 반환한다."""
@@ -567,7 +575,7 @@ class DashboardNode:
 
     def _cb_valve(self, msg) -> None:
         self.valve_cmd = list(msg.commanded_duty_cycles)
-        self.main_valve_open = msg.main_valve_open
+        self._driver_air_open = msg.main_valve_open
         self.modbus_rtt_ms = msg.modbus_rtt_ms
         self._mark_rx("valve")
 
@@ -608,7 +616,7 @@ class DashboardNode:
     def _cb_health(self, msg) -> None:
         self.navigation_ok = msg.navigation_ok
         self.actuators_ok = msg.actuators_ok
-        self.main_valve_open = msg.main_valve_open
+        self._health_air_open = msg.main_valve_open
         self.navigation_degraded = msg.navigation_degraded
         self.navigation_age_sec = msg.navigation_age_sec
         self.control_loop_rate_hz = msg.control_loop_rate_hz
@@ -706,6 +714,12 @@ class ReadinessLight(QFrame):
         )
 
 
+class AirBearingButton(QPushButton):
+    def nextCheckState(self):
+        # Only the telemetry update may select a state, including after a service reply.
+        pass
+
+
 class TargetCoordinate(QDoubleSpinBox):
     """Select the previous coordinate on the first click; later clicks move the cursor."""
 
@@ -799,6 +813,10 @@ class Dashboard(QMainWindow):
             QPushButton#emergencyStop:pressed {{ background:{C_ERROR}; color:{C_PANEL}; }}
             QPushButton:disabled, QPushButton#sendTarget:disabled, QPushButton#emergencyStop:disabled {{
                 background:{C_PANEL_ALT}; color:{C_IDLE}; border-color:{C_BORDER}; }}
+            QPushButton#airOn:checked, QPushButton#airOn:checked:disabled {{
+                background:{C_OK}; color:{C_PANEL}; border-color:{C_OK}; font-weight:600; }}
+            QPushButton#airOff:checked, QPushButton#airOff:checked:disabled {{
+                background:{C_TEXT_DIM}; color:{C_PANEL}; border-color:{C_TEXT_DIM}; font-weight:600; }}
             QAbstractItemView {{ background:{C_PANEL}; color:{C_TEXT};
                                  selection-background-color:{C_INFO}; selection-color:{C_PANEL}; }}
             """
@@ -1230,8 +1248,12 @@ class Dashboard(QMainWindow):
             commands.addWidget(button)
         commands.addStretch()
         commands.addWidget(QLabel("에어베어링"))
-        self._btn_air_on = QPushButton("ON")
-        self._btn_air_off = QPushButton("OFF")
+        self._btn_air_on = AirBearingButton("ON")
+        self._btn_air_off = AirBearingButton("OFF")
+        self._btn_air_on.setObjectName("airOn")
+        self._btn_air_off.setObjectName("airOff")
+        self._btn_air_on.setCheckable(True)
+        self._btn_air_off.setCheckable(True)
         self._btn_air_on.clicked.connect(lambda: self._node.request_main_valve(True))
         self._btn_air_off.clicked.connect(lambda: self._node.request_main_valve(False))
         commands.addWidget(self._btn_air_on)
@@ -1350,20 +1372,14 @@ class Dashboard(QMainWindow):
             grid_y=False,
         )
         grid_pen = pg.mkPen(C_BORDER)
-        for x in (0.5, 1, 1.5, 2, 2.5, 3):
+        for x in (0.5, 1, 1.5, 2, 2.5):
             self._xy_plot.addLine(x=x, pen=grid_pen).setZValue(-2)
-        for y in (0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4):
+        for y in (0.5, 1, 1.5, 2, 2.5, 3, 3.5):
             self._xy_plot.addLine(y=y, pen=grid_pen).setZValue(-2)
-        corners = QPainterPath()
-        for x, dx in ((0, 0.18), (3, -0.18)):
-            for y, dy in ((0, 0.18), (4, -0.18)):
-                corners.moveTo(x + dx, y)
-                corners.lineTo(x, y)
-                corners.lineTo(x, y + dy)
-        self._table_corners = pg.QtWidgets.QGraphicsPathItem(corners)
-        self._table_corners.setPen(pg.mkPen(C_TEXT_DIM, width=8))
-        self._table_corners.setZValue(-1)
-        self._xy_plot.addItem(self._table_corners, ignoreBounds=True)
+        self._table_perimeter = pg.QtWidgets.QGraphicsRectItem(0, 0, 3, 4)
+        self._table_perimeter.setPen(pg.mkPen(C_TEXT_DIM, width=8))
+        self._table_perimeter.setZValue(-1)
+        self._xy_plot.addItem(self._table_perimeter, ignoreBounds=True)
         self._xy_plot.setTitle(None)
         self._plan_curve = self._xy_plot.plot(pen=pg.mkPen("#b9b9c0", width=1.5, style=Qt.DashLine))
         self._elapsed_plan_curve = self._xy_plot.plot(pen=pg.mkPen("#cc302d", width=2.4, style=Qt.DashLine))
@@ -1477,10 +1493,12 @@ class Dashboard(QMainWindow):
         self._gripper_link.setData(xs, ys, pen=pg.mkPen(tip_color, width=3))
         selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
         workspace = (selected.workspace or PREFERRED_WORKSPACE) if selected else PREFERRED_WORKSPACE
-        legacy = workspace == "FSS_FSW" or bool(selected and "hardware_runtime" in selected.read_only)
-        self._cad_choice.setVisible(bool(joints and not base and not legacy))
+        private_arm = workspace.split("/", 1)[0] == "FSS_FSW" or bool(selected and (
+            getattr(selected, "private_arm", False) or "FSS_FSW" in selected.read_only
+            or "hardware_runtime" in selected.read_only))
+        self._cad_choice.setVisible(bool(joints and not base and not private_arm))
         self._cad_choice.setChecked(node.arm_local_cad)
-        use_cad = joints and node.arm_local_cad and not legacy
+        use_cad = joints and node.arm_local_cad and not private_arm
         detail = base or (encoder_model(joints) if use_cad else None)
         age_detail = age_base if base else age_joints
         self._draw_arm(self._arm_model, detail, age_detail)
@@ -1722,7 +1740,7 @@ class Dashboard(QMainWindow):
         label.setText(text)
         label.setStyleSheet(f"color:{color}; border:none;")
 
-    def _update_status_cards(self) -> None:
+    def _update_status_cards(self, air_state) -> None:
         node = self._node
 
         if node.source_age("mode") > SOURCE_TIMEOUT_SEC:
@@ -1755,9 +1773,9 @@ class Dashboard(QMainWindow):
         else:
             self._card_act.set_status("FAULT", "밸브/PLC 상태 확인", C_ERROR)
 
-        if not valve_fresh:
+        if air_state is None:
             self._card_main.set_status("NO DATA", "밸브 상태 미수신", C_ERROR)
-        elif node.main_valve_open:
+        elif air_state:
             self._card_main.set_status("ON", "에어베어링 공급", C_OK)
         else:
             color = C_ERROR if node.mode_name in ("READY", "ACTIVE") else C_IDLE
@@ -1946,7 +1964,7 @@ class Dashboard(QMainWindow):
         self._log_text.setHtml("<br>".join(visible))
         scrollbar.setValue(scrollbar.maximum() if follow else old_position)
 
-    def _update_controls(self, writable: bool) -> None:
+    def _update_controls(self, writable: bool, air_state) -> None:
         """준비도 등 + 버튼 활성/비활성 + 명령 상태를 갱신한다."""
         node = self._node
         ready = node.readiness()
@@ -1974,7 +1992,9 @@ class Dashboard(QMainWindow):
         else:
             self._lights["act"].set_state(C_ERROR, "미수신")
         armed_mode = node.mode_name in ("READY", "ACTIVE")
-        if node.main_valve_open:
+        if air_state is None:
+            self._lights["main_valve"].set_state(C_IDLE, "미수신")
+        elif air_state:
             self._lights["main_valve"].set_state(C_OK, "ON")
         else:
             self._lights["main_valve"].set_state(
@@ -1983,6 +2003,8 @@ class Dashboard(QMainWindow):
 
         self._btn_air_on.setEnabled(writable and mode_fresh and node.mode_name not in ("EMERGENCY_STOP", "SAFE_HOLD", "NO DATA"))
         self._btn_air_off.setEnabled(writable and node.mode_name != "NO DATA")
+        self._btn_air_on.setChecked(air_state is True)
+        self._btn_air_off.setChecked(air_state is False)
 
         if node.last_command_msg:
             self._command_status.setText(node.last_command_msg)
@@ -2061,8 +2083,9 @@ class Dashboard(QMainWindow):
                 summary += f"    거리 차  {error:.3f} m"
             self._position_summary.setText(summary)
         self._position_summary.setVisible(target)
-        self._update_status_cards()
-        self._update_controls(enabled)
+        air_state = node.reported_air_state() if selected is None or (selected.ready and not selected.stopped.is_set()) else None
+        self._update_status_cards(air_state)
+        self._update_controls(enabled, air_state)
         if shared_domain:
             self._command_status.setText("공유 ROS 도메인 · 기체별 도메인을 지정하세요")
         elif not self._node.last_command_msg:

@@ -90,14 +90,19 @@ class ArmPlotTest(unittest.TestCase):
             self.assertIsNone(window._arm_model.xData)
             self.assertTrue(window._cad_choice.isHidden())
         key = window._vehicles.tabData(window._vehicles.currentIndex())
-        with patch.dict(window._links, {key: NS(workspace="FSS_FSW", read_only="")}), patch.object(self.ui, "PREFERRED_WORKSPACE", "fss-fsw"):
-            window._update_arm()
-            self.assertIsNone(window._arm_model.xData)
-            self.assertTrue(window._cad_choice.isHidden())
-            node._cb_arm_base(NS(header=NS(frame_id="base_link", stamp=NS(sec=2, nanosec=0)),
-                                 poses=[pose(i, 0) for i in range(4)]))
-            window._update_arm()
-            self.assertEqual(window._arm_model.xData.tolist(), [0, 1, 2, 3])
+        for workspace, reason, private_arm in (("FSS_FSW", "", False), ("FSS_FSW/runtime/cpp", "", False),
+                                               ("fss-fsw", "FSS_FSW/runtime/cpp 사용 중 · 모니터링만 가능", False),
+                                               ("fss-fsw", "", True)):
+            link = NS(workspace=workspace, read_only=reason, private_arm=private_arm)
+            with self.subTest(workspace=workspace), patch.dict(window._links, {key: link}), patch.object(self.ui, "PREFERRED_WORKSPACE", "fss-fsw"):
+                window._update_arm()
+                self.assertIsNone(window._arm_model.xData)
+                self.assertTrue(window._cad_choice.isHidden())
+                node._cb_arm_base(NS(header=NS(frame_id="base_link", stamp=NS(sec=2, nanosec=0)),
+                                     poses=[pose(0, -i) for i in range(4)]))
+                window._update_arm()
+                self.assertEqual(window._arm_model.yData.tolist(), [0, -1, -2, -3])
+                node.arm_base = None
 
     def test_frames_source_expiry_and_tcp_trail(self):
         node, window = self.node, self.window
