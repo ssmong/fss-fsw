@@ -359,6 +359,16 @@ class MissionControlTest(unittest.TestCase):
         self.assertIsNone(w._vehicles.tabButton(0, self.ui.QTabBar.RightSide))
         self.assertTrue(w._toss_alignment.isVisible())
         self.assertIn("-2.0 mm", w._toss_alignment.text())
+        for phase in ("STOPPED", "MISSED"):
+            link.inbox.put([("paper_status", SimpleNamespace(**dict(report, phase=phase, fss_gripper="OPEN")))])
+            w._update()
+            self.assertTrue(w._toss_alignment.isVisible())
+            self.assertIn("-2.0 mm", w._toss_alignment.text())
+            self.assertEqual(w._toss_buttons["toss_start"].text(), "파지 후 출발")
+        link.inbox.put([("paper_status", SimpleNamespace(**dict(report, phase="STOPPED",
+                          grasp_guide="Waiting for fresh TCP pose")))])
+        w._update()
+        self.assertEqual(w._toss_alignment.text(), "파지점 수신 대기")
         link.data._last_rx["paper_status"] -= self.ui.SOURCE_TIMEOUT_SEC + 1
         w._update()
         self.assertFalse(w._toss_alignment.isVisible())

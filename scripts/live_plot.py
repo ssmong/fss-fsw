@@ -649,6 +649,7 @@ class DashboardNode:
             return
         if phase != self.toss_phase:
             phases = {"IDLE": "대기", "WAITING_FOR_A": "시작 파지점 정렬 대기", "PREPARING": "준비 중",
+                      "WAITING_FOR_MANUAL_CLOSE": "수동 파지 대기", "CLOSING_AT_A": "시작점 파지 중",
                       "A_HELD": "시작 파지점 고정",
                       "LAUNCH": "발사 구간", "COAST": "자유 이동", "CAPTURING": "캡처 진입",
                       "CLOSING": "파지 중", "LOCAL_BRAKE": "제동 중", "PLANNED_BRAKE": "계획 제동",
@@ -675,6 +676,8 @@ class DashboardNode:
             self.toss_alignment = "시작 파지점 정렬 완료"
             if not self.toss_aligned:
                 self.append_log(self.toss_alignment)
+        elif guide == "Waiting for fresh TCP pose":
+            self.toss_alignment = "파지점 수신 대기"
         elif isinstance(guide, str) and guide.startswith("Move TCP (table):"):
             error = data.get("launch_pose_error")
             if (isinstance(error, (list, tuple)) and len(error) == 3 and
@@ -1538,7 +1541,7 @@ class Dashboard(QMainWindow):
     def _live_toss_alignment(self, link):
         node = self._node
         if (node.toss_alignment and node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
-                and node.toss_phase in ("IDLE", "WAITING_FOR_A")
+                and node.toss_phase in ("IDLE", "WAITING_FOR_A", "STOPPED", "MISSED")
                 and (link is None or (link.ready and not link.stopped.is_set() and not link.bridge_error))):
             return node.toss_alignment
         return ""
@@ -1563,6 +1566,12 @@ class Dashboard(QMainWindow):
         if self._toss_method.currentText() == "위치 제어":
             prepare.setEnabled(body)
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
+        start = self._toss_buttons["toss_start"]
+        grasp_first = (phase_fresh and self._node.toss_phase in ("IDLE", "STOPPED", "MISSED")
+                       and self._node.toss_gripper in ("IDLE", "STOPPED", "OPEN", "OPEN_PASSIVE"))
+        start.setText("파지 후 출발" if grasp_first else "출발")
+        start.setToolTip("시작 위치·Yaw에 도달하면 자동으로 파지하고 출발합니다." if grasp_first
+                         else "실험 실행기에 출발을 요청합니다.")
         choosing = not phase_fresh or self._toss_method.isEnabled()
         self._toss_method.setVisible(choosing)
         self._toss_options.setVisible(choosing and self._toss_method.currentText() != "위치 제어")
