@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QLayout,
-    QScrollArea,
+    QSizePolicy,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -808,31 +808,21 @@ class Dashboard(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(17, 12, 17, 17)
-        root.setSpacing(12)
+        root.setSpacing(8)
 
         root.addLayout(self._build_connections())
         views = QStackedWidget()
         overview = QWidget()
         panels = QHBoxLayout(overview)
-        panels.setContentsMargins(12, 12, 12, 12)
+        panels.setContentsMargins(12, 6, 12, 6)
         panels.setSpacing(12)
         panels.addWidget(self._build_trajectory_panel(), stretch=1)
         sidebar = QVBoxLayout()
-        tools = QWidget()
-        tool_layout = QVBoxLayout(tools)
-        tool_layout.setSizeConstraint(QLayout.SetMinAndMaxSize)
-        tool_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar.setSpacing(6)
         self._controls = self._build_control_bar()
-        tool_layout.addWidget(self._controls)
-        tool_layout.addWidget(self._build_valve_plot())
-        scroll = QScrollArea()
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setSizeAdjustPolicy(QScrollArea.AdjustToContents)
-        scroll.setWidget(tools)
-        scroll.setMaximumHeight(tool_layout.sizeHint().height())
-        sidebar.addWidget(scroll, stretch=1)
+        self._controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        sidebar.addWidget(self._controls)
+        sidebar.addWidget(self._build_valve_plot())
         console_row = QHBoxLayout()
         self._console_tabs = QTabBar()
         self._console_tabs.setExpanding(False)
@@ -851,7 +841,8 @@ class Dashboard(QMainWindow):
         self._console = QStackedWidget()
         self._terminal = TerminalView()
         self._console.addWidget(self._terminal)
-        sidebar.addWidget(self._console, stretch=2)
+        self._console.setMinimumHeight(90)
+        sidebar.addWidget(self._console, stretch=1)
         panels.addLayout(sidebar, stretch=1)
         views.addWidget(overview)
         self._tabs = self._build_detail_tabs()
@@ -895,8 +886,6 @@ class Dashboard(QMainWindow):
         self._experiment_button.setToolTip("선택한 FSS 데이터 기록")
         self._experiment_button.clicked.connect(self._toggle_experiment)
         footer.addWidget(self._experiment_button)
-        self._sensors = QLabel()
-        footer.addWidget(self._sensors)
         detail_button = QPushButton("상세")
         detail_button.setCheckable(True)
         detail_button.toggled.connect(lambda show: views.setCurrentIndex(int(show)))
@@ -1224,11 +1213,13 @@ class Dashboard(QMainWindow):
         bar = QFrame()
         bar.setObjectName("panel")
         layout = QVBoxLayout(bar)
-        layout.setContentsMargins(8, 5, 8, 5)
-        layout.setSpacing(3)
-        bar.setStyleSheet("QPushButton {padding: 2px 7px;} QDoubleSpinBox {padding: 2px 4px;}")
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
+        layout.setContentsMargins(12, 9, 12, 10)
+        layout.setSpacing(6)
+        bar.setStyleSheet("QPushButton {border-radius:10px; min-height:22px; padding:3px 9px;}"
+                          "QDoubleSpinBox {border-radius:10px; min-height:22px; padding:3px 6px;}")
         commands = QHBoxLayout()
-        commands.setSpacing(3)
+        commands.setSpacing(6)
         commands.addWidget(QLabel("제어기"))
         self._controller = QButtonGroup(bar)
         for index, label in enumerate(("PID", "LQR")):
@@ -1248,8 +1239,8 @@ class Dashboard(QMainWindow):
         layout.addLayout(commands)
 
         targets = QGridLayout()
-        targets.setVerticalSpacing(0)
-        targets.setHorizontalSpacing(3)
+        targets.setVerticalSpacing(2)
+        targets.setHorizontalSpacing(6)
         self._target_x, self._target_y, self._target_yaw = (TargetCoordinate() for _ in range(3))
         for col, (field, label, low, high, decimals, step) in enumerate((
             (self._target_x, "X (m)", 0, 3, 3, 0.01),
@@ -1265,6 +1256,7 @@ class Dashboard(QMainWindow):
             caption.setBuddy(field)
             targets.addWidget(caption, 0, col)
             targets.addWidget(field, 1, col)
+            targets.setColumnStretch(col, 1)
         self._send_target_button = QPushButton("목표 전송")
         self._send_target_button.setObjectName("sendTarget")
         self._send_target_button.clicked.connect(self._send_target)
@@ -1277,14 +1269,24 @@ class Dashboard(QMainWindow):
         return bar
 
     def _build_valve_plot(self):
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        layout = QVBoxLayout(panel)
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
+        layout.setContentsMargins(12, 8, 12, 7)
+        layout.setSpacing(2)
+        layout.addWidget(QLabel("밸브 명령"))
         plot = pg.PlotWidget()
-        plot.setMaximumHeight(155)
-        plot.setMinimumHeight(105)
+        plot.setFixedHeight(max(88, 5 * self.fontMetrics().height()))
         plot.setXRange(0.5, 8.5, padding=0)
         plot.setYRange(0, 1, padding=0)
         plot.setMouseEnabled(x=False, y=False)
         plot.hideButtons()
-        _style_plot(plot, "밸브 명령", grid_x=False, grid_y=False)
+        _style_plot(plot, "", grid_x=False, grid_y=False)
+        plot.setTitle(None)
+        plot.plotItem.layout.setContentsMargins(0, self.fontMetrics().height() / 2 + 1, 1, 1)
+        plot.getAxis("bottom").setHeight(self.fontMetrics().height() + 8)
         plot.getAxis("left").setStyle(hideOverlappingLabels=False)
         for value in (0.5, 1):
             plot.addLine(y=value, pen=pg.mkPen(C_BORDER))
@@ -1293,7 +1295,8 @@ class Dashboard(QMainWindow):
         plot.getAxis("bottom").setTicks([[(int(ch), str(ch)) for ch in channels]])
         self._valve_cmd_bar = pg.BarGraphItem(x=channels, height=np.zeros(8), width=0.65, brush=C_INFO, pen=pg.mkPen(None))
         plot.addItem(self._valve_cmd_bar)
-        return plot
+        layout.addWidget(plot)
+        return panel
 
     def _build_readiness_panel(self) -> QWidget:
         panel = QFrame()
@@ -2058,11 +2061,6 @@ class Dashboard(QMainWindow):
                 summary += f"    거리 차  {error:.3f} m"
             self._position_summary.setText(summary)
         self._position_summary.setVisible(target)
-        ready = node.readiness()
-        self._sensors.setText(" &nbsp; ".join(
-            f'<span style="color:{C_OK if ready[key] else C_IDLE}">●</span> {label}'
-            for key, label in (("vicon", "Vicon"), ("imu", "IMU"), ("nav", "항법"))
-        ))
         self._update_status_cards()
         self._update_controls(enabled)
         if shared_domain:

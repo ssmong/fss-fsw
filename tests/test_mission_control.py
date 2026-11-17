@@ -100,7 +100,6 @@ class MissionControlTest(unittest.TestCase):
             self.assertEqual(w._read_target(), ("PID", 1.25, 3.456, -73.5))
             self.assertFalse(w._send_target_button.isEnabled())
             self.assertLess(w._controls.height(), 110)
-            self.assertGreater(w._console.height(), w._controls.height() * 2)
             controls = [w._target_x, w._target_y, w._target_yaw, w._send_target_button,
                         w._controller.button(0), w._controller.button(1), w._btn_air_on, w._btn_air_off]
             rectangles = [button.rect().translated(button.mapTo(w._controls, QPoint())) for button in controls]
@@ -470,6 +469,27 @@ class MissionControlTest(unittest.TestCase):
         self.window._update()
         self.assertIsNone(self.window._vicon_curve.xData)
         self.assertFalse(self.window._spacecraft_body.isVisible())
+
+    def test_console_grows_after_controls_and_valve_axes_fit(self):
+        from PySide6.QtCore import QPoint
+
+        w = self.window
+        w.show()
+        terminal_heights = []
+        for width, height in ((840, 520), (1200, 760)):
+            w.resize(width, height)
+            self.app.processEvents()
+            plot = w._valve_cmd_bar.getViewWidget()
+            panel = plot.parentWidget()
+            self.assertGreaterEqual(w._controls.height(), w._controls.minimumSizeHint().height())
+            self.assertGreaterEqual(panel.height(), panel.minimumSizeHint().height())
+            self.assertTrue(panel.rect().contains(plot.geometry()))
+            self.assertLess(panel.mapTo(w, panel.rect().bottomLeft()).y(),
+                            w._console_tabs.mapTo(w, QPoint()).y())
+            self.assertGreaterEqual(w._console.height(), 90)
+            terminal_heights.append(w._console.height())
+        self.assertGreater(terminal_heights[1], terminal_heights[0])
+        self.assertGreater(terminal_heights[1], w._controls.height() * 2)
 
 
 if __name__ == "__main__":
