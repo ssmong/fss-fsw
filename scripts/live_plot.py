@@ -1737,7 +1737,6 @@ class Dashboard(QMainWindow):
     def _update_toss_controls(self, link):
         for action, button in self._toss_buttons.items():
             button.setEnabled(bool(self._can_send_toss(link, action)))
-        run = self._toss_buttons["toss_run"]
         active = self._node.active_plan_key()
         bound = bool(active and self._node.toss_phase not in ("STOPPED", "MISSED", "FAULT"))
         method = active.rsplit("/", 1)[-1] if bound else self._node.toss_method
@@ -1748,7 +1747,7 @@ class Dashboard(QMainWindow):
         self._toss_method.setToolTip("현재 실험의 경로" if bound else "실험 경로 미리보기")
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
         self._toss_method.setVisible(True)
-        self._toss_options.setEnabled(run.isEnabled())
+        self._toss_options.setEnabled(not bound)
         gripper = "Gripper —"
         if (self._node.arm_equipped and self._node.arm_tcp is not None
                 and self._node.source_age("arm_tcp") < ARM_TIMEOUT_SEC):
@@ -1757,6 +1756,11 @@ class Dashboard(QMainWindow):
         self._toss_gripper_position.setText(gripper)
         if not link or not link.ready or link.stopped.is_set() or link.bridge_error:
             status = "연결 대기"
+        elif link.read_only:
+            status = link.read_only
+        elif (link.workflow != "toss"
+              and time.monotonic() - link.last_body_status_at <= SOURCE_TIMEOUT_SEC):
+            status = "위치제어 본체 종료 후 toss_fss"
         elif phase_fresh:
             plan = self._node.active_plan_key()
             method = plan.rsplit("/", 1)[-1] if plan else ""

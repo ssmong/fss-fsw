@@ -465,7 +465,7 @@ class MissionControlTest(unittest.TestCase):
                 self.assertEqual(button.text(), name)
                 self.assertTrue(button.isVisible())
                 self.assertEqual(button.isEnabled(), name == action)
-            self.assertFalse(w._toss_options.isEnabled())
+            self.assertTrue(w._toss_options.isEnabled())
             w._toss_buttons[action].click()
             self.assertEqual(link.commands.get_nowait()[1:], (action, True))
             link.inbox.put([("toss_reply", "accepted")])
@@ -476,6 +476,21 @@ class MissionControlTest(unittest.TestCase):
         w._toss_options.clear()
         w._toss_buttons["toss_run"].click()
         self.assertEqual(link.commands.get_nowait()[1:], ("toss_run", "Proposed"))
+
+    def test_toss_options_can_be_drafted_before_start_and_control_conflict_is_shown(self):
+        w = self.window
+        link = self.connect("bench", 0)
+        self.body_status(link, workflow="control", toss_actions=[], can_start_body=False)
+        w._control_views.button(1).click()
+        w._update()
+        self.assertEqual(w._toss_status.text(), "위치제어 본체 종료 후 toss_fss")
+        self.assertTrue(w._toss_method.isEnabled())
+        self.assertTrue(w._toss_options.isEnabled())
+        w._toss_options.setText("tracking_mode:=velocity")
+        self.assertEqual(link.data.toss_options, "tracking_mode:=velocity")
+        for button in w._toss_buttons.values():
+            self.assertFalse(button.isEnabled())
+        self.assertTrue(link.commands.empty())
 
     def test_toss_gripper_position_is_fresh_and_per_selected_fss(self):
         w = self.window
