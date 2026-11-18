@@ -242,7 +242,9 @@ void nav_count_measurement_resets_each_second() {
 }
 
 void active_fault_holds_once_and_requires_rearming() {
-    Fixture f;
+    ManagerConfig config;
+    config.nav_correction_loss_timeout_s = 0.0;
+    Fixture f(config);
     f.active();
     f.clock.advance_ms(1000);
     f.manager.on_valve(f.clock.now_ns, true, 0.0);
@@ -368,6 +370,7 @@ void arm_status_and_dry_bench_gate_activation() {
 
 void toss_grace_is_bounded_and_never_relaxes_arming() {
     ManagerConfig config;
+    config.nav_correction_loss_timeout_s = 0.0;
     config.toss_nav_uncertainty_grace = true;
     Fixture f(config);
     f.active();
@@ -399,10 +402,107 @@ void toss_grace_is_bounded_and_never_relaxes_arming() {
     invalid.check();
     CHECK(!invalid.manager.nav_ready());
 }
+
+void correction_loss_requires_ten_continuous_seconds() {
+    Fixture f;
+    f.active();
+    const auto bad_tick = [&]() {
+        f.manager.on_nav(f.clock.now_ns, .1, .2, .3);
+        f.manager.on_valve(f.clock.now_ns, true, 0.0);
+        return f.manager.health_check(f.clock.now_ns);
+    };
+    CHECK(!bad_tick());
+    CHECK(f.manager.health().has_fault());
+    CHECK(f.manager.navigation_degraded());
+    CHECK(!f.manager.nav_ready());
+    f.clock.advance_ms(9999);
+    CHECK(!bad_tick());
+    CHECK(f.manager.mode() == Mode::ACTIVE);
+    f.clock.advance_ms(1);
+    CHECK(bad_tick());
+    CHECK(f.manager.mode() == Mode::SAFE_HOLD);
+    CHECK(f.manager.transition_log().back().reason.find("nav std") != std::string::npos);
+}
+
+void correction_loss_timer_resets_on_recovery_and_mode_changes() {
+    Fixture f;
+    f.active();
+    const auto bad_tick = [&]() {
+        f.manager.on_nav(f.clock.now_ns, .1, .1, .1);
+        f.manager.on_valve(f.clock.now_ns, true, 0.0);
+        return f.manager.health_check(f.clock.now_ns);
+    };
+    CHECK(!bad_tick());
+    f.clock.advance_ms(9000);
+    CHECK(!bad_tick());
+    f.manager.on_nav(f.clock.now_ns, .001, .001, .002); // Recovery between health ticks still resets.
+    f.clock.advance_ms(1);
+    CHECK(!bad_tick());
+    f.clock.advance_ms(9999);
+    CHECK(!bad_tick());
+    CHECK(f.request(Mode::READY));
+    f.sensors();
+    f.check();
+    CHECK(f.request(Mode::ACTIVE));
+    CHECK(!bad_tick());
+    f.clock.advance_ms(9999);
+    CHECK(!bad_tick());
+    f.clock.advance_ms(1);
+    CHECK(bad_tick());
+}
+
+void correction_loss_delay_never_delays_absent_nav_or_air_support() {
+    for (int fault = 0; fault < 3; ++fault) {
+        ManagerConfig config;
+        config.nav_age_limit_ms = 200;
+        Fixture f(config);
+        f.active();
+        f.manager.on_nav(0, .1, .1, .1);
+        CHECK(!f.manager.health_check(0));
+        if (fault == 0) {
+            f.clock.advance_ms(201);
+            f.manager.on_valve(f.clock.now_ns, true, 0);
+        } else if (fault == 1) {
+            f.clock.advance_ms(501);
+            f.manager.on_nav(f.clock.now_ns, .1, .1, .1);
+        } else {
+            f.manager.on_valve(0, false, 0);
+        }
+        CHECK(f.manager.health_check(f.clock.now_ns));
+        CHECK(f.manager.mode() == Mode::SAFE_HOLD);
+    }
+}
+
+void correction_loss_clock_reversal_restarts_wait_and_invalid_timeout_is_rejected() {
+    Fixture f;
+    f.active();
+    const auto bad_tick = [&](std::int64_t ms) {
+        f.clock.now_ns = ms * 1000000;
+        f.manager.on_nav(f.clock.now_ns, .1, .1, .1);
+        f.manager.on_valve(f.clock.now_ns, true, 0);
+        return f.manager.health_check(f.clock.now_ns);
+    };
+    CHECK(!bad_tick(20000));
+    CHECK(!bad_tick(10000));
+    CHECK(!bad_tick(19999));
+    CHECK(bad_tick(20000));
+    for (double timeout : {-1.0, std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::quiet_NaN()}) {
+        ManagerConfig config;
+        config.nav_correction_loss_timeout_s = timeout;
+        bool rejected = false;
+        try { ManagerCore invalid(config); } catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected);
+    }
+}
 }  // namespace
 
 int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+        {"correction_loss_requires_ten_continuous_seconds", correction_loss_requires_ten_continuous_seconds},
+        {"correction_loss_timer_resets_on_recovery_and_mode_changes", correction_loss_timer_resets_on_recovery_and_mode_changes},
+        {"correction_loss_delay_never_delays_absent_nav_or_air_support", correction_loss_delay_never_delays_absent_nav_or_air_support},
+        {"correction_loss_clock_reversal_restarts_wait_and_invalid_timeout_is_rejected", correction_loss_clock_reversal_restarts_wait_and_invalid_timeout_is_rejected},
         {"all_transition_guards", all_transition_guards},
         {"initial_nominal_and_history", initial_nominal_and_history},
         {"emergency_latch_and_manual_reset", emergency_latch_and_manual_reset},

@@ -114,6 +114,18 @@ class TossTests(unittest.TestCase):
         self.names.append("paper_toss_executor")
         self.assertEqual(self.b.available(self.names)[0], ())
 
+    def test_owned_fault_allows_executor_guarded_restart(self):
+        self.flight()
+        self.paper(owned=True)
+        (self.home / ".bash_aliases").write_text("toss_close() { :; }\n")
+        self.b.observe({"phase": "FAULT", "stop_confirmed": True})
+        self.assertEqual(self.b.available(self.names)[0], ("toss_close", "toss_start", "toss_stop"))
+        self.b.phase_at -= 4
+        self.assertEqual(self.b.available(self.names)[0], ())
+        self.b.observe({"phase": "FAULT"})
+        (self.b.state / "toss_run.json").unlink()
+        self.assertEqual(self.b.available(self.names)[0], ())
+
     def test_position_switch_rejects_reused_pid_and_unrelated_hardware(self):
         self.add(40, 1, 40, [])
         self.procs.clear()

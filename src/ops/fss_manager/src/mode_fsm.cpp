@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <cmath>
 #include <sstream>
+#include <stdexcept>
 
 namespace fss_manager {
 namespace {
@@ -95,13 +96,17 @@ bool HealthStatus::navigation_ok() const {
 }
 
 ManagerCore::ManagerCore(const ManagerConfig& config)
-    : config_(config), health_(config.nav_age_limit_ms, config.control_rate_min_hz) {}
+    : config_(config), health_(config.nav_age_limit_ms, config.control_rate_min_hz) {
+    if (!std::isfinite(config.nav_correction_loss_timeout_s) || config.nav_correction_loss_timeout_s < 0.0)
+        throw std::invalid_argument("nav_correction_loss_timeout_s must be finite and nonnegative");
+}
 
 void ManagerCore::on_nav(std::int64_t now_ns, double std_x, double std_y, double std_theta,
                          std::optional<std::int64_t> stamp_ns) {
     last_nav_ns_ = now_ns;
     ++nav_count_;
     nav_std_ = {std_x, std_y, std_theta};
+    if (within_std()) nav_correction_lost_since_ns_.reset();
     nav_stamp_ns_ = stamp_ns.value_or(now_ns);
     const auto age = age_ms(now_ns, *nav_stamp_ns_);
     if (config_.toss_nav_uncertainty_grace && within_std() && age >= 0.0 && age <= 100.0)
@@ -162,14 +167,28 @@ bool ManagerCore::health_check(std::int64_t now_ns) {
     if (grace)
         health_.warnings.push_back("일시적 항법 불확실도 증가");
 
-    if (config_.auto_safe_hold && fsm_.mode == Mode::ACTIVE && health_.has_fault()) {
+    if (fsm_.mode != Mode::ACTIVE || nav_uncertainty_ok_) {
+        nav_correction_lost_since_ns_.reset();
+    } else if (!nav_correction_lost_since_ns_ || now_ns < *nav_correction_lost_since_ns_) {
+        nav_correction_lost_since_ns_ = now_ns;
+    }
+    const bool correction_loss_expired = !vicon_ok && nav_correction_lost_since_ns_ &&
+        age_ms(now_ns, *nav_correction_lost_since_ns_) >= config_.nav_correction_loss_timeout_s * 1000.0;
+    // Only correction/uncertainty loss waits; absent navigation and air support remain immediate faults.
+    const bool immediate_fault = !health_.navigation_ok() || !act_ready_ ||
+        (!config_.dry_bench_solenoid && !main_valve_open_);
+    if (config_.auto_safe_hold && fsm_.mode == Mode::ACTIVE && (immediate_fault || correction_loss_expired)) {
         std::string reason;
         for (const auto& error : health_.errors) {
             if (!reason.empty())
                 reason += "; ";
             reason += error;
         }
+        if (!nav_uncertainty_ok_)
+            reason += "; nav std (x m, y m, yaw rad)=(" + fixed(nav_std_[0], 6) + ", " +
+                fixed(nav_std_[1], 6) + ", " + fixed(nav_std_[2], 6) + ")";
         fsm_.transition(Mode::SAFE_HOLD, reason);
+        nav_correction_lost_since_ns_.reset();
         return true;
     }
     return false;
@@ -211,6 +230,7 @@ ModeResponse ManagerCore::set_mode(std::uint8_t requested_mode, std::optional<st
         return {false, fsm_.mode,
                 std::string("전이 불가: ") + mode_name(fsm_.mode) + " → " + mode_name(target)};
     }
+    nav_correction_lost_since_ns_.reset();
     return {true, fsm_.mode, std::string("모드 전이: ") + mode_name(fsm_.mode)};
 }
 

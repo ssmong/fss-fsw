@@ -6,8 +6,9 @@ health_check_rate_hz: ${gnc_node.control_rate_hz}  # GNC와 같은 명목 주기
 nav_age_limit_ms: 1000.0
 control_rate_min_hz: 15.0          # 제어 루프 최소 주파수
 auto_safe_hold: true               # ACTIVE 중 결함 시 자동 SAFE_HOLD
+nav_correction_loss_timeout_s: 10.0 # 항법 보정/불확실도 이상이 연속 10초일 때 전이
 
-# 항법 불확실도(EKF 1σ) 허용 한계 — 초과 시 항법 저하 → ACTIVE에서 자동 SAFE_HOLD
+# 항법 불확실도(EKF 1σ) 허용 한계 — 즉시 저하 표시, 위 대기시간 후 자동 SAFE_HOLD
 # Vicon 정상 시 위치 1σ ≈ 0.3~0.5mm이므로 5mm는 오탐 여유가 크고,
 # Vicon 상실 추측항법에서는 수 초 내 도달(노이즈 모델 기준). Phase 5 실측 후 재조정
 nav_pos_std_limit: 0.005           # [m]

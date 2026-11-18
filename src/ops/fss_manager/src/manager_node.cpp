@@ -28,6 +28,7 @@ ManagerConfig ManagerNode::declare_config() {
     config.nav_heading_std_limit = required_double("nav_heading_std_limit");
     rcl_interfaces::msg::ParameterDescriptor immutable;
     immutable.read_only = true;
+    config.nav_correction_loss_timeout_s = declare_parameter("nav_correction_loss_timeout_s", 10.0, immutable);
     config.dry_bench_solenoid = declare_parameter("dry_bench_solenoid", false, immutable);
     config.require_arm_status = declare_parameter("require_arm_status", false, immutable);
     config.toss_nav_uncertainty_grace = declare_parameter("toss_nav_uncertainty_grace", false, immutable);

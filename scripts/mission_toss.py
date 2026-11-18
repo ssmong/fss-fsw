@@ -17,7 +17,7 @@ if "device_processes" not in globals():  # SSH bridge concatenates these modules
 
 TOSS_METHODS = ("Proposed", "Nominal", "JF_only")
 TOSS_COMMANDS = ("toss_fss", "toss_run", "toss_close", "toss_start", "toss_stop", "toss_prepare")
-TOSS_START_PHASES = ("IDLE", "STOPPED", "MISSED", "A_HELD")
+TOSS_START_PHASES = ("IDLE", "STOPPED", "MISSED", "A_HELD", "FAULT")
 TOSS_UPGRADE = "Self-tossing FSW 런처 업데이트 필요"
 
 
@@ -216,7 +216,7 @@ class TossBench:
                 return (), "실험 상태 수신 대기"
             if phase in TOSS_START_PHASES:
                 close = ("toss_close",) if self._has_close_alias() else ()
-                if phase == "A_HELD":
+                if phase in ("A_HELD", "FAULT"):
                     return (*close, "toss_start", "toss_stop"), phase
                 return (*close, "toss_start"), phase
             if phase == "WAITING_FOR_A" and self._has_close_alias():

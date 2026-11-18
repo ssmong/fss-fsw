@@ -505,6 +505,19 @@ class MissionControlTest(unittest.TestCase):
         self.assertEqual(link.commands.get_nowait()[1:], ("toss_fss", True))
         self.assertTrue(link.toss_pending)
 
+    def test_toss_safe_hold_is_distinguished_from_process_disconnect(self):
+        w = self.window
+        link = self.connect("bench", 0)
+        self.body_status(link, workflow="toss", toss_actions=["toss_start", "toss_stop"])
+        link.inbox.put([("mode", SimpleNamespace(mode_name="SAFE_HOLD")),
+                        ("paper_status", SimpleNamespace(phase="FAULT"))])
+        w._control_views.button(1).click()
+        w._update()
+        self.assertEqual(w._toss_status.text(), "SAFE_HOLD · Vicon 미수신")
+        self.assertTrue(w._toss_buttons["toss_start"].isEnabled())
+        self.assertIn("재시작", w._toss_buttons["toss_start"].toolTip())
+        self.assertIn("출발", w._toss_buttons["toss_close"].toolTip())
+
     def test_toss_air_controls_follow_reported_state_and_permission(self):
         w = self.window
         link = self.connect("bench", 0)

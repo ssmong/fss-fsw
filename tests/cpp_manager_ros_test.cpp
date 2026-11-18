@@ -31,6 +31,7 @@ rclcpp::NodeOptions options() {
         {"nav_age_limit_ms", 1000.0},
         {"control_rate_min_hz", 15.0},
         {"auto_safe_hold", true},
+        {"nav_correction_loss_timeout_s", 0.0},
         {"nav_pos_std_limit", 0.005},
         {"nav_heading_std_limit", 0.02},
     });

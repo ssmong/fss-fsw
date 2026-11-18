@@ -65,6 +65,7 @@ struct ManagerConfig {
     bool dry_bench_solenoid{false};
     bool require_arm_status{false};
     bool toss_nav_uncertainty_grace{false};
+    double nav_correction_loss_timeout_s{10.0};
 };
 
 struct ModeResponse {
@@ -112,6 +113,7 @@ private:
     std::optional<std::int64_t> valid_vicon_stamp_ns_;
     std::optional<std::int64_t> last_good_nav_stamp_ns_;
     std::optional<std::int64_t> arm_status_stamp_ns_;
+    std::optional<std::int64_t> nav_correction_lost_since_ns_;
     std::int64_t now_ns_{0};
     double nav_hz_{0.0};
     std::uint64_t nav_count_{0};

@@ -1786,6 +1786,10 @@ class Dashboard(QMainWindow):
             method = plan.rsplit("/", 1)[-1] if plan else ""
             phase = self._node.toss_phase_label
             status = f"{method} · {phase}" if method else phase
+            if self._node.mode_name == "SAFE_HOLD" and self._node.source_age("mode") <= SOURCE_TIMEOUT_SEC:
+                status = "SAFE_HOLD"
+                if self._node.source_age("vicon") > SOURCE_TIMEOUT_SEC:
+                    status += " · Vicon 미수신"
         elif time.monotonic() - link.last_body_status_at <= SOURCE_TIMEOUT_SEC:
             status = link.toss_state or "상태 미수신"
         else:
@@ -1799,6 +1803,9 @@ class Dashboard(QMainWindow):
         elif link and any(action in link.toss_actions for action in ("toss_close", "toss_start", "toss_stop")):
             reason = "실험 실행기가 이미 켜져 있습니다."
         run.setToolTip("" if run.isEnabled() else reason)
+        self._toss_buttons["toss_close"].setToolTip("수동 파지 요청 후 자세 준비·출발까지 진행")
+        self._toss_buttons["toss_start"].setToolTip(
+            "오류 복구 확인 후 파지·자세 준비부터 재시작" if self._node.toss_phase == "FAULT" else "")
         alignment = self._live_toss_alignment(link)
         self._toss_alignment.setText(alignment)
         self._toss_alignment.setVisible(bool(alignment))
