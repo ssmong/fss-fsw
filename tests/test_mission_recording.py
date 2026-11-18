@@ -27,6 +27,34 @@ class RecordingTest(unittest.TestCase):
         with patch.dict(os.environ, QT_QPA_PLATFORM="offscreen"):
             cls.app = live_plot.QApplication.instance() or live_plot.QApplication([])
 
+    def test_index_updates_methods_and_memos_without_importing_older_runs(self):
+        from mission_recording import save_experiment_memo
+        with tempfile.TemporaryDirectory() as root:
+            old = Path(root) / "self-tossing/2020-01-01/00-00-00"
+            old.mkdir(parents=True)
+            (old / "session.json").write_text('{"method":"old"}', encoding="utf-8")
+            runs = []
+            for method in ("Proposed", "JF_only"):
+                fss = self.gui.DashboardNode()
+                run = fss.recorder.start(root, "self-tossing", "FSS-1")
+                fss.receive("paper_status", {"phase":"LAUNCH", "plan_id":f"HW-{method}-C20"})
+                fss.recorder.stop()
+                runs.append(run)
+            save_experiment_memo(runs[0], "성공 | 메모\n<다음>")
+            save_experiment_memo(runs[1], "두 번째")
+            index = Path(root) / "self-tossing/index.md"
+            text = index.read_text(encoding="utf-8")
+            self.assertIn("Proposed", text)
+            self.assertIn("JF_only", text)
+            self.assertIn("성공 &#124; 메모<br>&lt;다음&gt;", text)
+            self.assertIn("두 번째", text)
+            self.assertNotIn("2020-01-01", text)
+            save_experiment_memo(runs[0], "수정")
+            text = index.read_text(encoding="utf-8")
+            self.assertNotIn("성공", text)
+            self.assertIn("수정", text)
+            self.assertEqual(text.count("]("), 2)
+
     def test_method_and_memo_are_saved_in_the_finished_run(self):
         from mission_recording import save_experiment_memo
         with tempfile.TemporaryDirectory() as root:

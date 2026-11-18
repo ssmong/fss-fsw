@@ -7,15 +7,17 @@ from contextlib import ExitStack
 import csv
 from datetime import datetime
 import gzip
+import html
 import json
 import math
 from numbers import Real
 from pathlib import Path, PureWindowsPath
 import re
 import time
+from urllib.parse import quote
 from types import SimpleNamespace
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QLockFile, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
 from mission_video import VideoRecorder
 
@@ -89,6 +91,31 @@ def _run_directory(root, name, now):
             index += 1
 
 
+def _update_experiment_index(root):
+    lock = QLockFile(str(root / ".index.lock"))
+    if not lock.tryLock(2000):
+        raise OSError("실험 목록 파일이 사용 중입니다.")
+    try:
+        rows = []
+        for path in sorted(root.glob("*/*/session.json"), reverse=True):
+            try:
+                session = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if session.get("index_version") != 1:
+                continue
+            folder = path.parent.relative_to(root).as_posix()
+            def cell(value):
+                return html.escape(str(value or ""), quote=False).replace("|", "&#124;").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+            rows.append(f"| [{folder}]({quote(folder)}/) | {cell(session.get('method'))} | {cell(session.get('memo'))} |")
+        text = "# 실험 기록\n\n| 폴더 | 기법 | 메모 |\n| --- | --- | --- |\n" + "\n".join(rows) + "\n"
+        tmp = root / "index.tmp"
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(root / "index.md")
+    finally:
+        lock.unlock()
+
+
 def _save_session(directory, summary, *, preserve_memo=True):
     # Video finalization may arrive after the operator saved a memo.
     session = directory / "session.json"
@@ -99,6 +126,8 @@ def _save_session(directory, summary, *, preserve_memo=True):
     tmp = directory / "session.tmp"
     tmp.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(directory / "session.json")
+    if summary.get("index_version") == 1:
+        _update_experiment_index(directory.parent.parent)
 
 
 def experiment_method(plan_id):
@@ -146,7 +175,7 @@ class ExperimentRecorder:
             self._paths = {}
             self._path_counts = Counter()
             self._strides = Counter()
-            self._summary = {"format_version": 2, "experiment": name.strip() or "default", "vehicle": vehicle,
+            self._summary = {"format_version": 2, "index_version": 1, "experiment": name.strip() or "default", "vehicle": vehicle,
                              "started_at": now.isoformat(), "status": "recording", "pose_source": "vicon"}
             context = self.context() if self.context else {}
             self._summary["method"] = experiment_method((context.get("source_run") or {}).get("plan_id"))
