@@ -407,17 +407,35 @@ def open_node(receive, reply, args=None, reject=None):
     return node, actions.request
 
 
-def serve():
+def serve(hub=None):
     import rclpy
     from rosidl_runtime_py.convert import message_to_ordereddict
 
+    command_owner = None
+    command_error = "reply_error"
+
     def emit(kind, data):
-        print(json.dumps([kind, data], separators=(",", ":")), flush=True)
+        nonlocal command_owner
+        if hub is not None:
+            if kind in ("reply", "reply_error", "body_reply", "body_error", "toss_reply", "toss_error"):
+                if kind == "reply_error" and getattr(getattr(request, "__self__", None), "cancel_for_off", False):
+                    hub.publish("log", {"level": 40, "name": "Mission Control", "msg": data})
+                    return
+                if command_owner is not None:
+                    hub.publish(kind, data, target=command_owner)
+                    command_owner = None
+            else:
+                hub.publish(kind, data)
+        else:
+            print(json.dumps([kind, data], separators=(",", ":")), flush=True)
 
     arm_last = {}
     recording = False
 
     def forward(name, msg):
+        nonlocal recording
+        if hub is not None:
+            recording = hub.recording
         if name == "paper_status" and globals().get("toss_bench"):
             toss_bench.observe(msg)
         if not recording and name in ("arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"):
@@ -454,7 +472,7 @@ def serve():
     if status := globals().get("startup_status"):
         failed = status.startswith("FSW 자동 시작 실패")
         emit("log", {"level": 40 if failed else 20, "name": "Mission Control", "msg": status})
-        if failed:
+        if failed and hub is None:
             emit("reply_error", status)
     heartbeat = 0.0
     pending = b""
@@ -481,6 +499,7 @@ def serve():
             raise RuntimeError("실험 서비스 소유자를 확인할 수 없습니다.")
     next_idle_check = 0.0
     idle = False
+    attached_writable = False
 
     def can_start_body(names):
         nonlocal next_idle_check, idle
@@ -502,6 +521,8 @@ def serve():
 
     try:
         while rclpy.ok():
+            if hub is not None and hub.expired() and command_owner is None and toss_future is None:
+                break
             if toss_future and toss_future.done():
                 try:
                     emit("toss_reply", toss_future.result())
@@ -515,7 +536,8 @@ def serve():
                 check_start = globals().get("startup_failure")
                 if check_start and (error := check_start(names)):
                     emit("log", {"level": 40, "name": "Mission Control", "msg": error})
-                    emit("reply_error", error)
+                    if hub is None:
+                        emit("reply_error", error)
                 toss_actions, toss_state = (), ""
                 body_allowed = False
                 if bench:
@@ -541,7 +563,8 @@ def serve():
                                    "toss_state": toss_state, "read_only": ("모니터링 전용" if passive else "")
                                    if bench else globals().get("read_only", "")})
                 heartbeat = time.monotonic() + 1
-            if select.select([sys.stdin], [], [], 0)[0]:
+            commands = hub.poll() if hub is not None else []
+            if hub is None and select.select([sys.stdin], [], [], 0)[0]:
                 data = os.read(sys.stdin.fileno(), 4096)
                 if not data:
                     break
@@ -549,32 +572,56 @@ def serve():
                 while b"\n" in pending:
                     command, pending = pending.split(b"\n", 1)
                     name, value = json.loads(command)
-                    if name == "record_stream":
-                        recording = value is True
-                    elif bench:
-                        if name == "start_body":
+                    commands.append((None, name, value))
+            for owner, name, value in commands:
+                if name == "__attach__" and hub is not None:
+                    if not attached_writable:
+                        attached_writable = True
+                        if (not bench and domain is None and not toss_bench_installed()
+                                and can_start_body(node.get_node_names())):
                             try:
-                                if (value is not True or passive or toss_future is not None
-                                        or not bench.capabilities(node.get_node_names(), domain)[2]):
-                                    raise ValueError("기체 실행 가능 상태를 확인하세요.")
-                                emit("body_reply", "기체 제어 FSW 전환 중")
-                                raise SystemExit(76)
+                                emit("log", {"level": 20, "name": "Mission Control",
+                                             "msg": prepare_hardware(only_if_idle=True)})
                             except (OSError, RuntimeError, ValueError) as exc:
-                                emit("body_error", str(exc))
-                        elif passive or name not in TOSS_COMMANDS or toss_future is not None:
-                            emit("toss_error", "실험 명령 또는 처리 상태를 확인하세요.")
-                        else:
-                            toss_future = toss_pool.submit(bench.request, name, value, node.get_node_names, verify_toss_service)
-                    elif name == "start_body":
+                                hub.publish("body_error", str(exc), target=owner)
+                    continue
+                error_kind = "toss_error" if name.startswith("toss_") else (
+                    "body_error" if name == "start_body" else "reply_error")
+                if hub is not None and name != "record_stream":
+                    if command_owner is not None:
+                        urgent = not bench and ((name == "mode" and value == MissionActions.ESTOP)
+                                                 or (name == "valve" and value is False))
+                        if not urgent:
+                            hub.publish(error_kind, "다른 명령 처리 중", target=owner)
+                            continue
+                        hub.publish(command_error, "다른 연결의 정지 요청으로 명령 종료", target=command_owner)
+                    command_owner, command_error = owner, error_kind
+                if name == "record_stream":
+                    recording = value is True
+                elif bench:
+                    if name == "start_body":
                         try:
-                            if value is not True or not can_start_body(node.get_node_names()):
-                                raise ValueError("기체 실행 상태를 확인하세요.")
-                            emit("body_reply", prepare_hardware())
+                            if (value is not True or passive or toss_future is not None
+                                    or not bench.capabilities(node.get_node_names(), domain)[2]):
+                                raise ValueError("기체 실행 가능 상태를 확인하세요.")
+                            emit("body_reply", "기체 제어 FSW 전환 중")
+                            raise SystemExit(76)
                         except (OSError, RuntimeError, ValueError) as exc:
                             emit("body_error", str(exc))
-                        next_idle_check = 0.0
+                    elif passive or name not in TOSS_COMMANDS or toss_future is not None:
+                        emit("toss_error", "실험 명령 또는 처리 상태를 확인하세요.")
                     else:
-                        request(name, value)
+                        toss_future = toss_pool.submit(bench.request, name, value, node.get_node_names, verify_toss_service)
+                elif name == "start_body":
+                    try:
+                        if value is not True or not can_start_body(node.get_node_names()):
+                            raise ValueError("기체 실행 상태를 확인하세요.")
+                        emit("body_reply", prepare_hardware())
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        emit("body_error", str(exc))
+                    next_idle_check = 0.0
+                else:
+                    request(name, value)
             rclpy.spin_once(node, timeout_sec=0.02)
     except (BrokenPipeError, KeyboardInterrupt):
         pass
@@ -587,4 +634,7 @@ def serve():
 
 
 if __name__ == "__main__":
-    serve()
+    if "run_shared" in globals():
+        run_shared(serve)
+    else:
+        serve()

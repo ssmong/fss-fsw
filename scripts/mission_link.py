@@ -203,10 +203,12 @@ class JetsonLink(QObject):
         routing = "\n".join((directory / (name + ".py")).read_text(encoding="utf-8") for name in names)
         selection = (routing + f'\nprint(":".join(bridge_selection({self.profile!r}, {domain!r}, '
                      'os.environ["FSS_MISSION_TRANSITION"], os.environ["FSS_MISSION_PREFERRED"])))')
-        context = (f'globals().update(bridge_context({self.profile!r}, {domain!r}, '
-                   'os.environ["FSS_MISSION_TRANSITION"], os.environ["FSS_MISSION_WORKFLOW"]))')
+        context = (f'shared_options=dict(profile={self.profile!r}, domain={domain!r}, '
+                   'transition=os.environ["FSS_MISSION_TRANSITION"], workflow=os.environ["FSS_MISSION_WORKFLOW"]); '
+                   f'globals().update(bridge_context("auto", {domain!r}, '
+                   'shared_options["transition"], shared_options["workflow"], allow_start=False))')
         bridge = "\n".join([routing, context, *((directory / (name + ".py")).read_text(encoding="utf-8")
-                                             for name in ("mission_plan", "mission_tracking", "mission_ros"))])
+                                             for name in ("mission_plan", "mission_tracking", "mission_shared", "mission_ros"))])
 
         def python_argument(source):
             # Keep the SSH command below Linux's per-argument exec limit, including nested shell quoting.
@@ -245,7 +247,7 @@ class JetsonLink(QObject):
                 while not self.commands.empty():
                     stamp, name, value = self.commands.get_nowait()
                     if time.monotonic() - stamp < 1:
-                        ch.sendall((json.dumps([name, value]) + "\n").encode())
+                        ch.sendall((json.dumps([name, value, observer]) + "\n").encode())
                     else:
                         error_event = "body_error" if name == "start_body" else "reply_error"
                         if name.startswith("toss_"):

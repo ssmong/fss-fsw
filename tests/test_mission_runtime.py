@@ -370,6 +370,15 @@ class Discovery(unittest.TestCase):
         self.assertEqual(args[:2], ["bash", "-c"])
         self.assertEqual(len(args), 3)
 
+    def test_shared_preflight_never_starts_hardware_before_singleton_lock(self):
+        import mission_bootstrap as boot
+        with patch.object(boot, "toss_bench_installed", return_value=False), patch.object(
+                boot, "prepare_session", return_value=("ready", "")) as prepare, patch.object(
+                boot, "private_base", return_value=None):
+            for transition in ("first", "body", "passive"):
+                boot.bridge_context("auto", None, transition, "control", allow_start=False)
+                self.assertFalse(prepare.call_args.kwargs["start_if_idle"])
+
     def test_mismatched_discovery_profiles_cannot_start_or_attach_for_commands(self):
         peers = [{"ROS_DOMAIN_ID": "8", "CYCLONEDDS_URI": uri} for uri in ("file:///a", "file:///b")]
         with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)):

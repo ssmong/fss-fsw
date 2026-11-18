@@ -12,7 +12,7 @@ def bridge_selection(profile, domain, transition, preferred):
     return "control", select_workspace(preferred, monitor_only=profile == "monitor")
 
 
-def bridge_context(profile, domain, transition, workflow):
+def bridge_context(profile, domain, transition, workflow, *, allow_start=True):
     monitor = profile == "monitor"
     context = dict(follow_workflow=profile in ("auto", "monitor"), toss_monitor=monitor, toss_domain=domain)
     if workflow == "toss":
@@ -22,7 +22,7 @@ def bridge_context(profile, domain, transition, workflow):
         return context
 
     # A shared bench remains available to both operators until someone chooses a task.
-    start = (not monitor and profile != "toss" and domain is None and
+    start = (allow_start and not monitor and profile != "toss" and domain is None and
              (transition == "body" or (transition == "first" and not toss_bench_installed())))
     status, reason = prepare_session(monitor, domain, start_if_idle=start)
     if transition != "passive" and native_overlay_changed(reason):
