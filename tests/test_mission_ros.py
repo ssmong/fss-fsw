@@ -68,20 +68,24 @@ class CatalogRelayTest(unittest.TestCase):
         catalog = SimpleNamespace(plans=[], signatures={}, defaults={}, refresh=Mock(return_value=False))
         with patch.dict(sys.modules, modules), patch.multiple(
             mission_ros, create=True, PlanCatalog=lambda: catalog, load_table_plans=Mock(),
+            toss_tuning_defaults=Mock(return_value={"Nominal": {"launch_position_gain_change_s": 3}}),
             paper_plan_elapsed=Mock(return_value=None), paper_run_files=Mock(return_value=None), PaperTracking=PaperTracking,
             ValveOutput=Mock(return_value=Mock(topics=("/actuators/valve_commands", "/actuators/valve_outputs"))), ArmRegistration=Mock(),
         ):
             rejects = Mock()
             _, request = mission_ros.open_node(lambda kind, value: events.append((kind, value)), Mock(), reject=rejects)
             self.assertEqual(events[:2], [("plans", []), ("plan_defaults", {})])
+            self.assertEqual(events[2], ("tuning_defaults", {"Nominal": {"launch_position_gain_change_s": 3}}))
             refresh = next(callback for _, callback in timers if callback.__name__ == "refresh_plans")
             refresh()
-            self.assertEqual(len(events), 2)
+            self.assertEqual(len(events), 3)
+            mission_ros.toss_tuning_defaults.assert_called_once()
             catalog.plans = [["bundle/Nominal", "A", [[0, 0], [1, 1]], [0, 1]]]
             catalog.defaults = {"Nominal": "bundle/Nominal"}
             catalog.refresh.return_value = True
             refresh()
-            self.assertEqual(events[-2:], [("plans", catalog.plans), ("plan_defaults", catalog.defaults)])
+            self.assertEqual(events[-3:-1], [("plans", catalog.plans), ("plan_defaults", catalog.defaults)])
+            self.assertEqual(mission_ros.toss_tuning_defaults.call_count, 2)
             node.create_client.return_value.call_async.assert_not_called()
             import json
             status = next(call.args[2] for call in node.create_subscription.call_args_list

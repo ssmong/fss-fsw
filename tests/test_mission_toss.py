@@ -101,6 +101,12 @@ class TossTests(unittest.TestCase):
         self.assertEqual(Path(cfg.model_file), (root / "model.json").resolve())
         self.assertEqual(source.read_text(), original)
         self.assertEqual((root / "tuning.yaml").read_text(), tuning_text)
+        with patch.object(toss, "_toss_capture_config", return_value=source):
+            defaults = toss.toss_tuning_defaults(root)
+        self.assertEqual(defaults["Nominal"]["launch_position_gain_change_s"], 3)
+        self.assertEqual(defaults["Proposed"]["launch_position_gain_before_per_s"], 1)
+        self.assertEqual(source.read_text(), original)
+        self.assertEqual((root / "tuning.yaml").read_text(), tuning_text)
         self.assertTrue(toss.matches_toss_run([20, 313, actual],
                         ["method:=Nominal", "execute:=true", *actual[1:]]))
         self.assertEqual(toss.snapshot_toss_tuning(args[:3], self.b.state, root), args[:3])

@@ -88,6 +88,38 @@ def _toss_capture_config(args, root):
     return Path(configs[0])
 
 
+def toss_tuning_defaults(root=None):
+    """Read each method's current YAML values without creating a run or snapshot."""
+    root = Path(root or os.environ.get("SELF_TOSSING_HARDWARE_ROOT", Path.home() / "self_tossing_hardware"))
+    if not root.is_dir():
+        return {}
+    try:
+        from omegaconf import OmegaConf
+        from omegaconf.errors import OmegaConfBaseException
+        from yaml import YAMLError
+    except ImportError:
+        return {}
+    defaults = {}
+    for method in TOSS_METHODS:
+        try:
+            source = _toss_capture_config([method], root)
+            config = OmegaConf.to_container(OmegaConf.load(source), resolve=True)
+            if not isinstance(config, dict):
+                continue
+            tuning_file = config.get("tuning_file")
+            if tuning_file is not None:
+                tuning = OmegaConf.to_container(OmegaConf.load(source.parent / tuning_file), resolve=True)
+                if not isinstance(tuning, dict) or config.keys() & tuning.keys():
+                    continue
+                config.update(tuning)
+            defaults[method] = {key: config[key] for key in TOSS_TUNING_KEYS
+                                if type(config.get(key)) in (int, float) and math.isfinite(config[key])}
+        except (ImportError, OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError,
+                SyntaxError, OmegaConfBaseException, YAMLError):
+            continue
+    return defaults
+
+
 def snapshot_toss_tuning(args, state, root=None):
     """Replace GUI-only gain options with an isolated config_file launch argument."""
     import tempfile

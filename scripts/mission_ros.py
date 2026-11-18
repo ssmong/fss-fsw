@@ -233,9 +233,13 @@ def open_node(receive, reply, args=None, reject=None):
         from mission_plan import PlanCatalog as catalog_type
     catalog = catalog_type()
     catalog.refresh()
+    read_tuning = globals().get("toss_tuning_defaults")
+    if read_tuning is None:
+        from mission_toss import toss_tuning_defaults as read_tuning
     tracking = tracker_type(catalog.plans, catalog.signatures, node.get_clock().now().nanoseconds / 1e9)
     receive("plans", catalog.plans)
     receive("plan_defaults", catalog.defaults)
+    receive("tuning_defaults", read_tuning())
     last_run = None
     published_extra = None
     last_paper_status = None
@@ -250,6 +254,7 @@ def open_node(receive, reply, args=None, reject=None):
         published_extra = tracking.extra_plan
         receive("plans", catalog.plans + ([published_extra] if published_extra else []))
         receive("plan_defaults", catalog.defaults)
+        receive("tuning_defaults", read_tuning())
         if last_paper_status and time.monotonic() - last_paper_status_at <= 2.5:
             status = last_paper_status
             if not status.get("log_directory"):
@@ -290,6 +295,8 @@ def open_node(receive, reply, args=None, reject=None):
                 published_extra = tracking.extra_plan
                 receive("plans", tracking.plans + ([published_extra] if published_extra else []))
                 receive("plan_defaults", catalog.defaults)
+                if catalog_changed:
+                    receive("tuning_defaults", read_tuning())
             last_elapsed = read_elapsed(status, source=source) if source else None
             receive("paper_trial", [plan_id, last_elapsed, tracking.active_key])
             for sample in errors:
@@ -417,7 +424,7 @@ def serve(hub=None):
         # The dashboard uses IMU arrivals only to measure the incoming rate.
         if name == "imu" and not recording:
             data = {}
-        elif name in ("plans", "plan_defaults", "paper_trial", "paper_status", "tracking_error", "arm_registration"):
+        elif name in ("plans", "plan_defaults", "tuning_defaults", "paper_trial", "paper_status", "tracking_error", "arm_registration"):
             data = msg
         elif name == "valve_output":
             data = {"duty_cycles": [float(value) for value in msg.duty_cycles]}

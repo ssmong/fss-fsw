@@ -342,6 +342,7 @@ class DashboardNode:
         self.control_view = "position"
         self.toss_options = ""
         self.toss_tuning_draft = {}
+        self.toss_tuning_defaults = {}
         self.toss_tuning_applied = None
         self.toss_phase = self.toss_phase_label = ""
         self.toss_gripper = self.toss_alignment = ""
@@ -668,6 +669,11 @@ class DashboardNode:
     def _cb_paper_trial(self, status) -> None:
         self.paper_trial, self.paper_elapsed, *self.paper_match = status
         self._mark_rx("paper_trial")
+
+    def _cb_tuning_defaults(self, defaults):
+        values = defaults if isinstance(defaults, dict) else vars(defaults)
+        self.toss_tuning_defaults = {method: item if isinstance(item, dict) else vars(item)
+                                    for method, item in values.items()}
 
     def _cb_plan_defaults(self, defaults):
         values = defaults if isinstance(defaults, dict) else getattr(defaults, "__dict__", {})
@@ -1776,9 +1782,9 @@ class Dashboard(QMainWindow):
             tuning.addWidget(label, row, 0)
             field = QLineEdit()
             field.setAccessibleName(key)
-            field.setFixedSize(88, 30)
+            field.setFixedSize(120, 30)
             field.setAlignment(Qt.AlignRight)
-            field.setPlaceholderText("YAML")
+            field.setPlaceholderText("—")
             field.setToolTip(f"{key} · 비우면 tuning.yaml 값 사용")
             field.textChanged.connect(lambda text, k=key: self._node.toss_tuning_draft.update({k: text}))
             self._toss_tuning[key] = field
@@ -1883,7 +1889,10 @@ class Dashboard(QMainWindow):
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
         self._toss_method.setVisible(True)
         self._toss_options.setEnabled(not bound)
-        for field in self._toss_tuning.values():
+        defaults = (self._node.toss_tuning_applied if bound else None) or self._node.toss_tuning_defaults.get(method, {})
+        for key, field in self._toss_tuning.items():
+            value = defaults.get(key)
+            field.setPlaceholderText(f"{value:g}" if type(value) in (int, float) and math.isfinite(value) else "—")
             field.setEnabled(not bound)
         gripper = "Gripper —"
         if (self._node.arm_equipped and self._node.arm_tcp is not None

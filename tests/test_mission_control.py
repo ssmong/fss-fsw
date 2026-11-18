@@ -601,7 +601,12 @@ class MissionControlTest(unittest.TestCase):
         self.assertFalse(w._toss_tuning_panel.isHidden())
         w._toss_advanced.click()
         self.assertTrue(w._toss_tuning_panel.isHidden())
+        first.data.receive("tuning_defaults", {"Nominal": {"launch_position_gain_change_s": 3,
+                               "launch_position_gain_before_per_s": 1,
+                               "launch_velocity_feedforward_scale": .5, "release_open_delay_s": -.2}})
+        w._update()
         fields = list(w._toss_tuning.values())
+        self.assertEqual([f.placeholderText() for f in fields], ["3", "1", "0.5", "-0.2"])
         for invalid in ("-1", "nan", "inf", "abc"):
             fields[0].setText(invalid)
             w._send_toss("toss_run")
@@ -610,7 +615,7 @@ class MissionControlTest(unittest.TestCase):
         fields[1].setText("0.7")
         fields[2].setText("0.8")
         fields[3].setText("-0.1")
-        self.assertTrue(all(field.width() == 88 for field in fields))
+        self.assertTrue(all(field.width() == 120 for field in fields))
         w._vehicles.setCurrentIndex(1)
         self.assertEqual(fields[0].text(), "")
         w._vehicles.setCurrentIndex(0)
