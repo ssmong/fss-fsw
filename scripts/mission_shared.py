@@ -14,7 +14,7 @@ import time
 
 SHARED_PROTOCOL = 1
 SHARED_CACHE = {"plans", "plan_defaults", "arm_registration", "connected"}
-SHARED_ARM = {"arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"}
+SHARED_DISPLAY = {"vicon", "ekf", "ref", "arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"}
 
 
 def shared_key(environment, domain):
@@ -87,7 +87,7 @@ class SharedHub:
                     elif client["profile"] == "toss":
                         status["can_start_body"] = False
                     outgoing = self._packet(kind, status)
-                elif kind in SHARED_ARM and not client["recording"]:
+                elif kind in SHARED_DISPLAY and not client["recording"]:
                     stamp = data.get("header", {}).get("stamp", {}) if isinstance(data, dict) else {}
                     ns = stamp.get("sec", 0) * 10**9 + stamp.get("nanosec", 0)
                     bucket = (ns or time.monotonic_ns()) // 50_000_000

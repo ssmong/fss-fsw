@@ -429,7 +429,7 @@ def serve(hub=None):
         else:
             print(json.dumps([kind, data], separators=(",", ":")), flush=True)
 
-    arm_last = {}
+    display_last = {}
     recording = False
 
     def forward(name, msg):
@@ -438,17 +438,18 @@ def serve(hub=None):
             recording = hub.recording
         if name == "paper_status" and globals().get("toss_bench"):
             toss_bench.observe(msg)
-        if not recording and name in ("arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"):
+        if not recording and name in ("vicon", "ekf", "ref", "arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"):
             if name == "arm_driver":
                 sample_ns = time.monotonic_ns()
             else:
                 stamp = msg.header.stamp
                 sample_ns = stamp.sec * 10**9 + stamp.nanosec
+                sample_ns = sample_ns or time.monotonic_ns()
             # Link poses and TCP from one kinematics update share this stamp.
             bucket = sample_ns // 50_000_000
-            if arm_last.get(name) == bucket:
+            if display_last.get(name) == bucket:
                 return
-            arm_last[name] = bucket
+            display_last[name] = bucket
         # The dashboard uses IMU arrivals only to measure the incoming rate.
         if name == "imu" and not recording:
             data = {}

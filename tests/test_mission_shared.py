@@ -118,6 +118,21 @@ class SharedTransportTest(unittest.TestCase):
         time.sleep(.15)
         self.assertTrue(self.hub.thread.is_alive())
 
+    def test_recording_client_receives_all_samples_while_monitor_receives_twenty_hz(self):
+        recorder, rid = self.client()
+        monitor, _ = self.client("monitor")
+        recorder.sendall(SharedHub._packet("record_stream", True))
+        self.until(lambda: self.hub.clients[rid]["recording"])
+        for i in range(100):
+            for kind in ("vicon", "ekf", "ref", "arm_joints"):
+                self.hub.publish(kind, {"header": {"stamp": {"sec": 1, "nanosec": i*10_000_000}}})
+        self.hub.publish("log", "finished")
+        for sock, expected in ((recorder, 100), (monitor, 20)):
+            counts = dict.fromkeys(("vicon", "ekf", "ref", "arm_joints"), 0)
+            while (event := self.receive(sock))[0] != "log":
+                counts[event[0]] += 1
+            self.assertEqual(counts, dict.fromkeys(counts, expected))
+
     def test_shutdown_broadcast_and_distinct_ros_environments(self):
         a, _ = self.client()
         b, _ = self.client("monitor")
@@ -161,6 +176,27 @@ class SharedTransportTest(unittest.TestCase):
 
 
 class SharedCommandTest(unittest.TestCase):
+    def test_display_filter_runs_before_conversion_and_recording_bypasses_it(self):
+        import mission_ros as ros
+        for recording, expected in ((False, 20), (True, 1000)):
+            with self.subTest(recording=recording):
+                output = []
+                convert = Mock(side_effect=lambda msg: {})
+                hub = NS(recording=recording, publish=lambda kind, data, **kw: output.append(kind))
+                def opened(receive, *args, **kwargs):
+                    for i in range(1000):
+                        msg = NS(header=NS(stamp=NS(sec=1, nanosec=i*1_000_000)))
+                        for kind in ("vicon", "ekf", "ref"):
+                            receive(kind, msg)
+                    return Mock(), Mock()
+                with (patch.dict(sys.modules, rclpy=NS(ok=lambda:False, shutdown=Mock()),
+                                 rosidl_runtime_py=NS(), **{"rosidl_runtime_py.convert": NS(message_to_ordereddict=convert)}),
+                      patch.object(ros, "open_node", side_effect=opened)):
+                    ros.serve(hub)
+                self.assertEqual(convert.call_count, expected*3)
+                for kind in ("vicon", "ekf", "ref"):
+                    self.assertEqual(output.count(kind), expected)
+
     def test_busy_rejection_and_startup_diagnostic_preserve_request_owner(self):
         import mission_ros as ros
         outputs, batches = [], iter([[(1, "target", ["PID", 1, 2, 0])],
