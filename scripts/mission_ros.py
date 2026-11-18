@@ -1,6 +1,7 @@
 """ROS subscriptions and services used by FSS Mission Control, locally or over SSH."""
 
 import json
+import math
 import os
 import select
 import sys
@@ -271,6 +272,11 @@ def open_node(receive, reply, args=None, reject=None):
             return
         source = read_run(status) if isinstance(status, dict) else None
         if source is not None:
+            plan = source[2].get("paper_plan", {})
+            grasp_s = plan.get("capture_end_s") if isinstance(plan, dict) else None
+            if type(grasp_s) in (int, float) and math.isfinite(grasp_s) and grasp_s >= 0:
+                status["planned_grasp_time_s"] = grasp_s
+                status["planned_grasp_time_reference"] = "LAUNCH"
             applied = source[2].get("experiment", {})
             keys = ("launch_position_gain_change_s", "launch_position_gain_before_per_s",
                     "launch_position_gain_after_per_s", "launch_velocity_feedforward_scale", "release_open_delay_s")

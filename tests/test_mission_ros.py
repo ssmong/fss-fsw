@@ -100,11 +100,12 @@ class CatalogRelayTest(unittest.TestCase):
                 actual = {"launch_position_gain_change_s": 2.5, "launch_position_gain_before_per_s": 0.8,
                           "launch_position_gain_after_per_s": 0.2,
                           "launch_velocity_feedforward_scale": 0.8, "release_open_delay_s": -0.1}
-                mission_ros.paper_run_files.return_value = ("run", Path("samples.jsonl"), {"experiment": actual})
+                mission_ros.paper_run_files.return_value = ("run", Path("samples.jsonl"), {"experiment": actual, "paper_plan": {"capture_end_s": 38.25}})
                 events.clear()
                 status(SimpleNamespace(data=json.dumps({"frame_id": "table", "plan_id": "A", "phase": "PREPARING"})))
                 self.assertEqual(events[0], ("paper_status", {"frame_id": "table", "plan_id": "A",
-                                 "phase": "PREPARING", "tuning": actual}))
+                                 "phase": "PREPARING", "tuning": actual, "planned_grasp_time_s": 38.25,
+                                 "planned_grasp_time_reference": "LAUNCH"}))
             node.get_node_names.return_value = ["valve_driver_node"]
             client = node.create_client.return_value
             client.call_async.return_value = SimpleNamespace(done=lambda: True, result=lambda: SimpleNamespace(success=True))

@@ -290,6 +290,12 @@ class ExperimentRecorder:
                                          "elapsed_s": row["elapsed_s"], **sample})
             if kind == "paper_status":
                 status = vars(value) if isinstance(value, SimpleNamespace) else value
+                grasp_s = status.get("planned_grasp_time_s") if isinstance(status, dict) else None
+                if (type(grasp_s) in (int, float) and math.isfinite(grasp_s) and grasp_s >= 0
+                        and status.get("planned_grasp_time_reference") == "LAUNCH"
+                        and grasp_s != self._summary.get("planned_grasp_time_s")):
+                    self._summary.update(planned_grasp_time_s=grasp_s, planned_grasp_time_reference="LAUNCH")
+                    self._save_summary()
                 method = experiment_method(status.get("plan_id")) if isinstance(status, dict) else None
                 if method and method != self._summary.get("method"):
                     self._summary["method"] = method

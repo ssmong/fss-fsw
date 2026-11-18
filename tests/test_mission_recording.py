@@ -70,6 +70,21 @@ class RecordingTest(unittest.TestCase):
                 fss.recorder._video_done(NS(error="", frames_written=1, frames_dropped=0), run, fss.recorder._summary)
                 self.assertEqual(json.loads((run / "session.json").read_text(encoding="utf-8"))["memo"], "파지 성공\n다음엔 gain 변경")
 
+    def test_planned_grasp_time_is_archived_from_launch_reference(self):
+        with tempfile.TemporaryDirectory() as root:
+            fss = self.gui.DashboardNode()
+            run = fss.recorder.start(root, "self-tossing", "FSS-1")
+            for value in (None, float("nan"), -1):
+                fss.receive("paper_status", {"phase": "LAUNCH", "planned_grasp_time_s": value,
+                           "planned_grasp_time_reference": "LAUNCH"})
+            self.assertNotIn("planned_grasp_time_s", json.loads((run / "session.json").read_text()))
+            fss.receive("paper_status", {"phase": "LAUNCH", "planned_grasp_time_s": 38.25,
+                       "planned_grasp_time_reference": "LAUNCH"})
+            fss.recorder.stop()
+            session = json.loads((run / "session.json").read_text())
+            self.assertEqual(session["planned_grasp_time_s"], 38.25)
+            self.assertEqual(session["planned_grasp_time_reference"], "LAUNCH")
+
     def test_applied_tuning_is_saved_with_experiment(self):
         with tempfile.TemporaryDirectory() as root:
             fss = self.gui.DashboardNode()
