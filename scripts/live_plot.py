@@ -58,7 +58,7 @@ from PySide6.QtWidgets import (
 
 from mission_arm import ViconArmOverlay, feedback_source, joint_angles, link_points, plan_arm_points, pose_yaw_deg
 from mission_link import JetsonLink, PREFERRED_WORKSPACE, SOURCE_TIMEOUT_SEC
-from mission_recording import ExperimentRecorder
+from mission_recording import ExperimentRecorder, save_experiment_memo
 from mission_terminal import TerminalView
 from mission_toss import toss_run_args
 from mission_ros import open_node
@@ -1327,8 +1327,7 @@ class Dashboard(QMainWindow):
             node.append_log(f"실험 기록 시작 · {directory}")
         self._update()
 
-    @staticmethod
-    def _stop_experiment(node, reason):
+    def _stop_experiment(self, node, reason):
         if node.recorder.active:
             node.recorder.capture(node.recording_snapshot())
             try:
@@ -1338,8 +1337,41 @@ class Dashboard(QMainWindow):
                 node.set_command_result(f"실험 저장 실패 · {exc}", 40)
             else:
                 node.append_log(f"실험 저장 · {directory}")
+                self._prompt_experiment_memo(directory, closing=reason == "window_closed")
         node.auto_recording_run = None
         node.auto_recording_deadline = None
+
+    def _prompt_experiment_memo(self, directory, *, closing=False):
+        def save(text):
+            try:
+                save_experiment_memo(directory, text)
+                return True
+            except OSError as exc:
+                QMessageBox.warning(self, "메모 저장 실패", str(exc))
+                return False
+        if closing:
+            text, accepted = QInputDialog.getMultiLineText(self, "실험 메모", str(directory))
+            if accepted:
+                save(text)
+            return
+        dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.setWindowTitle("실험 메모")
+        layout = QVBoxLayout(dialog)
+        label = QLabel(str(directory))
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        editor = QTextEdit()
+        editor.setPlaceholderText("실험 메모")
+        layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("저장")
+        buttons.button(QDialogButtonBox.Cancel).setText("건너뛰기")
+        buttons.accepted.connect(lambda: dialog.accept() if save(editor.toPlainText()) else None)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(440, 260)
+        dialog.show()
 
     def _finish_planned_recording(self, node):
         if not node.recorder.active or not node.auto_recording_run:
@@ -1377,7 +1409,7 @@ class Dashboard(QMainWindow):
             if node.auto_recording_run == key and phase in ("STOPPED", "MISSED", "FAULT"):
                 self._stop_experiment(node, phase.lower())
             return
-        if phase not in ("PREPARING", "LAUNCH", "COAST", "CAPTURING", "CLOSING",
+        if phase not in ("LAUNCH", "COAST", "CAPTURING", "CLOSING",
                          "LOCAL_BRAKE", "PLANNED_BRAKE", "HOLDING"):
             return
         handled = self._recorded_runs.setdefault(endpoint, set())
@@ -1389,7 +1421,7 @@ class Dashboard(QMainWindow):
         if node.recorder.active:
             return
         node.source_run = {"plan_id": plan, "log_directory": directory,
-                           "phase": phase, "partial_join": phase != "PREPARING"}
+                           "phase": phase, "partial_join": phase != "LAUNCH"}
         node.recording_target_revisions = dict(node.target_revisions)
         try:
             saved = node.recorder.start(self._experiment_root, "self-tossing", link.display_id or endpoint)

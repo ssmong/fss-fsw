@@ -89,10 +89,28 @@ def _run_directory(root, name, now):
             index += 1
 
 
-def _save_session(directory, summary):
+def _save_session(directory, summary, *, preserve_memo=True):
+    # Video finalization may arrive after the operator saved a memo.
+    session = directory / "session.json"
+    if preserve_memo and session.is_file():
+        existing = json.loads(session.read_text(encoding="utf-8"))
+        if "memo" in existing:
+            summary["memo"] = existing["memo"]
     tmp = directory / "session.tmp"
     tmp.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(directory / "session.json")
+
+
+def experiment_method(plan_id):
+    match = re.search(r"(?:^|[-/])(Proposed|Nominal|JF_only)(?:$|[-/])", str(plan_id or ""))
+    return match.group(1) if match else None
+
+
+def save_experiment_memo(directory, memo):
+    directory = Path(directory)
+    summary = json.loads((directory / "session.json").read_text(encoding="utf-8"))
+    summary["memo"] = memo
+    _save_session(directory, summary, preserve_memo=False)
 
 
 class ExperimentRecorder:
@@ -130,6 +148,8 @@ class ExperimentRecorder:
             self._strides = Counter()
             self._summary = {"format_version": 2, "experiment": name.strip() or "default", "vehicle": vehicle,
                              "started_at": now.isoformat(), "status": "recording", "pose_source": "vicon"}
+            context = self.context() if self.context else {}
+            self._summary["method"] = experiment_method((context.get("source_run") or {}).get("plan_id"))
             self._video = None
             self.video_error = ""
             self._save_summary()
@@ -241,6 +261,10 @@ class ExperimentRecorder:
                                          "elapsed_s": row["elapsed_s"], **sample})
             if kind == "paper_status":
                 status = vars(value) if isinstance(value, SimpleNamespace) else value
+                method = experiment_method(status.get("plan_id")) if isinstance(status, dict) else None
+                if method and method != self._summary.get("method"):
+                    self._summary["method"] = method
+                    self._save_summary()
                 tuning = status.get("tuning") if isinstance(status, dict) else None
                 if isinstance(tuning, dict) and tuning != self._summary.get("tuning"):
                     self._summary["tuning"] = tuning

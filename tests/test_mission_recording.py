@@ -27,6 +27,21 @@ class RecordingTest(unittest.TestCase):
         with patch.dict(os.environ, QT_QPA_PLATFORM="offscreen"):
             cls.app = live_plot.QApplication.instance() or live_plot.QApplication([])
 
+    def test_method_and_memo_are_saved_in_the_finished_run(self):
+        from mission_recording import save_experiment_memo
+        with tempfile.TemporaryDirectory() as root:
+            for method in ("Proposed", "JF_only", "Nominal"):
+                fss = self.gui.DashboardNode()
+                run = fss.recorder.start(root, "self-tossing", "FSS-1")
+                fss.receive("paper_status", {"phase": "LAUNCH", "plan_id": f"HW-test-{method}-C20"})
+                fss.recorder.stop()
+                save_experiment_memo(run, "파지 성공\n다음엔 gain 변경")
+                self.assertEqual(json.loads((run / "session.json").read_text(encoding="utf-8"))["method"], method)
+                self.assertEqual(json.loads((run / "session.json").read_text(encoding="utf-8"))["memo"], "파지 성공\n다음엔 gain 변경")
+                self.assertFalse((run / "memo.txt").exists())
+                fss.recorder._video_done(NS(error="", frames_written=1, frames_dropped=0), run, fss.recorder._summary)
+                self.assertEqual(json.loads((run / "session.json").read_text(encoding="utf-8"))["memo"], "파지 성공\n다음엔 gain 변경")
+
     def test_applied_tuning_is_saved_with_experiment(self):
         with tempfile.TemporaryDirectory() as root:
             fss = self.gui.DashboardNode()
@@ -36,7 +51,7 @@ class RecordingTest(unittest.TestCase):
             fss.receive("paper_status", {"phase": "IDLE", "tuning": tuning})
             fss.recorder.stop()
             self.assertEqual(json.loads((run / "tuning.json").read_text()), tuning)
-            self.assertEqual(json.loads((run / "session.json").read_text())["tuning"], tuning)
+            self.assertEqual(json.loads((run / "session.json").read_text(encoding="utf-8"))["tuning"], tuning)
 
     def test_archive_uses_every_received_sample_and_unfiltered_logs(self):
         from PySide6.QtGui import QImage
@@ -99,7 +114,7 @@ class RecordingTest(unittest.TestCase):
             self.assertFalse(recorder.video_error, recorder.video_error)
             recorder.stop()
             self.assertTrue(recorder.finish_video())
-            summary = json.loads((run / "session.json").read_text())
+            summary = json.loads((run / "session.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["video"]["status"], "finished")
             self.assertGreaterEqual(summary["video"]["frames"], 1)
             self.assertGreater((run / "trajectory.mp4").stat().st_size, 1000)

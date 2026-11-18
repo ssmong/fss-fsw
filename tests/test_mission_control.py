@@ -26,6 +26,9 @@ class MissionControlTest(unittest.TestCase):
             cls.app = live_plot.QApplication.instance() or live_plot.QApplication([])
 
     def setUp(self):
+        memo = patch.object(self.ui.QInputDialog, "getMultiLineText", return_value=("", False))
+        memo.start()
+        self.addCleanup(memo.stop)
         def video(*args, **kwargs):
             encoder = Mock(finished=False, error="", frames_written=0, frames_dropped=0)
             encoder.stop.side_effect = lambda: setattr(encoder, "finished", True)
@@ -853,6 +856,16 @@ class MissionControlTest(unittest.TestCase):
         self.assertEqual(w._update_plan_and_get_target()[:3], (2., 2., 1.))
         self.assertTrue(link.commands.empty())
 
+    def test_memo_dialog_keeps_finished_run_destination(self):
+        w = self.window
+        with patch.object(self.ui, "save_experiment_memo") as save:
+            w._prompt_experiment_memo(Path("old-run"))
+            dialog = next(d for d in w.findChildren(self.ui.QDialog) if d.windowTitle() == "실험 메모")
+            dialog.findChild(self.ui.QTextEdit).setPlainText("성공")
+            buttons = dialog.findChild(self.ui.QDialogButtonBox)
+            buttons.button(self.ui.QDialogButtonBox.Save).click()
+            save.assert_called_once_with(Path("old-run"), "성공")
+
     def test_automatic_recording_keeps_each_run_and_preserves_manual_archives(self):
         w = self.window
         w.add_jetson("observer", "operator", None, "", monitor_only=True)
@@ -866,27 +879,27 @@ class MissionControlTest(unittest.TestCase):
         def report(phase, run="run-1"):
             first.data.receive("paper_status", dict(
                 frame_id="table", plan_id="plan", log_directory=f"/logs/{run}", phase=phase))
-        for phase in ("IDLE", "WAITING_FOR_A", "CLOSING_AT_A", "A_HELD", "STOPPING", "STOPPED"):
+        for phase in ("IDLE", "WAITING_FOR_A", "CLOSING_AT_A", "A_HELD", "PREPARING", "STOPPING", "STOPPED"):
             report(phase)
         recorder.start.assert_not_called()
-        report("PREPARING")
+        report("LAUNCH")
         recorder.start.assert_called_once_with(w._experiment_root, "self-tossing", "observer")
         self.assertFalse(first.data.source_run["partial_join"])
         self.assertTrue(recorder.capture.called)
-        report("PREPARING")
+        report("LAUNCH")
         report("HOLDING")
         self.assertTrue(recorder.active)
         report("STOPPED")
         recorder.stop.assert_called_once_with("stopped")
         recorded = [call.args[1]["phase"] for call in recorder.record.call_args_list
                     if call.args[0] == "paper_status"]
-        self.assertEqual(recorded, ["PREPARING", "PREPARING", "HOLDING", "STOPPED"])
-        report("PREPARING")  # Repeated old status cannot recreate a run.
+        self.assertEqual(recorded, ["LAUNCH", "LAUNCH", "HOLDING", "STOPPED"])
+        report("LAUNCH")  # Repeated old status cannot recreate a run.
         self.assertFalse(recorder.active)
-        report("LAUNCH", "run-2")
+        report("COAST", "run-2")
         self.assertTrue(first.data.source_run["partial_join"])
         w._stop_experiment(first.data, "operator")
-        report("LAUNCH", "run-2")
+        report("COAST", "run-2")
         self.assertFalse(recorder.active)
         recorder.active = True  # A manual archive already spans the next experiment.
         report("PREPARING", "run-3")
@@ -919,7 +932,7 @@ class MissionControlTest(unittest.TestCase):
             w._update()
         with patch.object(self.ui.time, "monotonic", return_value=200.):
             w._update()
-            self.assertTrue(recorder.active)
+            self.assertFalse(recorder.active)
             self.assertIsNone(node.auto_recording_deadline)
             report("LAUNCH")
             node.receive("paper_trial", ["p", 2., "active/Proposed"])
