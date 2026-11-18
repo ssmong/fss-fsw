@@ -16,6 +16,8 @@ env/
 
 # ROS2 / colcon
 install/
+/.native-build/
+/.native-install/
 log/
 build/
 
