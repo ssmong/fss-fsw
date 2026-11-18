@@ -221,6 +221,17 @@ class TossTests(unittest.TestCase):
         self.assertEqual([event for event, _ in out][-2:], ["toss_error", "body_error"])
         bench.request.assert_not_called()
 
+    def test_private_native_root_offers_body_start_only_when_bench_idle(self):
+        with patch.object(toss, "select_workspace", return_value=toss.PRIVATE):
+            self.assertFalse(self.b.capabilities([], None)[2])
+            binary = self.home / "FSS_FSW/install/fss_gnc/lib/fss_gnc/gnc_node"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"\x7fELF")
+            self.assertTrue(self.b.capabilities([], None)[2])
+            self.assertFalse(self.b.capabilities([], 0)[2])
+            self.flight()
+            self.assertFalse(self.b.capabilities(self.names, None)[2])
+
 
 if __name__ == "__main__":
     unittest.main()

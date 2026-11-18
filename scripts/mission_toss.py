@@ -12,7 +12,7 @@ from pathlib import Path
 if "device_processes" not in globals():  # SSH bridge concatenates these modules.
     from mission_runtime import (FSS_NODES, PRIVATE, ROS_ENV_KEYS, checkout_for, device_processes,
                                  executable_name, guarded_full_launch, launch_package, process_role,
-                                 ros_network, select_workspace)
+                                 native_workspace, ros_network, select_workspace)
 
 
 TOSS_METHODS = ("Proposed", "Nominal", "JF_only")
@@ -244,7 +244,7 @@ class TossBench:
         if domain is None and (status in (TOSS_UPGRADE, "실험 FSW 대기")):
             try:
                 work = select_workspace(os.getenv("FSS_MISSION_PREFERRED", PRIVATE), home=self.home, proc=self.proc)
-                body = work != PRIVATE and guarded_full_launch(self.home / work)
+                body = native_workspace(work, self.home) and guarded_full_launch(self.home / work)
             except (RuntimeError, OSError):
                 pass
         return actions, status, body

@@ -37,7 +37,7 @@ class BodyAvailability(unittest.TestCase):
         ros.spin_once.side_effect = advance
         processes = Mock(side_effect=[{"flight": ["external"]}, {"flight": []}])
         runtime = dict(_starting_flight=object(), prepare_hardware=Mock(), PUBLIC=PUBLIC,
-                       PRIVATE_CPP=PRIVATE_CPP, FSS_NODES={"gnc_node"}, local_stacks=processes)
+                       PRIVATE_CPP=PRIVATE_CPP, PRIVATE=PRIVATE, FSS_NODES={"gnc_node"}, local_stacks=processes)
         modules = {"rclpy": ros, "rosidl_runtime_py.convert": Mock()}
         env = {"ROS_LOCALHOST_ONLY": "1", "ROS_DOMAIN_ID": "0", "FSS_MISSION_WORKSPACE": PUBLIC}
         with (patch.dict(mission_ros.__dict__, runtime), patch.dict(sys.modules, modules),
@@ -50,6 +50,23 @@ class BodyAvailability(unittest.TestCase):
                          [False, False, False, True, True, True, True, True])
         self.assertEqual(processes.call_count, 2)
         runtime["prepare_hardware"].assert_not_called()
+
+
+class CalibratedImuPolicy(unittest.TestCase):
+    def test_profile_uses_config_and_rejects_invalid_values(self):
+        from mission_runtime import profile_uses_imu
+        loader = Mock()
+        with (patch.dict(sys.modules, {"fss_common.hydra_bridge": SimpleNamespace(load_hydra_config=loader)}),
+              patch.dict(os.environ, {"FSS_HYDRA_OVERRIDES": "system.use_imu=false"})):
+            self.assertTrue(profile_uses_imu(None))
+            loader.assert_not_called()
+            for value in (False, True):
+                loader.return_value = SimpleNamespace(system=SimpleNamespace(use_imu=value))
+                self.assertIs(profile_uses_imu(Path("base.launch.py")), value)
+                self.assertEqual(loader.call_args.kwargs["overrides"], ["system.use_imu=false"])
+            loader.return_value = SimpleNamespace(system=SimpleNamespace(use_imu="false"))
+            with self.assertRaisesRegex(ValueError, "system.use_imu"):
+                profile_uses_imu(Path("base.launch.py"))
 
 
 class ValveTelemetry(unittest.TestCase):
@@ -167,6 +184,9 @@ class Discovery(unittest.TestCase):
         self.lease = guard.start()
         self.addCleanup(guard.stop)
         self.lease.return_value.__enter__.return_value.fileno.return_value = 43
+        imu = patch("mission_runtime.profile_uses_imu", return_value=True)
+        imu.start()
+        self.addCleanup(imu.stop)
 
     @staticmethod
     def install_launch_fixture(prefix):
@@ -238,6 +258,63 @@ class Discovery(unittest.TestCase):
         base = ["ros2", "launch", "/home/smrl/FSS_FSW/runtime/cpp/base.launch.py", "use_sim:=false"]
         self.assertEqual(process_role(base, PRIVATE_CPP, env), "flight")
         self.assertEqual(checkout_for(base, {"AMENT_PREFIX_PATH": "/home/smrl/fss-fsw/install/fss_gnc"}), PUBLIC)
+
+    def test_native_private_root_is_preferred_but_toss_launch_still_blocks_body_control(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)):
+            home = Path(tmp)
+            proc = home / "proc"
+            proc.mkdir()
+            for workspace in (PRIVATE, PRIVATE_CPP, PUBLIC):
+                install = home / workspace / "install"
+                binary = install / "fss_gnc/lib/fss_gnc/gnc_node"
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b"\x7fELF")
+                (install / "local_setup.bash").touch()
+            self.assertEqual(select_workspace(PRIVATE, home, proc), PRIVATE)
+            self.assertEqual(select_workspace(PUBLIC, home, proc), PUBLIC)
+            node = [(home / PRIVATE / "install/fss_gnc/lib/fss_gnc/gnc_node").as_posix()]
+            self.assertEqual(process_role(node, PRIVATE), "flight")
+            self.assertEqual(process_role(node, PUBLIC), "competing")
+            env = {"AMENT_PREFIX_PATH": (home / PRIVATE / "install/fss_bringup").as_posix()}
+            launch = ["ros2", "launch", "fss_bringup", "fss_full.launch.py",
+                      "use_arm:=true", "use_thrusters:=false", "use_imu:=true"]
+            self.assertEqual(process_role(launch, PRIVATE, env), "competing")
+            with patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": PRIVATE}), patch(
+                    "mission_runtime.device_processes", return_value=[(launch, env)]):
+                self.assertIn("모니터링", prepare_session()[1])
+                self.assertFalse(local_service_owner("manager_node"))
+            with patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": PUBLIC}), patch(
+                    "mission_runtime.select_workspace", return_value=PRIVATE):
+                self.assertTrue(native_overlay_changed(str(HardwareBusy({}, PRIVATE))))
+
+    def test_native_private_root_vicon_only_start_skips_vendor_imu(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)):
+            home = Path(tmp)
+            install = home / PRIVATE / "install"
+            binary = install / "fss_gnc/lib/fss_gnc/gnc_node"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"\x7fELF")
+            self.install_launch_fixture(install)
+            marker = install / "share/ament_index/resource_index/fss_mission_control/fss_gnc"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("require_explicit_target")
+            profile = home / PRIVATE_CPP / "base.launch.py"
+            profile.parent.mkdir(parents=True)
+            profile.write_text('LaunchConfiguration("require_explicit_target")')
+            vendor = home / "xsens_mti_ros2_driver/install/setup.bash"
+            vendor.parent.mkdir(parents=True)
+            vendor.touch()
+            with (patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": PRIVATE}),
+                  patch.dict(sys.modules, fcntl=SimpleNamespace(LOCK_EX=2, flock=lambda *_: None)),
+                  patch("mission_runtime.local_stacks", return_value={"flight": [], "imu": [], "monitor": {}}),
+                  patch("mission_runtime.profile_uses_imu", return_value=False),
+                  patch("mission_runtime.time.sleep"), patch("mission_runtime.subprocess.Popen") as spawn):
+                spawn.return_value.poll.return_value = None
+                self.assertEqual(prepare_session(start_if_idle=True), ("기체 소프트웨어 기동", ""))
+                command = spawn.call_args.args[0]
+                self.assertNotIn("--imu-script", command)
+                self.assertEqual(spawn.call_args.kwargs["cwd"], home / PRIVATE)
+                self.assertIn(str(profile), command)
 
     def test_nested_native_bringup_uses_pinned_source_and_reuses_isolated_vendor_imu(self):
         for existing_imu in ([], [{"ROS_LOCALHOST_ONLY": "1"}], [{}]):

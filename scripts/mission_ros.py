@@ -505,7 +505,7 @@ def serve(hub=None):
     def can_start_body(names):
         nonlocal next_idle_check, idle
         if (globals().get("read_only") or "prepare_hardware" not in globals()
-                or os.getenv("FSS_MISSION_WORKSPACE") not in (PUBLIC, PRIVATE_CPP)
+                or os.getenv("FSS_MISSION_WORKSPACE") not in (PUBLIC, PRIVATE_CPP, PRIVATE)
                 or os.getenv("ROS_LOCALHOST_ONLY") != "1" or os.getenv("ROS_DOMAIN_ID", "0") != "0"
                 or globals().get("_starting_flight") is not None or FSS_NODES.intersection(names)):
             next_idle_check = 0.0

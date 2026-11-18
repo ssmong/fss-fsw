@@ -2,6 +2,7 @@
 
 import ast
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path, PurePosixPath
@@ -67,7 +68,9 @@ def process_role(argv, selected=None, environ=None):
     name, package = executable_name(argv), launch_package(argv)
     program = program_path(argv)
     launch_file = PurePosixPath(package or "")
-    if (launch_file.name == "arm.launch.py" or (package == "fss_bringup" and "arm.launch.py" in argv)
+    toss_body = (package == "fss_bringup" and "fss_full.launch.py" in argv
+                 and "use_arm:=true" in argv and "use_thrusters:=false" in argv)
+    if (toss_body or launch_file.name == "arm.launch.py" or (package == "fss_bringup" and "arm.launch.py" in argv)
             or "self_tossing_hils" in launch_file.parts
             or package in ("self_tossing_hils", "self_tossing_hardware") or name in ("capture_executor", "paper_toss_node")
             or ({"self_tossing_hils", "self_tossing_hardware"}.intersection(program.parts) and name in
@@ -81,7 +84,7 @@ def process_role(argv, selected=None, environ=None):
     if (name in FSS_NODES or package in ("fss_bringup", "hardware_runtime")
             or launch_file.name in ("fss_full.launch.py", "base.launch.py") or "hardware_runtime" in program.parts):
         project = checkout_for(argv, environ or {})
-        if (project not in (PUBLIC, PRIVATE_CPP) or package == "hardware_runtime"
+        if (not native_workspace(project) or package == "hardware_runtime"
                 or "hardware_runtime" in program.parts or (selected and project != selected)
                 or program.name == "gnc_node.py" or "gnc_backend:=python" in argv):
             return "competing"
@@ -128,9 +131,13 @@ def native_install(work):
     return False
 
 
+def native_workspace(name, home=None):
+    return name in (PUBLIC, PRIVATE_CPP) or (name == PRIVATE and native_install((home or Path.home()) / PRIVATE))
+
+
 def select_workspace(preferred, home=None, proc=Path("/proc"), monitor_only=False):
     home = home or Path.home()
-    candidates = (PRIVATE_CPP, PUBLIC) if preferred == PRIVATE else (PUBLIC, PRIVATE_CPP)
+    candidates = (PRIVATE, PRIVATE_CPP, PUBLIC) if preferred == PRIVATE else (PUBLIC, PRIVATE, PRIVATE_CPP)
     installed = [name for name in candidates if (home / name / "install/local_setup.bash").is_file()
                  and native_install(home / name)]
     legacy_available = (home / PRIVATE / "install/setup.bash").is_file()
@@ -224,7 +231,8 @@ def local_stacks(proc=Path("/proc"), monitor=False, domain=None):
             package = launch_package(argv)
             if package in ("self_tossing_hils", "self_tossing_hardware") or "self_tossing_hils" in program_path(argv).parts:
                 owner = "self_tossing_hils"
-            elif owner == PRIVATE or package == "hardware_runtime":
+            elif ((owner == PRIVATE and not native_workspace(PRIVATE)) or package == "hardware_runtime"
+                  or "use_arm:=true" in argv and "use_thrusters:=false" in argv):
                 owner = "FSS_FSW/hardware_runtime"
             conflicts.add(owner or package or executable_name(argv))
             continue
@@ -280,13 +288,25 @@ def claim_installed_hardware():
     return claim_hardware(probe=lambda: device_resource_owner(share_imu=True))
 
 
+def profile_uses_imu(profile):
+    if profile is None:
+        return True
+    from fss_common.hydra_bridge import load_hydra_config
+    cfg = load_hydra_config(Path.home() / PRIVATE / "config",
+                            overrides=shlex.split(os.getenv("FSS_HYDRA_OVERRIDES", "")))
+    value = cfg.system.use_imu
+    if type(value) is not bool:
+        raise ValueError("system.use_imu must be true or false")
+    return value
+
+
 def prepare_hardware(*, only_if_idle=False):
     """Serialize startup and check ownership again before opening any devices."""
     from fcntl import LOCK_EX, flock
     global _starting_flight
 
     selected = os.getenv("FSS_MISSION_WORKSPACE", PUBLIC)
-    if selected not in (PRIVATE_CPP, PUBLIC):
+    if not native_workspace(selected):
         raise HardwareBusy({}, selected)
     work = Path.home() / selected
     if selected == PRIVATE_CPP:
@@ -312,6 +332,7 @@ def prepare_hardware(*, only_if_idle=False):
         profile = private_base()
         if profile and not profile.is_file():
             raise RuntimeError("실험실 기체 설정 필요 · cd ~/FSS_FSW && bash scripts/cpp_fsw.sh build")
+        use_imu = profile_uses_imu(profile)
         install = Path.home() / selected / "install"
         feature = "share/ament_index/resource_index/fss_mission_control/fss_gnc"
         if not any((prefix / feature).is_file() and
@@ -343,7 +364,7 @@ def prepare_hardware(*, only_if_idle=False):
         with claim_installed_hardware() as lease:
             fd = lease.fileno()
             command = ["python3", "-m", "fss_common.flight_runner"]
-            if not stacks["imu"] and (Path.home() / "xsens_mti_ros2_driver/install/setup.bash").is_file():
+            if use_imu and not stacks["imu"] and (Path.home() / "xsens_mti_ros2_driver/install/setup.bash").is_file():
                 command += ["--imu-script", str(work / "scripts/launch/start_imu.sh"),
                             "--imu-log", str(state / "imu.log")]
             flight = ([str(profile), "use_sim:=false"] if profile
@@ -388,7 +409,7 @@ def prepare_session(monitor_only=False, domain=None, *, start_if_idle=False):
     try:
         stacks = local_stacks(monitor=True, domain=domain)
         environment = stacks["monitor"]
-        if selected == PRIVATE:
+        if selected == PRIVATE and not native_workspace(PRIVATE):
             reason = f"{selected} 모니터링 전용"
         elif monitor_only:
             reason = "모니터링 전용"
@@ -406,7 +427,7 @@ def prepare_session(monitor_only=False, domain=None, *, start_if_idle=False):
     if domain is not None:
         os.environ["ROS_DOMAIN_ID"] = str(domain)
     if (start_if_idle and not reason and not monitor_only and domain is None
-            and selected in (PUBLIC, PRIVATE_CPP) and not stacks["flight"] and not stacks["imu"]):
+            and native_workspace(selected) and not stacks["flight"] and not stacks["imu"]):
         try:
             return prepare_hardware(only_if_idle=True), ""
         except HardwareBusy as busy:
@@ -421,9 +442,9 @@ def prepare_session(monitor_only=False, domain=None, *, start_if_idle=False):
 
 def native_overlay_changed(reason):
     selected = os.environ.get("FSS_MISSION_WORKSPACE")
-    if selected not in (PRIVATE_CPP, PUBLIC):
+    if not native_workspace(selected):
         return False
-    alternate = PUBLIC if selected == PRIVATE_CPP else PRIVATE_CPP
-    if reason != str(HardwareBusy({}, alternate)):
-        return False
-    return select_workspace(os.environ.get("FSS_MISSION_PREFERRED", PUBLIC)) == alternate
+    for alternate in (PRIVATE, PRIVATE_CPP, PUBLIC):
+        if alternate != selected and native_workspace(alternate) and reason == str(HardwareBusy({}, alternate)):
+            return select_workspace(os.environ.get("FSS_MISSION_PREFERRED", PUBLIC)) == alternate
+    return False
