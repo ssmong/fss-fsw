@@ -1230,10 +1230,24 @@ class Dashboard(QMainWindow):
             link.data.send_command("start_body", True)
         self._update()
 
+    def _can_stop_body(self, endpoint, link):
+        return (self._links.get(endpoint) is link and link.ready and not link.stopped.is_set()
+                and link.profile != "monitor" and not link.bridge_error and link.can_stop_body
+                and not link.body_start_pending
+                and time.monotonic() - link.last_body_status_at <= SOURCE_TIMEOUT_SEC)
+
+    def _stop_vehicle_body(self, endpoint, link):
+        for connected in self._links.values():
+            connected.drain()
+        if self._can_stop_body(endpoint, link):
+            link.data.send_command("stop_body", True)
+        self._update()
+
     def _update_body_button(self, index, endpoint, link, label):
         side = QTabBar.RightSide
         button = self._vehicles.tabButton(index, side)
-        if not self._can_start_body(endpoint, link):
+        stopping = self._can_stop_body(endpoint, link)
+        if not stopping and not self._can_start_body(endpoint, link):
             if button is not None:
                 button.setEnabled(False)
                 self._vehicles.setTabButton(index, side, None)
@@ -1243,9 +1257,12 @@ class Dashboard(QMainWindow):
             button = QPushButton("위치제어 시작", self._vehicles)
             button.setObjectName("bodyStart")
             button.adjustSize()
-            button.clicked.connect(lambda: self._start_vehicle_body(endpoint, link))
+            button.clicked.connect(lambda: self._stop_vehicle_body(endpoint, link)
+                                   if self._can_stop_body(endpoint, link) else self._start_vehicle_body(endpoint, link))
             self._vehicles.setTabButton(index, side, button)
-        action = f"{label} 위치제어 FSW 시작"
+        button.setText("FSS 프로세스 종료" if stopping else "위치제어 시작")
+        button.adjustSize()
+        action = f"{label} FSS 프로세스 종료" if stopping else f"{label} 위치제어 FSW 시작"
         button.setAccessibleName(action)
         button.setToolTip(action)
 
@@ -1424,10 +1441,25 @@ class Dashboard(QMainWindow):
         password.setFocus()
         if dialog.exec() and host.text().strip() and user.text().strip():
             self.add_jetson(host.text().strip(), user.text().strip(), None, password.text(),
-                            display_id.text(), arm_equipped=arm.isChecked(), monitor_only=monitor.isChecked())
+                            display_id.text(), arm_equipped=arm.isChecked(), monitor_only=monitor.isChecked(),
+                            prompt_existing=not monitor.isChecked())
+
+    def _choose_existing_processes(self, endpoint, link):
+        link.drain()
+        if not self._can_stop_body(endpoint, link):
+            return
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("FSS 연결")
+        dialog.setText(f"{link.display_id or endpoint}에 실행 중인 FSS 프로세스가 있습니다.")
+        keep = dialog.addButton("기존 프로세스에 연결", QMessageBox.AcceptRole)
+        stop = dialog.addButton("종료 후 연결", QMessageBox.DestructiveRole)
+        dialog.setDefaultButton(keep)
+        dialog.exec()
+        if dialog.clickedButton() is stop:
+            self._stop_vehicle_body(endpoint, link)
 
     def add_jetson(self, host, user, domain, password, display_id=None, monitor_only=False, arm_equipped=None,
-                   profile=None):
+                   profile=None, prompt_existing=False):
         endpoint = host if domain is None else f"{host} / {domain}"
         profile = "monitor" if monitor_only else (profile or "auto")
         arm_key = f"arm_equipped/{endpoint}"
@@ -1461,6 +1493,7 @@ class Dashboard(QMainWindow):
                 self._disconnect_jetson(i)
                 break
         link = JetsonLink(DashboardNode(self._history_sec), profile=profile)
+        link.prompt_existing = prompt_existing
         self._recorders.add(link.data.recorder)
         if profile == "toss":
             link.shells.selected = "log"
@@ -1695,7 +1728,10 @@ class Dashboard(QMainWindow):
             button.setCheckable(True)
             button.clicked.connect(lambda checked=False, state=value: self._send_toss_air(state))
             air.addWidget(button)
-        layout.addLayout(air, 3, 2, 1, 3)
+        self._toss_standby = QPushButton("실험 대기")
+        self._toss_standby.clicked.connect(lambda: self._send_toss("toss_reset"))
+        layout.addWidget(self._toss_standby, 3, 2)
+        layout.addLayout(air, 3, 3, 1, 2)
         self._toss_alignment = QLabel()
         self._toss_alignment.setTextFormat(Qt.PlainText)
         self._toss_alignment.setStyleSheet(f"color:{C_TEXT_DIM};")
@@ -1755,6 +1791,7 @@ class Dashboard(QMainWindow):
         return ""
 
     def _update_toss_controls(self, link):
+        self._toss_standby.setEnabled(bool(self._can_send_toss(link, "toss_reset")))
         for action, button in self._toss_buttons.items():
             button.setEnabled(bool(self._can_send_toss(link, action)))
         active = self._node.active_plan_key()
@@ -2529,8 +2566,8 @@ class Dashboard(QMainWindow):
                 C_ERROR if armed_mode else C_IDLE, "OFF"
             )
 
-        self._btn_air_on.setEnabled(writable and mode_fresh and node.mode_name not in ("EMERGENCY_STOP", "SAFE_HOLD", "NO DATA"))
-        self._btn_air_off.setEnabled(writable and node.mode_name != "NO DATA")
+        self._btn_air_on.setEnabled(writable)
+        self._btn_air_off.setEnabled(writable)
         self._btn_air_on.setChecked(air_state is True)
         self._btn_air_off.setChecked(air_state is False)
 
@@ -2582,6 +2619,11 @@ class Dashboard(QMainWindow):
             self._vehicles.setTabToolTip(i, f"{tooltip}\n{detail}" if detail else tooltip)
             self._vehicles.setTabText(i, f"{short_label} · {status}".replace("&", "&&"))
             self._update_body_button(i, endpoint, link, label)
+            if (getattr(link, "prompt_existing", False) and link.ready
+                    and time.monotonic() - link.last_body_status_at <= SOURCE_TIMEOUT_SEC):
+                link.prompt_existing = False
+                if self._can_stop_body(endpoint, link):
+                    QTimer.singleShot(0, lambda key=endpoint, current=link: self._choose_existing_processes(key, current))
             if endpoint in self._trails:
                 trail, marker = self._trails[endpoint]
                 xs, ys = data.vicon_trail.coordinates()

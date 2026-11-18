@@ -50,6 +50,7 @@ class JetsonLink(QObject):
         self.workspace = None
         self.private_arm = False
         self.can_start_body = False
+        self.can_stop_body = False
         self.body_start_pending = False
         self.last_body_status_at = float("-inf")
         self.read_only = "모니터링 전용" if self.monitor_only else ""
@@ -64,15 +65,23 @@ class JetsonLink(QObject):
                 and self.ready and not self.read_only and not self.bridge_error
                 and not self.stopped.is_set() and not self.toss_pending and not self.body_start_pending
                 and time.monotonic() - self.last_body_status_at <= SOURCE_TIMEOUT_SEC
-                and name in ("toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop") and name in self.toss_actions)
+                and name in ("toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop", "toss_reset") and name in self.toss_actions)
 
     def can_toss_air(self):
-        return self.toss_air_available and any(self.can_toss(action) for action in ("toss_run", "toss_start"))
+        return (self.toss_air_available and self.profile in ("auto", "toss") and self.workflow == "toss"
+                and self.ready and not self.read_only and not self.bridge_error and not self.stopped.is_set()
+                and time.monotonic() - self.last_body_status_at <= SOURCE_TIMEOUT_SEC)
 
     def request(self, name, value):
-        if not self.ready or self.monitor_only or self.read_only or self.stopped.is_set() or self.bridge_error:
+        if (not self.ready or self.monitor_only or (self.read_only and name != "stop_body")
+                or self.stopped.is_set() or self.bridge_error):
             return
-        if name == "valve" and self.workflow == "toss":
+        if name == "stop_body":
+            if (value is not True or not self.can_stop_body or self.body_start_pending
+                    or time.monotonic() - self.last_body_status_at > SOURCE_TIMEOUT_SEC):
+                return
+            self.body_start_pending = True
+        elif name == "valve" and self.workflow == "toss":
             if type(value) is not bool or not self.can_toss_air():
                 return
         elif name.startswith("toss_"):
@@ -125,6 +134,7 @@ class JetsonLink(QObject):
                             self.shells.selected = "log"
                         self.workflow = workflow
                         self.can_start_body = getattr(value, "can_start_body", False)
+                        self.can_stop_body = getattr(value, "can_stop_body", False)
                         self.last_body_status_at = getattr(value, "received_at", float("-inf"))
                         self.toss_actions = tuple(getattr(value, "toss_actions", ()))
                         self.toss_air_available = getattr(value, "toss_air_available", False)
@@ -144,6 +154,7 @@ class JetsonLink(QObject):
                 elif name in ("body_reply", "body_error"):
                     self.body_start_pending = False
                     self.can_start_body = False
+                    self.can_stop_body = False
                     self.data.set_command_result(value, 20 if name == "body_reply" else 40)
                 elif name in ("toss_reply", "toss_error"):
                     self.toss_pending = False
@@ -257,7 +268,7 @@ class JetsonLink(QObject):
                     if time.monotonic() - stamp < 1:
                         ch.sendall((json.dumps([name, value, observer]) + "\n").encode())
                     else:
-                        error_event = "body_error" if name == "start_body" else "reply_error"
+                        error_event = "body_error" if name in ("start_body", "stop_body") else "reply_error"
                         if name.startswith("toss_"):
                             error_event = "toss_error"
                         self.inbox.put([(error_event, "전송 시간 초과")], timeout=2)

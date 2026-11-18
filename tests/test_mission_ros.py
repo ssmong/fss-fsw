@@ -46,7 +46,7 @@ class CatalogRelayTest(unittest.TestCase):
         with patch.dict(sys.modules, modules), patch.multiple(
             mission_ros, create=True, PlanCatalog=lambda: catalog, load_table_plans=Mock(),
             paper_plan_elapsed=Mock(return_value=None), paper_run_files=Mock(return_value=None), PaperTracking=PaperTracking,
-            ValveOutput=Mock(), ArmRegistration=Mock(),
+            ValveOutput=Mock(return_value=Mock(topics=("/actuators/valve_commands", "/actuators/valve_outputs"))), ArmRegistration=Mock(),
         ):
             rejects = Mock()
             _, request = mission_ros.open_node(lambda kind, value: events.append((kind, value)), Mock(), reject=rejects)

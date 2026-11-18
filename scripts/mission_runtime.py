@@ -141,21 +141,14 @@ def select_workspace(preferred, home=None, proc=Path("/proc"), monitor_only=Fals
     candidates = (PRIVATE, PRIVATE_CPP, PUBLIC) if preferred == PRIVATE else (PUBLIC, PRIVATE, PRIVATE_CPP)
     installed = [name for name in candidates if (home / name / "install/local_setup.bash").is_file()
                  and native_install(home / name)]
-    legacy_available = (home / PRIVATE / "install/setup.bash").is_file()
     active = set()
-    competing = False
     for argv, env in device_processes(proc):
         role = process_role(argv, environ=env)
         if role in ("flight", "competing"):
             active.add(checkout_for(argv, env))
-            competing |= role == "competing"
-    if legacy_available and PRIVATE in active:
-        return PRIVATE
     for name in installed:
         if name in active:
             return name
-    if legacy_available and (competing or (monitor_only and not installed)):
-        return PRIVATE
     if installed:
         return installed[0]
     build = ("cd ~/FSS_FSW && bash scripts/cpp_fsw.sh build" if preferred == PRIVATE
@@ -417,9 +410,9 @@ def prepare_session(monitor_only=False, domain=None, *, start_if_idle=False):
     try:
         stacks = local_stacks(monitor=True, domain=domain)
         environment = stacks["monitor"]
-        if selected == PRIVATE and not native_workspace(PRIVATE):
-            reason = f"{selected} 모니터링 전용"
-        elif monitor_only:
+        if not native_workspace(selected):
+            raise RuntimeError("Jetson C++ FSW 설치가 필요합니다.")
+        if monitor_only:
             reason = "모니터링 전용"
         elif not stacks["flight"] and not stacks["imu"]:
             environment = {"ROS_DOMAIN_ID": "0", "ROS_LOCALHOST_ONLY": "1"}

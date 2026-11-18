@@ -10,6 +10,7 @@ import tempfile
 import time
 from types import SimpleNamespace as NS
 import unittest
+from concurrent.futures import Future
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -197,6 +198,49 @@ class SharedTransportTest(unittest.TestCase):
 
 
 class SharedCommandTest(unittest.TestCase):
+    def test_pending_toss_air_and_stop_keep_separate_reply_owners(self):
+        import mission_ros as ros
+        outputs, calls = [], []
+        batches = iter([[(1, "toss_start", True)], [(2, "valve", False)], [(3, "stop_body", True)],
+                        [(4, "target", ["PID", 1, 2, 0])], [(5, "valve", True)], [], []])
+        hub = NS(poll=lambda:next(batches), publish=lambda kind,data,target=None:outputs.append((kind,data,target)),
+                 expired=lambda:False, recording=False)
+        bench = Mock()
+        bench.capabilities.return_value = (("toss_start",), "PREPARING", False)
+        bench.can_control_air.return_value = True
+        toss_done, stop_done = Future(), Future()
+        pool = Mock()
+        pool.submit.side_effect = [toss_done, stop_done]
+        action = None
+        count = [0]
+        def opened(receive, reply, reject):
+            nonlocal action
+            def call(name, value):
+                calls.append((name,value))
+                future = Future()
+                future.set_result(NS(success=True))
+                return future
+            action = ros.MissionActions(call, reply, reject)
+            return Mock(get_node_names=lambda:[],get_name=lambda:"observer"), action.request
+        def spin(*args,**kwargs):
+            count[0] += 1
+            action.tick()
+            if count[0] == 4: toss_done.set_result("toss completed")
+            if count[0] == 5: stop_done.set_result("FSS stopped")
+        rclpy = NS(ok=Mock(side_effect=[True]*7+[False]),spin_once=spin,shutdown=Mock())
+        with (patch.dict(sys.modules,rclpy=rclpy,rosidl_runtime_py=NS(),
+                         **{"rosidl_runtime_py.convert":NS(message_to_ordereddict=lambda x:x)}),
+              patch.object(ros,"open_node",side_effect=opened),
+              patch.multiple(ros,create=True,toss_bench=bench,TOSS_COMMANDS=("toss_start",)),
+              patch("concurrent.futures.ThreadPoolExecutor",return_value=pool)):
+            ros.serve(hub)
+        self.assertEqual(calls,[("toss_air",False)])
+        self.assertIn(("reply","에어베어링 OFF",2),outputs)
+        self.assertIn(("toss_reply","toss completed",1),outputs)
+        self.assertIn(("body_reply","FSS stopped",3),outputs)
+        self.assertTrue(any(k=="reply_error" and owner==4 for k,_,owner in outputs))
+        self.assertTrue(any(k=="reply_error" and owner==5 for k,_,owner in outputs))
+
     def test_display_filter_runs_before_conversion_and_recording_bypasses_it(self):
         import mission_ros as ros
         for recording, expected in ((False, 20), (True, 1000)):

@@ -16,7 +16,7 @@ if "device_processes" not in globals():  # SSH bridge concatenates these modules
 
 
 TOSS_METHODS = ("Proposed", "Nominal", "JF_only")
-TOSS_COMMANDS = ("toss_fss", "toss_run", "toss_close", "toss_start", "toss_stop", "toss_prepare")
+TOSS_COMMANDS = ("toss_fss", "toss_run", "toss_close", "toss_start", "toss_stop", "toss_prepare", "toss_reset")
 TOSS_START_PHASES = ("IDLE", "STOPPED", "MISSED", "A_HELD", "FAULT")
 TOSS_UPGRADE = "Self-tossing FSW 런처 업데이트 필요"
 
@@ -133,6 +133,55 @@ def toss_trigger_reply(output):
     raise RuntimeError("실험 서비스 응답을 확인할 수 없습니다.")
 
 
+def interrupt_fss_processes(processes, proc):
+    """Signal verified process identities, never a login shell or an entire process group."""
+    import signal
+    import select
+
+    handles = {}
+    seen = set()
+    try:
+        for pid, ticks, argv in processes:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            fd = None
+            try:
+                fd = os.pidfd_open(pid)
+                if toss_process(pid, proc)[2] != ticks:
+                    os.close(fd)
+                    fd = None
+                    raise RuntimeError("종료 대상 프로세스가 변경되었습니다.")
+                handles[fd] = executable_name(argv)
+            except (FileNotFoundError, ProcessLookupError):
+                if fd is not None:
+                    os.close(fd)
+                continue
+        for fd in handles:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        pending = set(handles)
+        for timeout, next_signal in ((10, signal.SIGTERM), (5, None)):
+            deadline = time.monotonic() + timeout
+            while pending and time.monotonic() < deadline:
+                ready, _, _ = select.select(list(pending), [], [], .1)
+                pending.difference_update(ready)
+            if not pending:
+                return
+            if next_signal is not None:
+                for fd in pending:
+                    try:
+                        signal.pidfd_send_signal(fd, next_signal)
+                    except ProcessLookupError:
+                        pass
+        raise RuntimeError("종료 확인 시간 초과 · " + ", ".join(sorted({handles[fd] for fd in pending})))
+    finally:
+        for fd in handles:
+            os.close(fd)
+
+
 class TossBench:
     def __init__(self, home=None, proc=Path("/proc")):
         self.home = home or Path.home()
@@ -236,7 +285,65 @@ class TossBench:
         return ("toss_fss",), "실험 FSW 대기"
 
     def available(self, names):
-        return self._stage(names)
+        actions, state = self._stage(names)
+        if self.owned_run() is not None:
+            actions = (*actions, "toss_reset")
+        return actions, state
+
+    def owned_run(self):
+        record = self._owner_record("toss_run")
+        if record is None:
+            return None
+        try:
+            pid, ticks = record[:2]
+            argv = (self.proc / str(pid) / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            if len(argv) < 5 or argv[3:5] != [b"mission-control", b"toss_run"]:
+                return None
+            if Path(os.fsdecode(argv[0])).name not in ("bash", "sh"):
+                return None
+            return pid, ticks
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def can_stop_body(self):
+        return bool(list(device_processes(self.proc)))
+
+    def stop_body(self):
+        from fcntl import LOCK_EX, flock
+        self.state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.cancelled.set()
+        with (self.state / "startup.lock").open("a") as lock:
+            flock(lock, LOCK_EX)
+            targets = []
+            for pid, argv, _ in device_processes(self.proc, with_pid=True):
+                try:
+                    targets.append((pid, toss_process(pid, self.proc)[2], argv))
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+            interrupt_fss_processes(targets, self.proc)
+        return "FSS 프로세스 종료" if targets else "실행 중인 FSS 프로세스 없음"
+
+    def reset_run(self):
+        from fcntl import LOCK_EX, LOCK_NB, flock
+        with (self.state / "startup.lock").open("a") as lock:
+            flock(lock, LOCK_EX | LOCK_NB)
+            owner = self.owned_run()
+            if owner is None:
+                raise RuntimeError("지상국이 시작한 실험 실행기만 대기로 돌릴 수 있습니다.")
+            pid, ticks = owner
+            targets = [(pid, ticks, ["bash", "toss_run"])]
+            for child, argv, env in device_processes(self.proc, with_pid=True):
+                _, session, start = toss_process(child, self.proc)
+                if session != pid:
+                    continue
+                if (ros_network(env) != ros_network(os.environ) or executable_name(argv) in FSS_NODES):
+                    raise RuntimeError("실험 실행기 소유 범위를 확인할 수 없습니다.")
+                targets.append((child, start, argv))
+            if self.owned_run() != owner:
+                raise RuntimeError("실험 실행 소유자 변경")
+            interrupt_fss_processes(targets, self.proc)
+        self.phase, self.phase_at = "", float("-inf")
+        return "실험 대기 · toss_fss 유지"
 
     def position_owner(self):
         try:
@@ -297,10 +404,10 @@ class TossBench:
         return self.request("toss_fss", True, names, verify_service)
 
     def can_control_air(self, names, actions=None):
-        if actions is None:
-            actions, _ = self.available(names)
+        actions, state = self._stage(names)
         return (names.count("valve_driver_node") == 1
-                and bool({"toss_run", "toss_start"}.intersection(actions)))
+                and (bool({"toss_run", "toss_start", "toss_close", "toss_stop"}.intersection(actions))
+                     or state in ("실험 상태 수신 대기", "실험 FSW 준비 중")))
 
     def _has_close_alias(self):
         try:
@@ -328,6 +435,8 @@ class TossBench:
         if action in ("toss_prepare", "toss_run"):
             value = toss_run_args(value)
         self.state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if action == "toss_reset":
+            return self.reset_run()
         if action not in ("toss_prepare", "toss_fss", "toss_run"):
             return self._invoke(action, value, names, verify_service)
         with (self.state / "toss-prepare.lock").open("a") as reservation:

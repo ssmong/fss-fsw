@@ -166,7 +166,7 @@ class TossTests(unittest.TestCase):
                 signal.assert_called_once()
                 close.assert_called_once_with(7)
 
-    def test_air_control_requires_ready_bench_and_owned_idle_experiment(self):
+    def test_air_control_requires_recognized_bench_but_not_experiment_phase(self):
         self.assertFalse(self.b.can_control_air([]))
         self.flight()
         self.assertFalse(self.b.can_control_air(self.names))
@@ -177,11 +177,71 @@ class TossTests(unittest.TestCase):
         (self.b.state / "toss_run.json").write_text('[20, 313, "Nominal"]')
         self.assertTrue(self.b.can_control_air(self.names))
         self.b.observe({"phase": "LAUNCH"})
-        self.assertFalse(self.b.can_control_air(self.names))
+        self.assertTrue(self.b.can_control_air(self.names))
         self.b.observe({"phase": "STOPPED"})
         self.assertTrue(self.b.can_control_air(self.names))
         self.b.phase_at -= 4
-        self.assertFalse(self.b.can_control_air(self.names))
+        self.assertTrue(self.b.can_control_air(self.names))
+
+    def test_explicit_stop_targets_existing_fss_snapshot_after_reconnect(self):
+        self.flight()
+        self.paper(owned=False)
+        reconnected = toss.TossBench(self.home, self.proc)
+        fake_fcntl = SimpleNamespace(LOCK_EX=2, flock=Mock())
+        with patch.dict(sys.modules, fcntl=fake_fcntl), patch.object(toss, "interrupt_fss_processes") as interrupt:
+            self.assertTrue(reconnected.can_stop_body())
+            self.assertEqual(reconnected.stop_body(), "FSS 프로세스 종료")
+            self.assertEqual([pid for pid, _, _ in interrupt.call_args.args[0]], [p[0] for p in self.procs])
+            self.assertTrue(reconnected.cancelled.is_set())
+
+    def test_reset_owned_run_after_reconnect_keeps_fss_and_rejects_stale_owner(self):
+        self.flight()
+        wrapper = ["bash", "-c", 'source "$HOME/.bash_aliases" && "$@"', "mission-control", "toss_run", "Nominal"]
+        self.add(20, 1, 20, wrapper)
+        self.procs.pop()
+        (self.proc / "20/cmdline").write_bytes("\0".join(wrapper).encode() + b"\0")
+        self.add(21, 20, 20, ["ros2", "launch", "self_tossing_hils", "paper_toss.launch.py", "method:=Nominal", "execute:=true"])
+        self.add(22, 21, 20, ["/lab/self_tossing_hardware/install_client/self_tossing_hils/lib/self_tossing_hils/capture_executor"])
+        (self.b.state / "toss_run.json").write_text('[20,313,["Nominal"]]')
+        reconnect = toss.TossBench(self.home, self.proc)
+        self.assertIn("toss_reset", reconnect.available(self.names)[0])
+        with (patch.dict(sys.modules, fcntl=SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=Mock())),
+              patch.object(toss, "interrupt_fss_processes") as interrupt):
+            self.assertEqual(reconnect.reset_run(), "실험 대기 · toss_fss 유지")
+            self.assertEqual([pid for pid, _, _ in interrupt.call_args.args[0]], [20,21,22])
+            (self.b.state / "toss_run.json").write_text('[20,999,["Nominal"]]')
+            self.assertNotIn("toss_reset", reconnect.available(self.names)[0])
+            with self.assertRaises(RuntimeError):
+                reconnect.reset_run()
+            interrupt.assert_called_once()
+
+    def test_changed_pid_identity_is_never_signalled(self):
+        with (patch.object(toss.os, "pidfd_open", return_value=7, create=True),
+              patch.object(toss.os, "close") as close,
+              patch.object(toss, "toss_process", return_value=(1,40,999)),
+              patch("signal.pidfd_send_signal", create=True) as send):
+            with self.assertRaisesRegex(RuntimeError, "변경"):
+                toss.interrupt_fss_processes([(40,313,["manager_node"])], self.proc)
+            send.assert_not_called()
+            close.assert_called_once_with(7)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd shutdown")
+    def test_pidfd_shutdown_leaves_unrelated_process_running(self):
+        import subprocess
+        import time
+        children = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(2)]
+        try:
+            time.sleep(.1)
+            pid = children[0].pid
+            ticks = toss.toss_process(pid, Path("/proc"))[2]
+            toss.interrupt_fss_processes([(pid,ticks,[sys.executable])],Path("/proc"))
+            children[0].wait(timeout=2)
+            self.assertIsNone(children[1].poll())
+        finally:
+            for child in children:
+                if child.poll() is None: child.terminate()
+                child.wait(timeout=3)
 
     def test_idle_upgrade_and_competing_owners(self):
         with patch.object(toss, "guarded_full_launch", return_value=False):

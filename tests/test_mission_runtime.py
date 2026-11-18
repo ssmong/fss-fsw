@@ -75,42 +75,17 @@ class ValveTelemetry(unittest.TestCase):
         self.sink = Mock()
         self.driver = SimpleNamespace(node_name="valve_driver_node", node_namespace="/", endpoint_gid=[1])
         self.gnc = SimpleNamespace(node_name="gnc_node", node_namespace="/", endpoint_gid=[2])
-        self.valve = ValveOutput(self.node, self.sink, SimpleNamespace(Request=SimpleNamespace))
+        self.valve = ValveOutput(self.node, self.sink)
 
     def test_native_requires_only_driver_as_publisher(self):
         msg = SimpleNamespace(header=None, duty_cycles=[.2] * 8)
         for pubs in ([], [self.gnc], [self.driver, self.gnc], [self.driver, self.driver]):
             self.node.get_publishers_info_by_topic.return_value = pubs
-            self.valve.native(msg)
+            self.valve.native(msg, "/actuators/valve_outputs")
         self.sink.assert_not_called()
         self.node.get_publishers_info_by_topic.return_value = [self.driver]
-        self.valve.native(msg)
+        self.valve.native(msg, "/actuators/valve_outputs")
         self.assertEqual(self.sink.call_args.args[1].duty_cycles, [.2] * 8)
-        self.node.get_subscriptions_info_by_topic.return_value = []
-        self.valve.legacy(SimpleNamespace(applied_values=[0] * 8))
-        self.sink.assert_called_once()
-
-    def test_legacy_uses_driver_write_snapshot_and_its_own_scale(self):
-        msg = SimpleNamespace(header=None, commanded_duty_cycles=[.95] * 8, applied_values=[0] * 8)
-        self.node.get_subscriptions_info_by_topic.return_value = [self.driver]
-        self.node.get_publishers_info_by_topic.return_value = [self.driver, self.gnc]
-        self.valve.legacy(msg)
-        self.sink.assert_not_called()
-        self.node.get_publishers_info_by_topic.return_value = [self.driver]
-        future = Future()
-        self.valve.client.call_async.return_value = future
-        self.valve.legacy(msg)
-        self.assertEqual(self.sink.call_args.args[1].duty_cycles, [0] * 8)
-        msg.applied_values[2] = 100
-        self.valve.legacy(msg)
-        self.assertIsNone(self.sink.call_args.args[1].duty_cycles)
-        future.set_result(SimpleNamespace(values=[SimpleNamespace(integer_array_value=[0, 500])]))
-        self.valve.legacy(msg)
-        self.assertEqual(self.sink.call_args.args[1].duty_cycles, [0, 0, .2, 0, 0, 0, 0, 0])
-        self.driver.endpoint_gid = [3]
-        self.valve.client.call_async.return_value = Future()
-        self.valve.legacy(msg)
-        self.assertIsNone(self.sink.call_args.args[1].duty_cycles)
 
 
 class FlightCommands(unittest.TestCase):
@@ -154,6 +129,15 @@ class FlightCommands(unittest.TestCase):
         self.assertEqual(rejected, ["bad target"])
         self.assertEqual(self.replies, [])
         self.assertEqual(len(self.calls), 1)
+
+    def test_air_on_preserves_safe_hold_estop_or_unknown_mode(self):
+        for mode in (None, self.actions.SAFE_HOLD, self.actions.ESTOP):
+            self.calls.clear()
+            self.actions.mode = mode
+            self.actions.request("valve", True)
+            self.assertEqual(self.calls, [("valve", True)])
+            self.accept()
+            self.assertEqual(self.actions.mode, mode)
 
     def test_target_arms_only_after_success_and_off_first_holds(self):
         self.actions.observe("mode", SimpleNamespace(mode=2))
@@ -215,7 +199,8 @@ class Discovery(unittest.TestCase):
             (home / PRIVATE / "install/setup.bash").touch()
             with self.assertRaisesRegex(RuntimeError, "scripts/cpp_fsw.sh build"):
                 select_workspace(PRIVATE, home, proc)
-            self.assertEqual(select_workspace(PRIVATE, home, proc, monitor_only=True), PRIVATE)
+            with self.assertRaisesRegex(RuntimeError, r"C\+\+ FSW"):
+                select_workspace(PRIVATE, home, proc, monitor_only=True)
             for workspace in (PUBLIC, PRIVATE_CPP):
                 install = home / workspace / "install"
                 libdir = install / ("lib" if workspace == PRIVATE_CPP else "fss_gnc/lib") / "fss_gnc"
@@ -235,8 +220,8 @@ class Discovery(unittest.TestCase):
             (child / "environ").write_bytes(b"ROS_DOMAIN_ID=31\x00")
             for active in (PUBLIC, PRIVATE_CPP, PRIVATE):
                 (child / "cmdline").write_bytes(f"/home/smrl/{active}/install/fss_gnc/lib/fss_gnc/gnc_node\0".encode())
-                self.assertEqual(select_workspace(PUBLIC, home, proc), active)
-                self.assertEqual(select_workspace(PRIVATE, home, proc), active)
+                self.assertEqual(select_workspace(PUBLIC, home, proc), PUBLIC if active == PRIVATE else active)
+                self.assertEqual(select_workspace(PRIVATE, home, proc), PRIVATE_CPP if active == PRIVATE else active)
             with patch.dict(os.environ, {"FSS_MISSION_WORKSPACE": PRIVATE}):
                 with patch("mission_runtime.local_stacks", side_effect=lambda **options: local_stacks(proc, **options)), patch("mission_runtime.prepare_hardware") as start:
                     self.assertTrue(prepare_session()[1])
@@ -422,8 +407,7 @@ class Discovery(unittest.TestCase):
                                 boot, "prepare_session", return_value=("ready", "")) as prepare, patch.object(
                                 boot, "private_base", return_value=None):
                             ctx = boot.bridge_context(profile, domain, transition, "control")
-                            expected = (profile == "auto" and domain is None and
-                                        (transition == "body" or transition == "first" and not shared))
+                            expected = profile == "auto" and domain is None and transition == "body"
                             prepare.assert_called_once_with(profile == "monitor", domain, start_if_idle=expected)
                             self.assertTrue(ctx["follow_workflow"])
                 with patch.object(boot, "prepare_session") as prepare, patch.object(boot, "attach_toss") as attach:

@@ -23,7 +23,7 @@ def bridge_context(profile, domain, transition, workflow, *, allow_start=True):
 
     # A shared bench remains available to both operators until someone chooses a task.
     start = (allow_start and not monitor and profile != "toss" and domain is None and
-             (transition == "body" or (transition == "first" and not toss_bench_installed())))
+             transition == "body")
     status, reason = prepare_session(monitor, domain, start_if_idle=start)
     if transition != "passive" and native_overlay_changed(reason):
         raise SystemExit(75)

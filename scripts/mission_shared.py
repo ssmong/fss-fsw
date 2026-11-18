@@ -12,7 +12,7 @@ import threading
 import time
 
 
-SHARED_PROTOCOL = 5
+SHARED_PROTOCOL = 6
 SHARED_CACHE = {"plans", "plan_defaults", "arm_registration", "connected"}
 SHARED_DISPLAY = {"vicon", "ekf", "ref", "arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"}
 
@@ -81,7 +81,7 @@ class SharedHub:
                 if kind == "connected":
                     status = dict(data, shared_bridge=True, shared_clients=len(self.clients))
                     if client["profile"] == "monitor":
-                        status.update(read_only="모니터링 전용", can_start_body=False, toss_actions=[])
+                        status.update(read_only="모니터링 전용", can_start_body=False, can_stop_body=False, toss_actions=[])
                     elif client["profile"] == "control":
                         status["toss_actions"] = []
                     elif client["profile"] == "toss":
@@ -107,7 +107,7 @@ class SharedHub:
                 if key in self.clients:
                     if name != "__attach__" and time.monotonic() - received > 1:
                         error = "toss_error" if name.startswith("toss_") else (
-                            "body_error" if name == "start_body" else "reply_error")
+                            "body_error" if name in ("start_body", "stop_body") else "reply_error")
                         self.publish(error, "중계 명령 대기 시간 초과", target=key)
                     else:
                         items.append((key, name, value))
@@ -139,12 +139,12 @@ class SharedHub:
             client["recording"] = value is True
             return
         error = "toss_error" if isinstance(name, str) and name.startswith("toss_") else (
-            "body_error" if name == "start_body" else "reply_error")
+            "body_error" if name in ("start_body", "stop_body") else "reply_error")
         profile = client["profile"]
         if (profile == "monitor" or (profile == "control" and isinstance(name, str) and name.startswith("toss_"))
-                or (profile == "toss" and name not in ("valve", "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop"))
-                or name not in ("mode", "valve", "target", "controller", "start_body",
-                                "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop")):
+                or (profile == "toss" and name not in ("stop_body", "valve", "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop", "toss_reset"))
+                or name not in ("mode", "valve", "target", "controller", "start_body", "stop_body",
+                                "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop", "toss_reset")):
             self.publish(error, "이 연결에서는 명령을 보낼 수 없습니다.", target=key)
             return
         status = self.cache.get("connected", ({}, None))[0]

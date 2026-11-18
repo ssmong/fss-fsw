@@ -518,6 +518,46 @@ class MissionControlTest(unittest.TestCase):
         self.assertIn("재시작", w._toss_buttons["toss_start"].toolTip())
         self.assertIn("출발", w._toss_buttons["toss_close"].toolTip())
 
+    def test_manual_process_stop_targets_its_fss_and_survives_read_only_conflict(self):
+        w = self.window
+        first = self.connect("first", 0)
+        second = self.connect("second", 1)
+        self.body_status(first, can_stop_body=True, read_only="기존 실험 사용 중", workflow="toss")
+        self.body_status(second, can_stop_body=False)
+        w._update()
+        button = w._vehicles.tabButton(0, self.ui.QTabBar.RightSide)
+        self.assertEqual(button.text(), "FSS 프로세스 종료")
+        button.click()
+        self.assertEqual(first.commands.get_nowait()[1:], ("stop_body", True))
+        self.assertTrue(second.commands.empty())
+
+    def test_existing_process_choice_only_appears_when_processes_exist(self):
+        w = self.window
+        link = self.connect("bench", 0)
+        with patch.object(w, "_choose_existing_processes") as choose:
+            link.prompt_existing = True
+            self.body_status(link, can_stop_body=False)
+            w._update()
+            self.app.processEvents()
+            choose.assert_not_called()
+            link.prompt_existing = True
+            self.body_status(link, can_stop_body=True)
+            w._update()
+            self.app.processEvents()
+            choose.assert_called_once_with("bench / 0", link)
+            w._update()
+            self.app.processEvents()
+            self.assertEqual(choose.call_count, 1)
+
+    def test_toss_standby_sends_explicit_reset(self):
+        w = self.window
+        link = self.connect("bench", 0)
+        self.body_status(link, workflow="toss", toss_actions=["toss_reset", "toss_stop"])
+        w._control_views.button(1).click()
+        self.assertTrue(w._toss_standby.isEnabled())
+        w._toss_standby.click()
+        self.assertEqual(link.commands.get_nowait()[1:], ("toss_reset", True))
+
     def test_toss_air_controls_follow_reported_state_and_permission(self):
         w = self.window
         link = self.connect("bench", 0)
@@ -533,8 +573,11 @@ class MissionControlTest(unittest.TestCase):
         self.assertEqual(link.commands.get_nowait()[1:], ("valve", True))
         self.assertFalse(w._toss_air_on.isChecked())
         self.assertTrue(w._toss_air_off.isChecked())
-        for fields in ({"toss_air_available": False}, {"read_only": "모니터링 전용"},
-                       {"age": 4}, {"toss_actions": ["toss_stop"]}):
+        self.body_status(link, workflow="toss", toss_actions=["toss_stop"], toss_air_available=True)
+        w._update()
+        self.assertTrue(w._toss_air_on.isEnabled())
+        self.assertTrue(w._toss_air_off.isEnabled())
+        for fields in ({"toss_air_available": False}, {"read_only": "모니터링 전용"}, {"age": 4}):
             values = dict(workflow="toss", toss_actions=["toss_run"], toss_air_available=True)
             values.update(fields)
             self.body_status(link, **values)
@@ -1312,7 +1355,7 @@ class MissionControlTest(unittest.TestCase):
         self.assertFalse(self.window._valve_cmd_bar.isVisible())
         self.assertIn("미수신", self.window._valve_title.text())
 
-    def test_stale_mode_blocks_open_and_tracking_expires_after_five_seconds(self):
+    def test_air_control_is_independent_of_mode_and_tracking_expires_after_five_seconds(self):
         link = self.connect("first", 1)
         pose = SimpleNamespace(
             header=SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=0)),
@@ -1327,8 +1370,8 @@ class MissionControlTest(unittest.TestCase):
         with patch.object(self.ui.time, "monotonic", return_value=now):
             self.window._update()
             self.window._btn_air_on.click()
-            self.assertTrue(link.commands.empty())
-            self.assertFalse(self.window._btn_air_on.isEnabled())
+            self.assertEqual(link.commands.get_nowait()[1:], ("valve", True))
+            self.assertTrue(self.window._btn_air_on.isEnabled())
             self.assertTrue(self.window._position_dot.isVisible())
             self.assertTrue(self.window._spacecraft_body.isVisible())
             self.assertEqual(list(self.window._vicon_curve.xData), [pose.x])

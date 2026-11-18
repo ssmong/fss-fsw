@@ -23,6 +23,7 @@ class MissionActions:
         self.air_open = False
         self.steps = self.future = self.step = None
         self.cancel_for_off = False
+        self.cancel_off_name = "valve"
 
     def observe(self, name, msg):
         if name == "mode":
@@ -45,11 +46,15 @@ class MissionActions:
             if initial in (self.PRESSURIZING, self.READY, self.ACTIVE, self.SAFE_HOLD) and self.mode != self.ESTOP:
                 yield "mode", self.IDLE
             return "에어베어링 OFF"
+        if name == "valve" and (self.mode is None or time.monotonic() - self.mode_at > 2.5):
+            yield "valve", True
+            return "에어베어링 ON"
         if self.mode is None or time.monotonic() - self.mode_at > 2.5:
             raise ValueError("기체 모드 수신 대기")
         if name == "valve":
             if self.mode in (self.SAFE_HOLD, self.ESTOP):
-                raise ValueError("정지 모드에서 에어베어링을 열 수 없습니다.")
+                yield "valve", True
+                return "에어베어링 ON"
             prepare = self.mode in (self.IDLE, self.PRESSURIZING)
             if self.mode == self.IDLE:
                 yield "mode", self.PRESSURIZING
@@ -74,9 +79,10 @@ class MissionActions:
         if self.steps is not None:
             if name == "mode" and value == self.ESTOP:
                 self.cancel_for_off = False
-            elif name == "valve" and value is False:
+            elif name in ("valve", "toss_air") and value is False:
                 # Wait for the single outstanding service before closing the air.
                 self.cancel_for_off = True
+                self.cancel_off_name = name
                 return
             else:
                 self.reject("기체 명령 처리 중")
@@ -104,7 +110,7 @@ class MissionActions:
                 else:
                     raise ValueError("기체 응답 시간 초과 · 상태 확인")
             if self.cancel_for_off:
-                self.steps = self._sequence("valve", False)
+                self.steps = self._sequence(self.cancel_off_name, False)
                 self.cancel_for_off = False
             self.step, value = next(self.steps)
             self.deadline = now + 3.0
@@ -117,7 +123,7 @@ class MissionActions:
             self.reject(str(exc))
             if self.cancel_for_off:
                 self.cancel_for_off = False
-                self.request("valve", False)
+                self.request(self.cancel_off_name, False)
 
 
 class ArmRegistration:
@@ -176,70 +182,16 @@ class ArmRegistration:
 
 
 class ValveOutput:
-    topic = "/actuators/valve_commands"
-    status_topic = "/actuators/valve_status"
+    topics = ("/actuators/valve_commands", "/actuators/valve_outputs")
 
-    def __init__(self, node, receive, parameters):
+    def __init__(self, node, receive):
         self.node, self.receive = node, receive
-        self.client = node.create_client(parameters, "/valve_driver_node/get_parameters")
-        self.range_request = parameters.Request(names=["plc.value_range"])
-        self.publisher_id = self.maximum = self.pending = None
-        self.next_query = 0.0
 
-    @staticmethod
-    def is_driver(endpoint):
-        return endpoint.node_name == "valve_driver_node" and endpoint.node_namespace == "/"
-
-    def output(self, header, duties):
-        self.receive("valve_output", SimpleNamespace(header=header, duty_cycles=duties))
-
-    def native(self, msg):
-        # In older workspaces GNC publishes *demand* on the very same topic.
-        publishers = self.node.get_publishers_info_by_topic(self.topic)
-        if len(publishers) == 1 and self.is_driver(publishers[0]):
-            self.output(msg.header, list(msg.duty_cycles))
-
-    def legacy(self, msg):
-        # Only the legacy driver subscribes to valve_commands. Its status
-        # holds a copy of its last successful software write in integer units.
-        if not any(self.is_driver(sub) for sub in self.node.get_subscriptions_info_by_topic(self.topic)):
-            return
-        publishers = self.node.get_publishers_info_by_topic(self.status_topic)
-        if len(publishers) != 1 or not self.is_driver(publishers[0]):
-            return
-        maximum = self.legacy_maximum(bytes(publishers[0].endpoint_gid))
-        values = msg.applied_values
-        duties = None
-        if len(values) == 8:
-            if all(value == 0 for value in values):
-                duties = [0.0] * 8
-            elif maximum and all(0 <= value <= maximum for value in values):
-                duties = [value / maximum for value in values]
-        self.output(msg.header, duties)
-
-    def legacy_maximum(self, publisher_id):
-        if publisher_id != self.publisher_id:
-            if self.pending:
-                self.pending.cancel()
-            self.publisher_id, self.maximum, self.pending = publisher_id, None, None
-            self.next_query = 0.0
-        if self.pending and self.pending.done():
-            try:
-                response = self.pending.result()
-                if response and response.values:
-                    limits = response.values[0].integer_array_value
-                    if len(limits) == 2 and limits[0] == 0 and limits[1] > 0:
-                        self.maximum = limits[1]
-            except Exception:
-                pass  # A driver restart can interrupt an in-flight request.
-            self.pending = None
-        now = time.monotonic()
-        if self.maximum is None and now >= self.next_query and self.client.service_is_ready():
-            if self.pending:
-                self.pending.cancel()
-            self.pending = self.client.call_async(self.range_request)
-            self.next_query = now + 3.0
-        return self.maximum
+    def native(self, msg, topic):
+        publishers = self.node.get_publishers_info_by_topic(topic)
+        if (len(publishers) == 1 and publishers[0].node_name == "valve_driver_node"
+                and publishers[0].node_namespace == "/"):
+            self.receive("valve_output", msg)
 
 
 def open_node(receive, reply, args=None, reject=None):
@@ -248,12 +200,8 @@ def open_node(receive, reply, args=None, reject=None):
         SpacecraftState, SystemHealth, SystemMode, TrajectoryReference, ValveCommands, ValveStatus,
     )
     from fss_interfaces.srv import MainValveControl, SetController, SetSystemMode
-    try:
-        from fss_interfaces.srv import SetTarget
-    except ImportError:
-        SetTarget = None  # Older workspaces still support monitoring and air control.
+    from fss_interfaces.srv import SetTarget
     from rcl_interfaces.msg import Log
-    from rcl_interfaces.srv import GetParameters
     from geometry_msgs.msg import PoseArray, PoseStamped
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Imu, JointState
@@ -270,8 +218,6 @@ def open_node(receive, reply, args=None, reject=None):
                 return
         actions.observe(name, msg)
         receive(name, msg)
-        if name == "valve":
-            valve_output.legacy(msg)
 
     # Standalone SSH code includes the reader; local ROS imports its sibling.
     read_plans = globals().get("load_table_plans")
@@ -354,8 +300,9 @@ def open_node(receive, reply, args=None, reject=None):
     node.create_subscription(String, "/paper_toss/status", paper_status, qos_profile_sensor_data)
     registration = ArmRegistration(node, receive, Trigger)
     node.create_timer(1.0, registration.poll)
-    valve_output = ValveOutput(node, receive, GetParameters)
-    node.create_subscription(ValveCommands, valve_output.topic, valve_output.native, 10)
+    valve_output = ValveOutput(node, receive)
+    for topic in valve_output.topics:
+        node.create_subscription(ValveCommands, topic, lambda msg, t=topic: valve_output.native(msg, t), 10)
 
     for name, topic, msg_type, depth in (
         ("vicon", "/sensors/vicon_state", SpacecraftState, 10),
@@ -380,8 +327,7 @@ def open_node(receive, reply, args=None, reject=None):
         "valve": (node.create_client(MainValveControl, "/actuators/main_valve"), MainValveControl, "open"),
     }
 
-    if SetTarget is not None:
-        services["target"] = (node.create_client(SetTarget, "/gnc/set_target"), SetTarget, None)
+    services["target"] = (node.create_client(SetTarget, "/gnc/set_target"), SetTarget, None)
 
     def call(name, value):
         toss_air = name == "toss_air"
@@ -389,7 +335,7 @@ def open_node(receive, reply, args=None, reject=None):
             bench = globals().get("toss_bench")
             if (type(value) is not bool or not bench or globals().get("toss_monitor")
                     or not bench.can_control_air(node.get_node_names())):
-                raise ValueError("에어베어링 변경은 Self-tossing 대기 상태에서만 가능합니다.")
+                raise ValueError("Self-tossing 에어베어링 명령 대상을 확인할 수 없습니다.")
             name = "valve"
         if globals().get("read_only") and not (toss_air and globals()["read_only"] == "Self-tossing"):
             raise ValueError(globals()["read_only"])
@@ -488,15 +434,26 @@ def serve(hub=None):
     heartbeat = 0.0
     pending = b""
     bench = globals().get("toss_bench")
-    switch_bench = (globals()["TossBench"]() if not bench and "TossBench" in globals()
-                    and globals()["toss_bench_installed"]() else None)
+    switch_bench = globals()["TossBench"]() if not bench and "TossBench" in globals() else None
     passive = globals().get("toss_monitor", False)
     domain = globals().get("toss_domain")
     next_workflow_check = 0.0
-    toss_pool = toss_future = None
+    toss_pool = toss_future = stop_future = None
+    toss_owner = stop_owner = None
+    stopping_requested = False
     if bench or switch_bench:
         from concurrent.futures import ThreadPoolExecutor
-        toss_pool = ThreadPoolExecutor(max_workers=1)
+        toss_pool = ThreadPoolExecutor(max_workers=2)
+
+    def future_result(future, prefix, recipient):
+        try:
+            kind, result = prefix + "_reply", future.result()
+        except Exception as exc:
+            kind, result = prefix + "_error", str(exc) or type(exc).__name__
+        if hub is not None:
+            hub.publish(kind, result, target=recipient)
+        else:
+            emit(kind, result)
 
     def verify_toss_service(service):
         publishers = node.get_publishers_info_by_topic("/paper_toss/status")
@@ -512,7 +469,6 @@ def serve(hub=None):
             raise RuntimeError("실험 서비스 소유자를 확인할 수 없습니다.")
     next_idle_check = 0.0
     idle = False
-    attached_writable = False
 
     def can_start_body(names):
         nonlocal next_idle_check, idle
@@ -534,15 +490,19 @@ def serve(hub=None):
 
     try:
         while rclpy.ok():
-            if hub is not None and hub.expired() and command_owner is None and toss_future is None:
+            if hub is not None and hub.expired() and command_owner is None and toss_future is None and stop_future is None:
                 break
             if toss_future and toss_future.done():
-                try:
-                    emit("toss_reply", toss_future.result())
-                except Exception as exc:
-                    emit("toss_error", str(exc) or type(exc).__name__)
+                future_result(toss_future, "toss", toss_owner)
                 toss_future = None
                 heartbeat = 0.0
+            if stop_future and stop_future.done():
+                future_result(stop_future, "body", stop_owner)
+                stop_future = None
+                heartbeat = 0.0
+            if stopping_requested and stop_future is None and toss_future is None:
+                (bench or switch_bench).cancelled.clear()
+                stopping_requested = False
             if time.monotonic() >= heartbeat:
                 names = node.get_node_names()
                 peers = [name for name in names if name.startswith("fss_mission_")]
@@ -562,7 +522,7 @@ def serve(hub=None):
                     body_allowed = can_start_body(names)
                     if switch_bench and switch_bench.can_switch_position():
                         toss_actions, toss_state = ("toss_fss",), "toss_fss로 Self-tossing 전환"
-                if (globals().get("follow_workflow") and toss_future is None
+                if (globals().get("follow_workflow") and toss_future is None and stop_future is None
                         and time.monotonic() >= next_workflow_check):
                     next_workflow_check = time.monotonic() + 3
                     next_toss = detect_toss_workflow(domain)
@@ -572,10 +532,12 @@ def serve(hub=None):
                 emit("connected", {"observer": node.get_name(), "peers": peers,
                                    "workspace": os.getenv("FSS_MISSION_WORKSPACE"),
                                    "private_arm": globals().get("private_arm", False),
-                                   "can_start_body": body_allowed and not passive and toss_future is None,
+                                   "can_start_body": body_allowed and not passive and toss_future is None and not stopping_requested,
+                                   "can_stop_body": bool(not passive and not stopping_requested and (bench or switch_bench)
+                                                         and (bench or switch_bench).can_stop_body()),
                                    "workflow": "toss" if bench else "control",
-                                   "toss_actions": toss_actions if toss_future is None and not passive else (),
-                                   "toss_air_available": bool(bench and not passive and toss_future is None
+                                   "toss_actions": toss_actions if toss_future is None and stop_future is None and not passive else (),
+                                   "toss_air_available": bool(bench and not passive
                                                               and bench.can_control_air(names, toss_actions)),
                                    "toss_state": toss_state, "read_only": ("모니터링 전용" if passive else "")
                                    if bench else globals().get("read_only", "")})
@@ -592,58 +554,70 @@ def serve(hub=None):
                     commands.append((None, name, value))
             for owner, name, value in commands:
                 if name == "__attach__" and hub is not None:
-                    if not attached_writable:
-                        attached_writable = True
-                        if (not bench and domain is None and not toss_bench_installed()
-                                and can_start_body(node.get_node_names())):
-                            try:
-                                emit("log", {"level": 20, "name": "Mission Control",
-                                             "msg": prepare_hardware(only_if_idle=True)})
-                            except (OSError, RuntimeError, ValueError) as exc:
-                                hub.publish("body_error", str(exc), target=owner)
                     continue
                 error_kind = "toss_error" if name.startswith("toss_") else (
-                    "body_error" if name == "start_body" else "reply_error")
+                    "body_error" if name in ("start_body", "stop_body") else "reply_error")
+                if ((stopping_requested or (toss_future is not None and not bench))
+                        and name != "record_stream" and not (name == "valve" and value is False)
+                        and not (name == "stop_body" and not stopping_requested)):
+                    if hub is not None:
+                        hub.publish(error_kind, "FSS 전환 또는 종료 처리 중", target=owner)
+                    else:
+                        emit(error_kind, "FSS 전환 또는 종료 처리 중")
+                    continue
                 if hub is not None and name != "record_stream":
                     if command_owner is not None:
-                        urgent = not bench and ((name == "mode" and value == MissionActions.ESTOP)
-                                                 or (name == "valve" and value is False))
+                        urgent = (name == "stop_body" and value is True) or (name == "valve" and value is False) or (
+                            not bench and name == "mode" and value == MissionActions.ESTOP)
                         if not urgent:
                             hub.publish(error_kind, "다른 명령 처리 중", target=owner)
                             continue
                         hub.publish(command_error, "다른 연결의 정지 요청으로 명령 종료", target=command_owner)
+                        if name == "stop_body" and isinstance(getattr(request, "__self__", None), MissionActions):
+                            request.__self__.steps = request.__self__.future = None
+                            request.__self__.cancel_for_off = False
                     command_owner, command_error = owner, error_kind
                 if name == "record_stream":
                     recording = value is True
+                elif name == "stop_body":
+                    if value is not True or passive or not (bench or switch_bench) or stop_future is not None:
+                        emit("body_error", "FSS 종료 가능 상태를 확인하세요.")
+                    else:
+                        stopping_requested = True
+                        (bench or switch_bench).cancelled.set()
+                        stop_owner, command_owner = command_owner, None
+                        stop_future = toss_pool.submit((bench or switch_bench).stop_body)
                 elif bench:
                     if name == "valve":
-                        if (passive or toss_future is not None or type(value) is not bool
+                        if (passive or type(value) is not bool
                                 or not bench.can_control_air(node.get_node_names())):
-                            emit("reply_error", "에어베어링 변경은 Self-tossing 대기 상태에서만 가능합니다.")
+                            emit("reply_error", "Self-tossing 에어베어링 명령 대상을 확인할 수 없습니다.")
                         else:
                             request("toss_air", value)
                     elif name == "start_body":
                         try:
-                            if (value is not True or passive or toss_future is not None
+                            if (value is not True or passive or toss_future is not None or stop_future is not None
                                     or not bench.capabilities(node.get_node_names(), domain)[2]):
                                 raise ValueError("기체 실행 가능 상태를 확인하세요.")
                             emit("body_reply", "기체 제어 FSW 전환 중")
                             raise SystemExit(76)
                         except (OSError, RuntimeError, ValueError) as exc:
                             emit("body_error", str(exc))
-                    elif passive or name not in TOSS_COMMANDS or toss_future is not None:
+                    elif passive or name not in TOSS_COMMANDS or toss_future is not None or stop_future is not None:
                         emit("toss_error", "실험 명령 또는 처리 상태를 확인하세요.")
                     else:
+                        toss_owner, command_owner = command_owner, None
                         toss_future = toss_pool.submit(bench.request, name, value, node.get_node_names, verify_toss_service)
                 elif name == "toss_fss":
-                    if (value is not True or passive or not switch_bench or toss_future is not None
+                    if (value is not True or passive or not switch_bench or toss_future is not None or stop_future is not None
                             or globals().get("read_only") or not switch_bench.can_switch_position()):
                         emit("toss_error", "지상국이 시작한 위치제어 본체만 전환할 수 있습니다.")
                     else:
+                        toss_owner, command_owner = command_owner, None
                         toss_future = toss_pool.submit(switch_bench.switch_position, node.get_node_names, verify_toss_service)
                 elif name == "start_body":
                     try:
-                        if value is not True or not can_start_body(node.get_node_names()):
+                        if value is not True or stop_future is not None or toss_future is not None or not can_start_body(node.get_node_names()):
                             raise ValueError("기체 실행 상태를 확인하세요.")
                         emit("body_reply", prepare_hardware())
                     except (OSError, RuntimeError, ValueError) as exc:
