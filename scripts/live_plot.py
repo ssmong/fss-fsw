@@ -1703,7 +1703,7 @@ class Dashboard(QMainWindow):
         self._toss_status.setStyleSheet(f"color:{C_TEXT_DIM};")
         self._toss_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._toss_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        layout.addWidget(self._toss_status, 0, 1, 1, 4)
+        layout.addWidget(self._toss_status, 0, 1, 1, 3)
         self._toss_method = QComboBox()
         self._toss_method.setAccessibleName("Self-tossing 경로")
         self._toss_method.addItems(("Nominal", "JF_only", "Proposed"))
@@ -1723,7 +1723,15 @@ class Dashboard(QMainWindow):
         self._toss_options.setPlaceholderText("추가 옵션 (선택)   이름:=값")
         self._toss_options.textChanged.connect(self._choose_toss_options)
         layout.addWidget(self._toss_options, 1, 2, 1, 3)
-        tuning = QHBoxLayout()
+        self._toss_advanced = QPushButton("고급")
+        self._toss_advanced.setCheckable(True)
+        self._toss_advanced.setAccessibleName("Self-tossing 고급 설정")
+        layout.addWidget(self._toss_advanced, 0, 4)
+        self._toss_tuning_panel = QWidget()
+        tuning = QHBoxLayout(self._toss_tuning_panel)
+        tuning.setContentsMargins(0, 0, 0, 0)
+        self._toss_tuning_panel.hide()
+        self._toss_advanced.toggled.connect(self._toss_tuning_panel.setVisible)
         self._toss_tuning = {}
         for label, key, unit in (("change", "launch_position_gain_change_s", "s"),
                                  ("before pos", "launch_position_gain_before_per_s", "1/s")):
@@ -1736,7 +1744,7 @@ class Dashboard(QMainWindow):
             self._toss_tuning[key] = field
             tuning.addWidget(field)
             tuning.addWidget(QLabel(unit))
-        layout.addLayout(tuning, 4, 0, 1, 5)
+        layout.addWidget(self._toss_tuning_panel, 4, 0, 1, 5)
         self._toss_gripper_position = QLabel("Gripper —")
         self._toss_gripper_position.setTextFormat(Qt.PlainText)
         layout.addWidget(self._toss_gripper_position, 3, 0, 1, 2)

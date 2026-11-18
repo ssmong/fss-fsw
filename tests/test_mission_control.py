@@ -593,6 +593,11 @@ class MissionControlTest(unittest.TestCase):
         self.body_status(first, workflow="toss", toss_actions=["toss_run"])
         w._vehicles.setCurrentIndex(0)
         w._update()
+        self.assertTrue(w._toss_tuning_panel.isHidden())
+        w._toss_advanced.click()
+        self.assertFalse(w._toss_tuning_panel.isHidden())
+        w._toss_advanced.click()
+        self.assertTrue(w._toss_tuning_panel.isHidden())
         fields = list(w._toss_tuning.values())
         for invalid in ("-1", "nan", "inf", "abc"):
             fields[0].setText(invalid)
