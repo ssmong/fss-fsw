@@ -1318,26 +1318,11 @@ class Dashboard(QMainWindow):
         node.auto_recording_run = None
         node.auto_recording_deadline = None
 
-    def _finish_planned_recording(self, node):
+    def _finish_auto_recording(self, node):
         if not node.recorder.active or not node.auto_recording_run:
             return
-        if node.auto_recording_deadline is None:
-            if node.toss_phase not in ("LAUNCH", "COAST", "CAPTURING", "CLOSING", "LOCAL_BRAKE",
-                                       "PLANNED_BRAKE", "HOLDING", "STOPPING"):
-                return
-            key = node.active_plan_key()
-            elapsed = node.paper_elapsed
-            if (key is None or node.paper_trial != node.auto_recording_run[0]
-                    or node.target_revisions["paper_trial"] <= node.recording_target_revisions.get("paper_trial", -1)
-                    or type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0):
-                return
-            times = node.paper_plans[key][2]
-            if not len(times) or not math.isfinite(times[-1]):
-                return
-            # Anchor to the running plan clock, not the potentially long preparation.
-            node.auto_recording_deadline = time.monotonic() + max(0., float(times[-1]) + 5. - elapsed)
-        if time.monotonic() >= node.auto_recording_deadline:
-            self._stop_experiment(node, "plan_finished_plus_5s")
+        if node.auto_recording_deadline is not None and time.monotonic() >= node.auto_recording_deadline:
+            self._stop_experiment(node, "experiment_stopped_plus_10s")
 
     def _auto_record_status(self, endpoint, link, message, after):
         data = message if isinstance(message, dict) else getattr(message, "__dict__", {})
@@ -1352,7 +1337,8 @@ class Dashboard(QMainWindow):
                 node.source_run["phase"] = phase
                 node.recorder.capture(node.recording_snapshot())
             if node.auto_recording_run == key and phase in ("STOPPED", "MISSED", "FAULT"):
-                self._stop_experiment(node, phase.lower())
+                if node.auto_recording_deadline is None:
+                    node.auto_recording_deadline = time.monotonic() + 10.
             return
         if phase not in ("PREPARING", "LAUNCH", "COAST", "CAPTURING", "CLOSING",
                          "LOCAL_BRAKE", "PLANNED_BRAKE", "HOLDING"):
@@ -2555,7 +2541,7 @@ class Dashboard(QMainWindow):
             data = link.data
             if link.bridge_error:
                 self._stop_experiment(data, "telemetry_disconnected")
-            self._finish_planned_recording(data)
+            self._finish_auto_recording(data)
             self._report_recording_error(data)
             if data.recorder.active:
                 data.recorder.capture(data.recording_snapshot())

@@ -805,7 +805,10 @@ class MissionControlTest(unittest.TestCase):
         report("HOLDING")
         self.assertTrue(recorder.active)
         report("STOPPED")
-        recorder.stop.assert_called_once_with("stopped")
+        self.assertTrue(recorder.active)
+        with patch.object(self.ui.time, "monotonic", return_value=first.data.auto_recording_deadline):
+            w._finish_auto_recording(first.data)
+        recorder.stop.assert_called_once_with("experiment_stopped_plus_10s")
         recorded = [call.args[1]["phase"] for call in recorder.record.call_args_list
                     if call.args[0] == "paper_status"]
         self.assertEqual(recorded, ["PREPARING", "PREPARING", "HOLDING", "STOPPED"])
@@ -826,7 +829,7 @@ class MissionControlTest(unittest.TestCase):
         self.assertTrue(first.commands.empty() and second.commands.empty())
         recorder.active = False
 
-    def test_auto_recording_stops_five_seconds_after_active_plan_without_stopping_hardware(self):
+    def test_auto_recording_keeps_ten_seconds_after_stop_without_stopping_hardware(self):
         w = self.window
         first, second = self.connect("first", 1), self.connect("second", 2)
         node = first.data
@@ -852,20 +855,30 @@ class MissionControlTest(unittest.TestCase):
             report("LAUNCH")
             node.receive("paper_trial", ["p", 2., "active/Proposed"])
             w._update()
-            self.assertEqual(node.auto_recording_deadline, 213.)
-        # A stale or stopped plan clock cannot leave the archive open forever.
-        with patch.object(self.ui.time, "monotonic", return_value=212.99):
+            self.assertIsNone(node.auto_recording_deadline)
+        # A plan ending does not truncate the actual experiment or its post-stop tail.
+        with patch.object(self.ui.time, "monotonic", return_value=300.):
+            node.receive("paper_trial", ["p", 102., "active/Proposed"])
             w._update()
             self.assertTrue(recorder.active)
-        with patch.object(self.ui.time, "monotonic", return_value=213.):
+            report("STOPPED")
+            self.assertEqual(node.auto_recording_deadline, 310.)
+        with patch.object(self.ui.time, "monotonic", return_value=309.99):
+            report("STOPPED")  # Repeated status must not extend the tail.
             w._update()
-            recorder.stop.assert_called_once_with("plan_finished_plus_5s")
+            self.assertTrue(recorder.active)
+            self.assertEqual(node.auto_recording_deadline, 310.)
+        with patch.object(self.ui.time, "monotonic", return_value=310.):
+            w._update()
+            recorder.stop.assert_called_once_with("experiment_stopped_plus_10s")
             self.assertFalse(recorder.active)
             report("HOLDING")
             self.assertFalse(recorder.active)
-            # Joining a different run after its deadline saves and immediately closes it.
             report("HOLDING", "two")
-            node.receive("paper_trial", ["p", 16., "active/Proposed"])
+            report("FAULT", "two")
+            self.assertEqual(node.auto_recording_deadline, 320.)
+            self.assertTrue(recorder.active)
+        with patch.object(self.ui.time, "monotonic", return_value=320.):
             w._update()
             self.assertEqual(recorder.stop.call_count, 2)
             self.assertFalse(recorder.active)
