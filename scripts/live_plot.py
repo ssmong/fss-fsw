@@ -1661,32 +1661,34 @@ class Dashboard(QMainWindow):
         self._toss_status.setStyleSheet(f"color:{C_TEXT_DIM};")
         self._toss_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._toss_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        layout.addWidget(self._toss_status, 0, 1, 1, 3)
+        layout.addWidget(self._toss_status, 0, 1, 1, 4)
         self._toss_method = QComboBox()
         self._toss_method.setAccessibleName("Self-tossing 경로")
         self._toss_method.addItems(("Nominal", "JF_only", "Proposed"))
         self._toss_method.currentTextChanged.connect(self._choose_toss_method)
-        layout.addWidget(self._toss_method, 1, 0)
+        layout.addWidget(self._toss_method, 1, 0, 1, 2)
         self._toss_buttons = {}
-        for col, (action, label) in enumerate((
-                ("toss_prepare", "준비"), ("toss_start", "출발"), ("toss_stop", "정지")), start=1):
-            button = QPushButton(label)
-            button.setAccessibleName("선택한 실험 준비" if action == "toss_prepare" else f"Self-tossing {label}")
+        for col, action in enumerate(("toss_fss", "toss_run", "toss_close", "toss_start", "toss_stop")):
+            button = QPushButton(action)
+            button.setAccessibleName(action)
             if action == "toss_start":
                 button.setObjectName("sendTarget")
             button.clicked.connect(lambda checked=False, name=action: self._send_toss(name))
-            layout.addWidget(button, 1, col)
+            layout.addWidget(button, 2, col)
             self._toss_buttons[action] = button
         self._toss_options = QLineEdit()
         self._toss_options.setAccessibleName("toss_run 추가 옵션")
         self._toss_options.setPlaceholderText("추가 옵션 (선택)   이름:=값")
         self._toss_options.textChanged.connect(self._choose_toss_options)
-        layout.addWidget(self._toss_options, 2, 0, 1, 4)
+        layout.addWidget(self._toss_options, 1, 2, 1, 3)
+        self._toss_gripper_position = QLabel("Gripper —")
+        self._toss_gripper_position.setTextFormat(Qt.PlainText)
+        layout.addWidget(self._toss_gripper_position, 3, 0, 1, 5)
         self._toss_alignment = QLabel()
         self._toss_alignment.setTextFormat(Qt.PlainText)
         self._toss_alignment.setStyleSheet(f"color:{C_TEXT_DIM};")
         self._toss_alignment.hide()
-        layout.addWidget(self._toss_alignment, 3, 0, 1, 4)
+        layout.addWidget(self._toss_alignment, 4, 0, 1, 5)
         return panel
 
     def _can_send_toss(self, link, action):
@@ -1709,8 +1711,8 @@ class Dashboard(QMainWindow):
         for connected in self._links.values():
             connected.drain()
         if self._can_send_toss(link, action):
-            value = self._toss_method.currentText() if action == "toss_prepare" else True
-            if action == "toss_prepare" and self._toss_options.text().strip():
+            value = self._toss_method.currentText() if action == "toss_run" else True
+            if action == "toss_run" and self._toss_options.text().strip():
                 try:
                     value = [value, *shlex.split(self._toss_options.text())]
                     toss_run_args(value)
@@ -1735,8 +1737,7 @@ class Dashboard(QMainWindow):
     def _update_toss_controls(self, link):
         for action, button in self._toss_buttons.items():
             button.setEnabled(bool(self._can_send_toss(link, action)))
-        prepare = self._toss_buttons["toss_prepare"]
-        prepare.setToolTip("실험 본체와 계획 실행기를 준비합니다. 기체 설정에 따라 에어베어링이 열립니다.")
+        run = self._toss_buttons["toss_run"]
         active = self._node.active_plan_key()
         bound = bool(active and self._node.toss_phase not in ("STOPPED", "MISSED", "FAULT"))
         method = active.rsplit("/", 1)[-1] if bound else self._node.toss_method
@@ -1746,17 +1747,14 @@ class Dashboard(QMainWindow):
         self._toss_method.setEnabled(not bound)
         self._toss_method.setToolTip("현재 실험의 경로" if bound else "실험 경로 미리보기")
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
-        start = self._toss_buttons["toss_start"]
-        grasp_first = (phase_fresh and self._node.toss_phase in ("IDLE", "STOPPED", "MISSED")
-                       and self._node.toss_gripper in ("IDLE", "STOPPED", "OPEN", "OPEN_PASSIVE"))
-        start.setText("파지 후 출발" if grasp_first else "출발")
-        start.setToolTip("시작 위치·Yaw에 도달하면 자동으로 파지하고 출발합니다." if grasp_first
-                         else "실험 실행기에 출발을 요청합니다.")
-        choosing = not phase_fresh or prepare.isEnabled()
         self._toss_method.setVisible(True)
-        self._toss_options.setVisible(choosing)
-        self._toss_options.setEnabled(prepare.isEnabled())
-        prepare.setVisible(choosing)
+        self._toss_options.setEnabled(run.isEnabled())
+        gripper = "Gripper —"
+        if (self._node.arm_equipped and self._node.arm_tcp is not None
+                and self._node.source_age("arm_tcp") < ARM_TIMEOUT_SEC):
+            x, y = self._node.arm_tcp
+            gripper = f"Gripper   X {x:.3f} m   Y {y:.3f} m"
+        self._toss_gripper_position.setText(gripper)
         if not link or not link.ready or link.stopped.is_set() or link.bridge_error:
             status = "연결 대기"
         elif phase_fresh:

@@ -79,6 +79,12 @@ class SharedTransportTest(unittest.TestCase):
         self.assertEqual(self.hub.poll(), [(cid, "target", ["PID", 1, 2, 0])])
         self.hub.publish("reply", "done", target=cid)
         self.assertEqual(self.receive(control), ["reply", "done"])
+        control.sendall((json.dumps(["toss_close", True, "one"]) + "\n").encode())
+        self.until(lambda: not self.hub.commands.empty())
+        self.assertEqual(self.hub.poll(), [(cid, "toss_close", True)])
+        monitor.sendall((json.dumps(["toss_close", True, "one"]) + "\n").encode())
+        self.assertEqual(self.receive(monitor)[0], "toss_error")
+        self.assertEqual(self.hub.poll(), [])
         monitor.settimeout(.1)
         with self.assertRaises(socket.timeout):
             monitor.recv(1)

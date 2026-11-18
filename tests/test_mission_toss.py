@@ -82,7 +82,7 @@ class TossTests(unittest.TestCase):
 
     def test_external_executor_status_is_observe_only(self):
         self.flight()
-        self.assertEqual(self.b.available(self.names)[0], ("toss_prepare",))
+        self.assertEqual(self.b.available(self.names)[0], ("toss_run",))
         self.paper()
         self.assertEqual(self.b.available(self.names), ((), "기존 실험 · IDLE"))
         (self.b.state / "toss_run.json").write_text("[20, 999]")
@@ -106,7 +106,7 @@ class TossTests(unittest.TestCase):
     def test_idle_upgrade_and_competing_owners(self):
         with patch.object(toss, "guarded_full_launch", return_value=False):
             self.assertEqual(self.b.available([])[0], ())
-        self.assertEqual(self.b.available([])[0], ("toss_prepare",))
+        self.assertEqual(self.b.available([])[0], ("toss_fss",))
         self.assertEqual(self.b.available(["gnc_node"])[0], ())
         self.flight()
         self.procs[0][1].append("use_thrusters:=true")
@@ -127,11 +127,45 @@ class TossTests(unittest.TestCase):
         with patch.dict(sys.modules, fcntl=fake_fcntl), patch.object(self.b, "_invoke", side_effect=launch) as invoke:
             self.assertIn("준비 완료", self.b.request("toss_prepare", "Nominal", lambda: self.names, Mock()))
             self.assertEqual([x.args[0] for x in invoke.call_args_list], ["toss_fss", "toss_run"])
-            for action, value in (("toss_fss", True), ("toss_run", "Nominal"),
+            for action, value in (("toss_fss", "yes"), ("toss_run", "Unknown"),
                                   ("toss_prepare", "Nominal;echo foo"), ("toss_start", "yes")):
                 with self.assertRaises(ValueError):
                     self.b.request(action, value, lambda: self.names, Mock())
             self.assertEqual(invoke.call_count, 2)
+
+    def test_raw_launch_buttons_invoke_only_the_selected_command(self):
+        fake_fcntl = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=Mock())
+        with patch.dict(sys.modules, fcntl=fake_fcntl), patch.object(self.b, "_invoke") as invoke:
+            self.b.request("toss_fss", True, list, Mock())
+            self.assertEqual(invoke.call_count, 1)
+            self.assertEqual(invoke.call_args.args[:2], ("toss_fss", True))
+            self.b.request("toss_run", ["Nominal", "tracking_mode:=current"], list, Mock())
+            self.assertEqual(invoke.call_count, 2)
+            self.assertEqual(invoke.call_args.args[:2], ("toss_run", ["Nominal", "tracking_mode:=current"]))
+
+    def test_close_requires_existing_alias_and_owned_fresh_executor(self):
+        self.flight()
+        self.paper(owned=True)
+        self.assertNotIn("toss_close", self.b.available(self.names)[0])
+        (self.home / ".bash_aliases").write_text("toss_close() { :; }\n")
+        self.assertEqual(self.b.available(self.names)[0], ("toss_close", "toss_start"))
+        self.b.observe({"phase": "WAITING_FOR_A"})
+        self.assertEqual(self.b.available(self.names)[0], ("toss_close", "toss_stop"))
+        self.b.observe({"phase": "LAUNCH"})
+        self.assertEqual(self.b.available(self.names)[0], ("toss_stop",))
+        self.b.phase_at -= 4
+        self.assertEqual(self.b.available(self.names)[0], ())
+
+    @unittest.skipUnless(os.name == "posix", "Linux alias service forwarding")
+    def test_close_checks_manual_close_start_service_and_preserves_refusal(self):
+        (self.home / ".bash_aliases").write_text(
+            "toss_close() { echo \"std_srvs.srv._trigger.Trigger_Response(success=False, message='fixture refused')\"; }\n")
+        verify = Mock()
+        with (patch.dict(os.environ, HOME=str(self.home)),
+              patch.object(self.b, "_stage", return_value=(("toss_close",), "WAITING_FOR_A")),
+              self.assertRaisesRegex(RuntimeError, "fixture refused")):
+            self.b.request("toss_close", True, lambda: self.names, verify)
+        verify.assert_called_once_with("/paper_toss/manual_close_start")
 
     def test_trigger_refusal_and_cli_errors_are_not_success(self):
         line = "response:\nstd_srvs.srv._trigger.Trigger_Response(success={}, message='device busy')"

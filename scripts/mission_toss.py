@@ -16,7 +16,7 @@ if "device_processes" not in globals():  # SSH bridge concatenates these modules
 
 
 TOSS_METHODS = ("Proposed", "Nominal", "JF_only")
-TOSS_COMMANDS = ("toss_prepare", "toss_start", "toss_stop")
+TOSS_COMMANDS = ("toss_fss", "toss_run", "toss_close", "toss_start", "toss_stop", "toss_prepare")
 TOSS_START_PHASES = ("IDLE", "STOPPED", "MISSED", "A_HELD")
 TOSS_UPGRADE = "Self-tossing FSW 런처 업데이트 필요"
 
@@ -215,9 +215,12 @@ class TossBench:
             if not fss or not paper or not executors or "paper_toss_executor" not in names or not phase:
                 return (), "실험 상태 수신 대기"
             if phase in TOSS_START_PHASES:
+                close = ("toss_close",) if self._has_close_alias() else ()
                 if phase == "A_HELD":
-                    return ("toss_start", "toss_stop"), phase
-                return ("toss_start",), phase
+                    return (*close, "toss_start", "toss_stop"), phase
+                return (*close, "toss_start"), phase
+            if phase == "WAITING_FOR_A" and self._has_close_alias():
+                return ("toss_close", "toss_stop"), phase
             return ("toss_stop",), phase
         if fss:
             if ({"arm_driver_node", "manager_node"}.issubset(names)
@@ -233,10 +236,14 @@ class TossBench:
         return ("toss_fss",), "실험 FSW 대기"
 
     def available(self, names):
-        actions, status = self._stage(names)
-        if actions in (("toss_fss",), ("toss_run",)):
-            actions = ("toss_prepare",)
-        return actions, status
+        return self._stage(names)
+
+    def _has_close_alias(self):
+        try:
+            return bool(re.search(r"^\s*(?:function\s+)?toss_close\s*\(\s*\)\s*\{",
+                                  (self.home / ".bash_aliases").read_text(), re.MULTILINE))
+        except OSError:
+            return False
 
     def capabilities(self, names, domain):
         actions, status = self.available(names)
@@ -252,18 +259,20 @@ class TossBench:
     def request(self, action, value, names, verify_service):
         from fcntl import LOCK_EX, LOCK_NB, flock
 
-        if action not in TOSS_COMMANDS or (action != "toss_prepare" and value is not True):
+        if action not in TOSS_COMMANDS or (action not in ("toss_prepare", "toss_run") and value is not True):
             raise ValueError("올바르지 않은 실험 요청")
-        if action == "toss_prepare":
+        if action in ("toss_prepare", "toss_run"):
             value = toss_run_args(value)
         self.state.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if action != "toss_prepare":
+        if action not in ("toss_prepare", "toss_fss", "toss_run"):
             return self._invoke(action, value, names, verify_service)
         with (self.state / "toss-prepare.lock").open("a") as reservation:
             try:
                 flock(reservation, LOCK_EX | LOCK_NB)
             except BlockingIOError as exc:
                 raise RuntimeError("다른 관제에서 실험 준비 중") from exc
+            if action != "toss_prepare":
+                return self._invoke(action, value, names, verify_service)
             actions, status = self._stage(names())
             expected_fss = None
             if actions == ("toss_fss",):
@@ -285,7 +294,7 @@ class TossBench:
             deadline = time.monotonic() + 25
             while not self.cancelled.wait(0.25):
                 actions, status = self._stage(names(), expected_fss)
-                if actions and all(item in ("toss_start", "toss_stop") for item in actions):
+                if actions and all(item in ("toss_close", "toss_start", "toss_stop") for item in actions):
                     return f"{value[0]} 실험 준비 완료 · {status}"
                 if (not self._owner("toss_run") or time.monotonic() >= deadline
                         or status != "실험 상태 수신 대기"):
@@ -306,8 +315,9 @@ class TossBench:
             command = ["bash", "-c", 'source "$HOME/.bash_aliases" && "$@"', "mission-control", action]
             if action == "toss_run":
                 command.extend(value)
-            if action in ("toss_start", "toss_stop"):
-                verify_service("/paper_toss/" + action.removeprefix("toss_"))
+            if action in ("toss_close", "toss_start", "toss_stop"):
+                service = "manual_close_start" if action == "toss_close" else action.removeprefix("toss_")
+                verify_service("/paper_toss/" + service)
                 # These aliases call the existing Trigger service, including its ownership/interlock checks.
                 # A ROS CLI exit status alone does not establish that the request was accepted.
                 with (self.state / "toss-trigger.log").open("w+") as output:

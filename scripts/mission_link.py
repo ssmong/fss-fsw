@@ -63,7 +63,7 @@ class JetsonLink(QObject):
                 and self.ready and not self.read_only and not self.bridge_error
                 and not self.stopped.is_set() and not self.toss_pending and not self.body_start_pending
                 and time.monotonic() - self.last_body_status_at <= SOURCE_TIMEOUT_SEC
-                and name in ("toss_prepare", "toss_start", "toss_stop") and name in self.toss_actions)
+                and name in ("toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop") and name in self.toss_actions)
 
     def request(self, name, value):
         if not self.ready or self.monitor_only or self.read_only or self.stopped.is_set() or self.bridge_error:
@@ -71,7 +71,7 @@ class JetsonLink(QObject):
         if name.startswith("toss_"):
             if not self.can_toss(name):
                 return
-            if name == "toss_prepare":
+            if name in ("toss_prepare", "toss_run"):
                 try:
                     args = toss_run_args(value)
                 except ValueError:

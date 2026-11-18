@@ -262,7 +262,7 @@ class MissionControlTest(unittest.TestCase):
         link = w._links["192.168.0.9"]
         self.assertEqual(link.profile, "auto")
         self.assertTrue(link.commands.empty())
-        self.body_status(link, workflow="toss", toss_actions=["toss_prepare"], toss_state="대기")
+        self.body_status(link, workflow="toss", toss_actions=["toss_run"], toss_state="대기")
         w._update()
         self.assertEqual(link.shells.selected, "log")
         self.assertFalse(w._controls.isHidden())
@@ -272,18 +272,18 @@ class MissionControlTest(unittest.TestCase):
         body_start = w._vehicles.tabButton(0, ui.QTabBar.RightSide)
         self.assertIsNotNone(body_start)
         self.assertEqual(body_start.text(), "본체 시작")
-        prepare = w._toss_buttons["toss_prepare"]
-        self.assertEqual(prepare.text(), "준비")
+        prepare = w._toss_buttons["toss_run"]
+        self.assertEqual(prepare.text(), "toss_run")
         self.assertTrue(prepare.isEnabled())
         self.assertEqual([w._toss_method.itemText(i) for i in range(w._toss_method.count())],
                          ["Nominal", "JF_only", "Proposed"])
         self.assertIn("경로", [label.text() for label in w._toss_controls.findChildren(ui.QLabel)])
-        self.assertEqual(prepare.accessibleName(), "선택한 실험 준비")
+        self.assertEqual(prepare.accessibleName(), "toss_run")
         self.assertTrue(link.commands.empty())
         body_start.click()
         self.assertEqual(link.commands.get_nowait()[1:], ("start_body", True))
         self.assertTrue(link.commands.empty())
-        self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
+        self.assertFalse(w._toss_buttons["toss_run"].isEnabled())
         link.inbox.put([("body_reply", "기동")])
         self.body_status(link, workflow="control", can_start_body=False)
         w._update()
@@ -296,7 +296,7 @@ class MissionControlTest(unittest.TestCase):
         w = self.window
         first, second = self.connect("first", 0), self.connect("second", 1)
         first.data.tracking_since = self.ui.time.monotonic() - 60
-        self.body_status(first, workflow="toss", toss_actions=["toss_prepare"])
+        self.body_status(first, workflow="toss", toss_actions=["toss_run"])
         self.body_status(second, can_start_body=False)
         w._update()
         self.assertTrue(w._vehicles.tabText(0).endswith("Missing"))
@@ -319,7 +319,7 @@ class MissionControlTest(unittest.TestCase):
         w._control_views.button(1).click()
         self.assertFalse(w._toss_controls.isHidden())
         first = self.connect("first", 0)
-        self.body_status(first, workflow="toss", toss_actions=["toss_prepare"], can_start_body=False)
+        self.body_status(first, workflow="toss", toss_actions=["toss_run"], can_start_body=False)
         w._update()
         self.assertTrue(w._control_views.button(0).isChecked())
         self.assertFalse(w._controls.isHidden())
@@ -334,10 +334,10 @@ class MissionControlTest(unittest.TestCase):
         self.assertTrue(w._send_target_button.isEnabled())
         w._control_views.button(1).click()
         self.assertFalse(w._toss_controls.isHidden())
-        self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
+        self.assertFalse(w._toss_buttons["toss_run"].isEnabled())
         self.assertFalse(w._btn_estop.isHidden())
         self.assertTrue(w._btn_estop.isEnabled())
-        w._toss_buttons["toss_prepare"].click()
+        w._toss_buttons["toss_run"].click()
         w._control_views.button(0).click()
         w._vehicles.setCurrentIndex(0)
         self.assertTrue(w._control_views.button(1).isChecked())
@@ -345,7 +345,7 @@ class MissionControlTest(unittest.TestCase):
         self.body_status(first, workflow="control", can_start_body=False)
         w._update()
         self.assertFalse(w._toss_controls.isHidden())
-        self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
+        self.assertFalse(w._toss_buttons["toss_run"].isEnabled())
         w._vehicles.setCurrentIndex(1)
         self.assertTrue(w._control_views.button(0).isChecked())
         self.assertTrue(first.commands.empty() and second.commands.empty())
@@ -355,7 +355,7 @@ class MissionControlTest(unittest.TestCase):
         for address in ("first", "second"):
             w.add_jetson(address, "operator", None, "", display_id=address)
             self.body_status(w._links[address], workflow="toss", can_start_body=False,
-                             toss_actions=["toss_prepare"], toss_state="준비 가능")
+                             toss_actions=["toss_run"], toss_state="준비 가능")
             w._control_views.button(1).click()
         a, b = w._links.values()
         w.show()
@@ -364,7 +364,7 @@ class MissionControlTest(unittest.TestCase):
         self.assertEqual(w._experiment_button.text(), "기록 시작")
         self.assertFalse(w._send_target_button.isEnabled())
         self.assertIsNone(w._vehicles.tabButton(1, self.ui.QTabBar.RightSide))
-        for action, value in (("start_body", True), ("mode", 3), ("toss_prepare", "unknown")):
+        for action, value in (("start_body", True), ("mode", 3), ("toss_run", "unknown")):
             b.request(action, value)
         self.assertTrue(b.commands.empty())
         with tempfile.TemporaryDirectory() as storage, patch.object(self.ui.QInputDialog, "getText",
@@ -374,19 +374,19 @@ class MissionControlTest(unittest.TestCase):
             self.assertTrue(b.data.recorder.active)
             self.assertTrue(b.commands.empty())
             w._experiment_button.click()
-        self.assertEqual(list(w._toss_buttons), ["toss_prepare", "toss_start", "toss_stop"])
+        self.assertEqual(list(w._toss_buttons), ["toss_fss", "toss_run", "toss_close", "toss_start", "toss_stop"])
         w._toss_method.setCurrentText("JF_only")
         w._toss_options.setText('label:="unterminated')
-        w._toss_buttons["toss_prepare"].click()
+        w._toss_buttons["toss_run"].click()
         self.assertTrue(b.commands.empty())
         self.assertIn("추가 옵션", b.data.last_command_msg)
         options = 'tracking_mode:=velocity label:="trial B"'
         w._toss_options.setText(options)
         w._toss_buttons["toss_start"].click()
         self.assertTrue(b.commands.empty())
-        w._toss_buttons["toss_prepare"].click()
-        self.assertEqual(b.commands.get_nowait()[1:], ("toss_prepare", ["JF_only", "tracking_mode:=velocity", "label:=trial B"]))
-        w._send_toss("toss_prepare")
+        w._toss_buttons["toss_run"].click()
+        self.assertEqual(b.commands.get_nowait()[1:], ("toss_run", ["JF_only", "tracking_mode:=velocity", "label:=trial B"]))
+        w._send_toss("toss_run")
         self.assertFalse(b.data.recorder.active)
         self.assertTrue(a.commands.empty() and b.commands.empty())
 
@@ -425,14 +425,14 @@ class MissionControlTest(unittest.TestCase):
         w = self.window
         w.add_jetson("bench", "operator", None, "", monitor_only=True)
         link = w._links["bench"]
-        self.body_status(link, workflow="toss", toss_actions=["toss_prepare"], toss_state="기존 실험")
+        self.body_status(link, workflow="toss", toss_actions=["toss_run"], toss_state="기존 실험")
         w._control_views.button(1).click()
         report = dict(phase="IDLE", grasp_guide="Move TCP (table):",
                       launch_pose_error=[.002, -.003, .1])
         link.inbox.put([("paper_status", SimpleNamespace(**report))])
         w.show()
         w._update()
-        self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
+        self.assertFalse(w._toss_buttons["toss_run"].isEnabled())
         self.assertIsNone(w._vehicles.tabButton(0, self.ui.QTabBar.RightSide))
         self.assertTrue(w._toss_alignment.isVisible())
         self.assertIn("-2.0 mm", w._toss_alignment.text())
@@ -441,7 +441,7 @@ class MissionControlTest(unittest.TestCase):
             w._update()
             self.assertTrue(w._toss_alignment.isVisible())
             self.assertIn("-2.0 mm", w._toss_alignment.text())
-            self.assertEqual(w._toss_buttons["toss_start"].text(), "파지 후 출발")
+            self.assertEqual(w._toss_buttons["toss_start"].text(), "toss_start")
         link.inbox.put([("paper_status", SimpleNamespace(**dict(report, phase="STOPPED",
                           grasp_guide="Waiting for fresh TCP pose")))])
         w._update()
@@ -452,6 +452,53 @@ class MissionControlTest(unittest.TestCase):
         link.inbox.put([("paper_status", SimpleNamespace(**dict(report, phase="LAUNCH")))])
         w._update()
         self.assertFalse(w._toss_alignment.isVisible())
+
+    def test_toss_original_buttons_stay_visible_and_send_only_allowed_commands(self):
+        w = self.window
+        link = self.connect("bench", 0)
+        w._control_views.button(1).click()
+        w.show()
+        for action in ("toss_fss", "toss_close", "toss_start", "toss_stop"):
+            self.body_status(link, workflow="toss", toss_actions=[action], can_start_body=False)
+            w._update()
+            for name, button in w._toss_buttons.items():
+                self.assertEqual(button.text(), name)
+                self.assertTrue(button.isVisible())
+                self.assertEqual(button.isEnabled(), name == action)
+            self.assertFalse(w._toss_options.isEnabled())
+            w._toss_buttons[action].click()
+            self.assertEqual(link.commands.get_nowait()[1:], (action, True))
+            link.inbox.put([("toss_reply", "accepted")])
+        self.body_status(link, workflow="toss", toss_actions=["toss_run"], can_start_body=False)
+        w._update()
+        self.assertTrue(w._toss_options.isEnabled())
+        w._toss_method.setCurrentText("Proposed")
+        w._toss_options.clear()
+        w._toss_buttons["toss_run"].click()
+        self.assertEqual(link.commands.get_nowait()[1:], ("toss_run", "Proposed"))
+
+    def test_toss_gripper_position_is_fresh_and_per_selected_fss(self):
+        w = self.window
+        first, second = self.connect("first", 0), self.connect("second", 1)
+        for link, xy in ((first, (1.234, 2.345)), (second, (2.456, 3.567))):
+            link.data.arm_equipped = True
+            link.data.arm_tcp = xy
+            link.data._mark_rx("arm_tcp")
+            link.data.control_view = "toss"
+            self.body_status(link, workflow="toss", can_start_body=False)
+        w._vehicles.setCurrentIndex(0)
+        w._update()
+        self.assertEqual(w._toss_gripper_position.text(), "Gripper   X 1.234 m   Y 2.345 m")
+        w._vehicles.setCurrentIndex(1)
+        w._update()
+        self.assertEqual(w._toss_gripper_position.text(), "Gripper   X 2.456 m   Y 3.567 m")
+        second.data._last_rx["arm_tcp"] -= self.ui.ARM_TIMEOUT_SEC + 1
+        w._update()
+        self.assertEqual(w._toss_gripper_position.text(), "Gripper —")
+        second.data._mark_rx("arm_tcp")
+        second.data.arm_equipped = False
+        w._update()
+        self.assertEqual(w._toss_gripper_position.text(), "Gripper —")
 
     def test_coordinates_accept_first_click_typing_offline_and_in_monitor_mode(self):
         from PySide6.QtCore import QPoint, Qt
@@ -655,7 +702,7 @@ class MissionControlTest(unittest.TestCase):
         w._control_views.button(1).click()
         w._update()
         self.assertFalse(w._toss_method.isEnabled())
-        self.assertFalse(w._toss_buttons["toss_prepare"].isEnabled())
+        self.assertFalse(w._toss_buttons["toss_run"].isEnabled())
         self.assertFalse(w._toss_buttons["toss_start"].isEnabled())
         index = w._plan_picker.findData("b/Proposed")
         w._plan_picker.setCurrentIndex(index)
