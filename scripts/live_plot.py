@@ -1780,7 +1780,7 @@ class Dashboard(QMainWindow):
             status = link.read_only
         elif (link.workflow != "toss"
               and time.monotonic() - link.last_body_status_at <= SOURCE_TIMEOUT_SEC):
-            status = "위치제어 본체 종료 후 toss_fss"
+            status = link.toss_state or "다른 본체에서 사용 중"
         elif phase_fresh:
             plan = self._node.active_plan_key()
             method = plan.rsplit("/", 1)[-1] if plan else ""

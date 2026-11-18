@@ -488,11 +488,13 @@ def serve(hub=None):
     heartbeat = 0.0
     pending = b""
     bench = globals().get("toss_bench")
+    switch_bench = (globals()["TossBench"]() if not bench and "TossBench" in globals()
+                    and globals()["toss_bench_installed"]() else None)
     passive = globals().get("toss_monitor", False)
     domain = globals().get("toss_domain")
     next_workflow_check = 0.0
     toss_pool = toss_future = None
-    if bench:
+    if bench or switch_bench:
         from concurrent.futures import ThreadPoolExecutor
         toss_pool = ThreadPoolExecutor(max_workers=1)
 
@@ -558,6 +560,8 @@ def serve(hub=None):
                         toss_state = str(exc)
                 else:
                     body_allowed = can_start_body(names)
+                    if switch_bench and switch_bench.can_switch_position():
+                        toss_actions, toss_state = ("toss_fss",), "toss_fss로 Self-tossing 전환"
                 if (globals().get("follow_workflow") and toss_future is None
                         and time.monotonic() >= next_workflow_check):
                     next_workflow_check = time.monotonic() + 3
@@ -631,6 +635,12 @@ def serve(hub=None):
                         emit("toss_error", "실험 명령 또는 처리 상태를 확인하세요.")
                     else:
                         toss_future = toss_pool.submit(bench.request, name, value, node.get_node_names, verify_toss_service)
+                elif name == "toss_fss":
+                    if (value is not True or passive or not switch_bench or toss_future is not None
+                            or globals().get("read_only") or not switch_bench.can_switch_position()):
+                        emit("toss_error", "지상국이 시작한 위치제어 본체만 전환할 수 있습니다.")
+                    else:
+                        toss_future = toss_pool.submit(switch_bench.switch_position, node.get_node_names, verify_toss_service)
                 elif name == "start_body":
                     try:
                         if value is not True or not can_start_body(node.get_node_names()):
@@ -645,8 +655,8 @@ def serve(hub=None):
     except (BrokenPipeError, KeyboardInterrupt):
         pass
     finally:
-        if bench:
-            bench.cancelled.set()
+        if bench or switch_bench:
+            (bench or switch_bench).cancelled.set()
             toss_pool.shutdown(wait=True, cancel_futures=True)
         node.destroy_node()
         rclpy.shutdown()

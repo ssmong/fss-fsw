@@ -248,6 +248,29 @@ class SharedCommandTest(unittest.TestCase):
         self.assertIn(("reply", "목표 설정", 1), outputs)
         self.assertFalse(any(kind == "reply_error" and data == "startup diagnostic" for kind,data,_ in outputs))
 
+    def test_control_bridge_routes_explicit_toss_fss_to_owned_stack_switch(self):
+        import mission_ros as ros
+        outputs = []
+        batches = iter([[(1, "toss_fss", True)]] + [[]] * 4)
+        hub = NS(poll=lambda: next(batches), publish=lambda kind, data, target=None: outputs.append((kind, data, target)),
+                 expired=lambda: False, recording=False)
+        bench = Mock()
+        bench.can_switch_position.return_value = True
+        bench.switch_position.return_value = "toss_fss started"
+        request = Mock()
+        rclpy = NS(ok=Mock(side_effect=[True]*5+[False]), spin_once=lambda *a, **kw: time.sleep(.01), shutdown=Mock())
+        with (patch.dict(sys.modules, rclpy=rclpy, rosidl_runtime_py=NS(),
+                         **{"rosidl_runtime_py.convert": NS(message_to_ordereddict=lambda x:x)}),
+              patch.object(ros, "open_node", return_value=(Mock(get_node_names=lambda: []), request)),
+              patch.multiple(ros, create=True, TossBench=lambda: bench, toss_bench_installed=lambda: True)):
+            ros.serve(hub)
+        bench.switch_position.assert_called_once()
+        request.assert_not_called()
+        self.assertIn(("toss_reply", "toss_fss started", 1), outputs)
+        first = next(data for kind, data, _ in outputs if kind == "connected")
+        self.assertEqual(first["workflow"], "control")
+        self.assertEqual(first["toss_actions"], ("toss_fss",))
+
     def test_off_owner_survives_failure_of_previous_service(self):
         import mission_ros as ros
         outputs, batches = [], iter([[(1, "target", ["PID", 1, 2, 0])], [(2, "valve", False)], [], [], [], [], []])

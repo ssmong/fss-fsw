@@ -1,6 +1,7 @@
 """Select or start the flight stack on the Jetson hosting this SSH session."""
 
 import ast
+import json
 import os
 import shlex
 import subprocess
@@ -300,6 +301,10 @@ def profile_uses_imu(profile):
     return value
 
 
+def process_start_ticks(pid):
+    return int((Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[19])
+
+
 def prepare_hardware(*, only_if_idle=False):
     """Serialize startup and check ownership again before opening any devices."""
     from fcntl import LOCK_EX, flock
@@ -378,6 +383,9 @@ def prepare_hardware(*, only_if_idle=False):
             time.sleep(0.35)
             if child.poll() is not None:
                 raise RuntimeError(f"기동 실패: {state / 'flight.log'}")
+            record = state / 'position-owner.json'
+            record.with_suffix('.tmp').write_text(json.dumps([int(child.pid), process_start_ticks(child.pid)]))
+            record.with_suffix('.tmp').replace(record)
         _starting_flight = (child, state / "flight.log", time.monotonic())
         return "기체 소프트웨어 기동"
 

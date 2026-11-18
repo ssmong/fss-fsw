@@ -114,6 +114,46 @@ class TossTests(unittest.TestCase):
         self.names.append("paper_toss_executor")
         self.assertEqual(self.b.available(self.names)[0], ())
 
+    def test_position_switch_rejects_reused_pid_and_unrelated_hardware(self):
+        self.add(40, 1, 40, [])
+        self.procs.clear()
+        runner = self.proc / "40"
+        (runner / "cmdline").write_bytes(b"python3\0-m\0fss_common.flight_runner\0require_explicit_target:=true\0")
+        (self.b.state / "position-owner.json").write_text('[40,313]')
+        self.add(41, 40, 41, ["ros2", "launch", "fss_bringup", "fss_full.launch.py"])
+        self.add(42, 41, 41, ["/lab/fss-fsw/install/fss_manager/lib/fss_manager/manager_node"])
+        self.assertEqual(self.b.position_owner(), (40,313))
+        (self.b.state / "position-owner.json").write_text('[40,999]')
+        self.assertIsNone(self.b.position_owner())
+        (self.b.state / "position-owner.json").write_text('[40,313]')
+        self.add(50, 1, 50, ["ros2", "launch", "self_tossing_hils", "paper_toss.launch.py"])
+        self.assertIsNone(self.b.position_owner())
+
+    def test_position_switch_waits_for_exit_and_ros_removal_before_launch(self):
+        fake_fcntl = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=Mock())
+        for timeout in (False, True):
+            with (patch.dict(sys.modules, fcntl=fake_fcntl),
+                  patch.object(self.b, "can_switch_position", return_value=True),
+                  patch.object(self.b, "position_owner", return_value=(40,313)),
+                  patch.object(self.b.cancelled, "wait", return_value=False),
+                  patch.object(toss.os, "pidfd_open", return_value=7, create=True),
+                  patch.object(toss.os, "close") as close,
+                  patch("signal.pidfd_send_signal", create=True) as signal,
+                  patch("select.select", return_value=([7], [], [])),
+                  patch.object(toss.time, "monotonic", side_effect=[0,16] if timeout else [0,1,2]),
+                  patch.object(self.b, "request", return_value="started") as launch):
+                names = Mock(side_effect=[["gnc_node"], []])
+                if timeout:
+                    with self.assertRaisesRegex(RuntimeError, "시간 초과"):
+                        self.b.switch_position(names, Mock())
+                    launch.assert_not_called()
+                else:
+                    self.assertEqual(self.b.switch_position(names, Mock()), "started")
+                    self.assertEqual(names.call_count, 2)
+                    self.assertEqual(launch.call_args.args[:2], ("toss_fss", True))
+                signal.assert_called_once()
+                close.assert_called_once_with(7)
+
     def test_air_control_requires_ready_bench_and_owned_idle_experiment(self):
         self.assertFalse(self.b.can_control_air([]))
         self.flight()

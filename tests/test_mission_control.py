@@ -484,7 +484,7 @@ class MissionControlTest(unittest.TestCase):
         self.body_status(link, workflow="control", toss_actions=[], can_start_body=False)
         w._control_views.button(1).click()
         w._update()
-        self.assertEqual(w._toss_status.text(), "위치제어 본체 종료 후 toss_fss")
+        self.assertEqual(w._toss_status.text(), "다른 본체에서 사용 중")
         self.assertTrue(w._toss_method.isEnabled())
         self.assertTrue(w._toss_options.isEnabled())
         w._toss_options.setText("tracking_mode:=velocity")
@@ -492,6 +492,18 @@ class MissionControlTest(unittest.TestCase):
         for button in w._toss_buttons.values():
             self.assertFalse(button.isEnabled())
         self.assertTrue(link.commands.empty())
+
+    def test_toss_fss_can_request_owned_position_stack_transition(self):
+        w = self.window
+        link = self.connect("bench", 0)
+        self.body_status(link, workflow="control", toss_actions=["toss_fss"],
+                         toss_state="toss_fss로 Self-tossing 전환", can_start_body=False)
+        w._control_views.button(1).click()
+        self.assertTrue(w._toss_buttons["toss_fss"].isEnabled())
+        self.assertFalse(w._toss_buttons["toss_run"].isEnabled())
+        w._toss_buttons["toss_fss"].click()
+        self.assertEqual(link.commands.get_nowait()[1:], ("toss_fss", True))
+        self.assertTrue(link.toss_pending)
 
     def test_toss_air_controls_follow_reported_state_and_permission(self):
         w = self.window

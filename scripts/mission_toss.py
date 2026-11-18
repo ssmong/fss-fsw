@@ -238,6 +238,64 @@ class TossBench:
     def available(self, names):
         return self._stage(names)
 
+    def position_owner(self):
+        try:
+            pid, ticks = json.loads((self.state / "position-owner.json").read_text())
+            _, session, start = toss_process(pid, self.proc)
+            argv = (self.proc / str(pid) / "cmdline").read_bytes().split(b"\0")
+            if (pid != session or ticks != start or argv[1:3] != [b"-m", b"fss_common.flight_runner"]
+                    or b"require_explicit_target:=true" not in argv):
+                return None
+            devices = list(device_processes(self.proc, with_pid=True))
+            if not devices:
+                return None
+            for child, _, env in devices:
+                if ros_network(env) != ros_network(os.environ):
+                    return None
+                seen = set()
+                while child != pid:
+                    if child <= 1 or child in seen:
+                        return None
+                    seen.add(child)
+                    child = toss_process(child, self.proc)[0]
+            return pid, ticks
+        except (OSError, ValueError, TypeError, IndexError):
+            return None
+
+    def can_switch_position(self):
+        return (toss_bench_installed(self.home) and guarded_full_launch(self.home / PRIVATE)
+                and self.position_owner() is not None)
+
+    def switch_position(self, names, verify_service):
+        import signal
+        import select
+        from fcntl import LOCK_EX, LOCK_NB, flock
+
+        with (self.state / "startup.lock").open("a") as lock:
+            flock(lock, LOCK_EX | LOCK_NB)
+            if not self.can_switch_position() or self.cancelled.is_set():
+                raise RuntimeError("지상국이 시작한 위치제어 본체만 전환할 수 있습니다.")
+            pid, ticks = self.position_owner()
+            # pidfd keeps a reused PID from receiving the shutdown signal.
+            fd = os.pidfd_open(pid)
+            try:
+                if self.position_owner() != (pid, ticks):
+                    raise RuntimeError("기체 실행 소유자 변경")
+                signal.pidfd_send_signal(fd, signal.SIGINT)
+                deadline = time.monotonic() + 15
+                while not self.cancelled.wait(.1):
+                    if (select.select([fd], [], [], 0)[0]
+                            and not list(device_processes(self.proc))
+                            and not FSS_NODES.intersection(names())):
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("위치제어 종료 확인 시간 초과 · Self-tossing을 시작하지 않았습니다.")
+                if self.cancelled.is_set():
+                    raise RuntimeError("연결 종료")
+            finally:
+                os.close(fd)
+        return self.request("toss_fss", True, names, verify_service)
+
     def can_control_air(self, names, actions=None):
         if actions is None:
             actions, _ = self.available(names)

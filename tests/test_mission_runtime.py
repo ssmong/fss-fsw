@@ -180,6 +180,9 @@ class FlightCommands(unittest.TestCase):
 
 class Discovery(unittest.TestCase):
     def setUp(self):
+        ticks = patch("mission_runtime.process_start_ticks", return_value=313)
+        ticks.start()
+        self.addCleanup(ticks.stop)
         guard = patch("mission_runtime.claim_installed_hardware")
         self.lease = guard.start()
         self.addCleanup(guard.stop)

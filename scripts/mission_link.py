@@ -60,7 +60,7 @@ class JetsonLink(QObject):
         threading.Thread(target=self._run, args=(host, user, domain, password), daemon=True).start()
 
     def can_toss(self, name):
-        return (self.profile in ("auto", "toss") and self.workflow == "toss"
+        return (self.profile in ("auto", "toss") and (self.workflow == "toss" or name == "toss_fss")
                 and self.ready and not self.read_only and not self.bridge_error
                 and not self.stopped.is_set() and not self.toss_pending and not self.body_start_pending
                 and time.monotonic() - self.last_body_status_at <= SOURCE_TIMEOUT_SEC
