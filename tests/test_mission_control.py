@@ -586,6 +586,30 @@ class MissionControlTest(unittest.TestCase):
             link.request("valve", True)
             self.assertTrue(link.commands.empty())
 
+    def test_toss_tuning_values_are_per_vehicle_and_sent_as_run_options(self):
+        w = self.window
+        first, second = self.connect("first", 0), self.connect("second", 1)
+        first.data.control_view = "toss"
+        self.body_status(first, workflow="toss", toss_actions=["toss_run"])
+        w._vehicles.setCurrentIndex(0)
+        w._update()
+        fields = list(w._toss_tuning.values())
+        for invalid in ("-1", "nan", "inf", "abc"):
+            fields[0].setText(invalid)
+            w._send_toss("toss_run")
+            self.assertTrue(first.commands.empty())
+        fields[0].setText("2.5")
+        fields[1].setText("0.7")
+        w._vehicles.setCurrentIndex(1)
+        self.assertEqual(fields[0].text(), "")
+        w._vehicles.setCurrentIndex(0)
+        self.assertEqual(fields[0].text(), "2.5")
+        w._send_toss("toss_run")
+        action, values = first.commands.get_nowait()[1:]
+        self.assertEqual(action, "toss_run")
+        self.assertIn("launch_position_gain_change_s:=2.5", values)
+        self.assertIn("launch_position_gain_before_per_s:=0.7", values)
+
     def test_toss_gripper_position_is_fresh_and_per_selected_fss(self):
         w = self.window
         first, second = self.connect("first", 0), self.connect("second", 1)

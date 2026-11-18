@@ -27,6 +27,17 @@ class RecordingTest(unittest.TestCase):
         with patch.dict(os.environ, QT_QPA_PLATFORM="offscreen"):
             cls.app = live_plot.QApplication.instance() or live_plot.QApplication([])
 
+    def test_applied_tuning_is_saved_with_experiment(self):
+        with tempfile.TemporaryDirectory() as root:
+            fss = self.gui.DashboardNode()
+            run = fss.recorder.start(root, "self-tossing", "FSS-1")
+            tuning = {"launch_position_gain_change_s": 2.5,
+                      "launch_position_gain_before_per_s": .7}
+            fss.receive("paper_status", {"phase": "IDLE", "tuning": tuning})
+            fss.recorder.stop()
+            self.assertEqual(json.loads((run / "tuning.json").read_text()), tuning)
+            self.assertEqual(json.loads((run / "session.json").read_text())["tuning"], tuning)
+
     def test_archive_uses_every_received_sample_and_unfiltered_logs(self):
         from PySide6.QtGui import QImage
         with tempfile.TemporaryDirectory() as root:

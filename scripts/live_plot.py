@@ -341,6 +341,8 @@ class DashboardNode:
         self.toss_method = "Nominal"
         self.control_view = "position"
         self.toss_options = ""
+        self.toss_tuning_draft = {}
+        self.toss_tuning_applied = None
         self.toss_phase = self.toss_phase_label = ""
         self.toss_gripper = self.toss_alignment = ""
         self.toss_contact = self.toss_aligned = False
@@ -432,9 +434,13 @@ class DashboardNode:
 
     def recording_context(self):
         return {"arm_equipped": self.arm_equipped, "selected_plan": self.plan_choice,
-                "active_plan_id": self.paper_trial, "plans": self.paper_plans, "source_run": self.source_run}
+                "active_plan_id": self.paper_trial, "plans": self.paper_plans, "source_run": self.source_run,
+                "tuning": self.toss_tuning_applied}
 
     def receive(self, name, msg):
+        if name == "paper_status":
+            status = msg if isinstance(msg, dict) else vars(msg)
+            self.toss_tuning_applied = status.get("tuning")
         if name == "paper_status" and self.recording_status:
             self.recording_status(msg, False)
         if self.recorder.active:
@@ -1561,6 +1567,8 @@ class Dashboard(QMainWindow):
             self._toss_method.setCurrentText(self._node.toss_method)
             self._toss_method.blockSignals(False)
             self._toss_options.setText(self._node.toss_options)
+            for key, field in self._toss_tuning.items():
+                field.setText(self._node.toss_tuning_draft.get(key, ""))
             for field, value in ((self._target_x, x), (self._target_y, y), (self._target_yaw, yaw)):
                 field.setValue(value)
         self._log_view_key = None
@@ -1715,6 +1723,20 @@ class Dashboard(QMainWindow):
         self._toss_options.setPlaceholderText("추가 옵션 (선택)   이름:=값")
         self._toss_options.textChanged.connect(self._choose_toss_options)
         layout.addWidget(self._toss_options, 1, 2, 1, 3)
+        tuning = QHBoxLayout()
+        self._toss_tuning = {}
+        for label, key, unit in (("change", "launch_position_gain_change_s", "s"),
+                                 ("before pos", "launch_position_gain_before_per_s", "1/s")):
+            tuning.addWidget(QLabel(label))
+            field = QLineEdit()
+            field.setAccessibleName(label)
+            field.setPlaceholderText("YAML")
+            field.setToolTip(f"{key} ({unit}) · 비우면 tuning.yaml 값 사용")
+            field.textChanged.connect(lambda text, k=key: self._node.toss_tuning_draft.update({k: text}))
+            self._toss_tuning[key] = field
+            tuning.addWidget(field)
+            tuning.addWidget(QLabel(unit))
+        layout.addLayout(tuning, 4, 0, 1, 5)
         self._toss_gripper_position = QLabel("Gripper —")
         self._toss_gripper_position.setTextFormat(Qt.PlainText)
         layout.addWidget(self._toss_gripper_position, 3, 0, 1, 2)
@@ -1736,7 +1758,7 @@ class Dashboard(QMainWindow):
         self._toss_alignment.setTextFormat(Qt.PlainText)
         self._toss_alignment.setStyleSheet(f"color:{C_TEXT_DIM};")
         self._toss_alignment.hide()
-        layout.addWidget(self._toss_alignment, 4, 0, 1, 5)
+        layout.addWidget(self._toss_alignment, 5, 0, 1, 5)
         return panel
 
     def _can_send_toss(self, link, action):
@@ -1768,10 +1790,18 @@ class Dashboard(QMainWindow):
             connected.drain()
         if self._can_send_toss(link, action):
             value = self._toss_method.currentText() if action == "toss_run" else True
-            if action == "toss_run" and self._toss_options.text().strip():
+            if action == "toss_run":
                 try:
                     value = [value, *shlex.split(self._toss_options.text())]
+                    for key, field in self._toss_tuning.items():
+                        if field.text().strip():
+                            number = float(field.text())
+                            if not math.isfinite(number) or number < 0:
+                                raise ValueError(f"{field.accessibleName()}는 0 이상의 유한한 값이어야 합니다.")
+                            value.append(f"{key}:={number}")
                     toss_run_args(value)
+                    if len(value) == 1:
+                        value = value[0]
                 except ValueError as exc:
                     message = f"추가 옵션 확인 · {exc}"
                     link.data.set_command_result(message, 30)
@@ -1805,6 +1835,8 @@ class Dashboard(QMainWindow):
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
         self._toss_method.setVisible(True)
         self._toss_options.setEnabled(not bound)
+        for field in self._toss_tuning.values():
+            field.setEnabled(not bound)
         gripper = "Gripper —"
         if (self._node.arm_equipped and self._node.arm_tcp is not None
                 and self._node.source_age("arm_tcp") < ARM_TIMEOUT_SEC):

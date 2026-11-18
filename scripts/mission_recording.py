@@ -239,6 +239,13 @@ class ExperimentRecorder:
                 row["data"] = sample
                 self._tracking.writerow({"received_unix_ns": row["received_unix_ns"],
                                          "elapsed_s": row["elapsed_s"], **sample})
+            if kind == "paper_status":
+                status = vars(value) if isinstance(value, SimpleNamespace) else value
+                tuning = status.get("tuning") if isinstance(status, dict) else None
+                if isinstance(tuning, dict) and tuning != self._summary.get("tuning"):
+                    self._summary["tuning"] = tuning
+                    (self.directory / "tuning.json").write_text(_json(tuning), encoding="utf-8")
+                    self._save_summary()
             self._buffer.extend((_json(row) + "\n").encode("utf-8"))
             self._counts[kind] += 1
             if now - self._last_flush_ns >= 250_000_000 or len(self._buffer) >= 262144:

@@ -264,13 +264,21 @@ def open_node(receive, reply, args=None, reject=None):
             status = json.loads(msg.data)
         except (ValueError, TypeError):
             return
+        source = read_run(status) if isinstance(status, dict) else None
+        if source is not None:
+            applied = source[2].get("experiment", {})
+            keys = ("launch_position_gain_change_s", "launch_position_gain_before_per_s",
+                    "launch_position_gain_after_per_s")
+            if isinstance(applied, dict):
+                tuning = {key: applied[key] for key in keys if key in applied}
+                if tuning:
+                    status["tuning"] = tuning
         terminal = isinstance(status, dict) and status.get("phase") in ("STOPPED", "MISSED", "FAULT")
         if not terminal:
             receive("paper_status", status)
         plan_id = status.get("plan_id") if isinstance(status, dict) and status.get("frame_id") == "table" else None
         if isinstance(plan_id, str) and plan_id:
             last_paper_status, last_paper_status_at = status, time.monotonic()
-            source = read_run(status)
             identity = (source[0], plan_id) if source else None
             catalog_changed = False
             if identity and identity != last_run:

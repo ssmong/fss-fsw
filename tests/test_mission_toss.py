@@ -1,6 +1,7 @@
 """Self-tossing adapter exercised with an isolated process tree and stub launches."""
 
 import json
+import importlib.util
 import os
 import sys
 import tempfile
@@ -69,6 +70,39 @@ class TossTests(unittest.TestCase):
         for value in (["Unknown"], [], {}, None, "Nominal mode:=velocity"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 toss.toss_run_args(value)
+
+    @unittest.skipUnless(importlib.util.find_spec("omegaconf"), "Jetson tuning dependency")
+    def test_gain_snapshot_preserves_source_and_other_tuning(self):
+        from omegaconf import OmegaConf
+        root = self.home / "self_tossing_hardware"
+        root.mkdir()
+        source = root / "capture.yaml"
+        original = "tuning_file: tuning.yaml\nmodel_file: model.json\nlog_directory: outputs\n"
+        tuning_text = ("launch_position_gain_change_s: 3\nlaunch_position_gain_before_per_s: 1\n"
+                       "launch_position_gain_after_per_s: 0.25\njoint_position_gain_per_s: 0.5\n")
+        source.write_text(original)
+        (root / "tuning.yaml").write_text(tuning_text)
+        args = ["Nominal", f"config_file:={source}", "tracking_mode:=velocity",
+                "launch_position_gain_change_s:=2.125", "launch_position_gain_before_per_s:=0"]
+        with patch.object(toss, "_toss_capture_config", return_value=source) as resolve:
+            actual = toss.snapshot_toss_tuning(args, self.b.state, root)
+        self.assertEqual(resolve.call_args.args[0], args[:3])
+        snapshot = Path(actual[-1].split(":=", 1)[1])
+        cfg = OmegaConf.load(snapshot)
+        tuned = OmegaConf.load(snapshot.parent / cfg.tuning_file)
+        self.assertEqual(tuned.launch_position_gain_change_s, 2.125)
+        self.assertEqual(tuned.launch_position_gain_before_per_s, 0)
+        self.assertEqual(tuned.launch_position_gain_after_per_s, .25)
+        self.assertEqual(tuned.joint_position_gain_per_s, .5)
+        self.assertEqual(Path(cfg.model_file), (root / "model.json").resolve())
+        self.assertEqual(source.read_text(), original)
+        self.assertEqual((root / "tuning.yaml").read_text(), tuning_text)
+        self.assertTrue(toss.matches_toss_run([20, 313, actual],
+                        ["method:=Nominal", "execute:=true", *actual[1:]]))
+        self.assertEqual(toss.snapshot_toss_tuning(args[:3], self.b.state, root), args[:3])
+        for value in ("nan", "inf", "-1", "true"):
+            with self.assertRaises(ValueError):
+                toss.toss_run_args(["Nominal", f"launch_position_gain_change_s:={value}"])
 
     def test_new_owner_record_matches_exact_runtime_args(self):
         self.flight()
