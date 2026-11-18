@@ -88,6 +88,17 @@ class TossTests(unittest.TestCase):
         (self.b.state / "toss_run.json").write_text("[20, 999]")
         self.assertEqual(self.b.available(self.names)[0], ())
 
+    def test_cpp_toss_flight_with_driver_children_enables_run(self):
+        self.flight()
+        for pid, name in enumerate(("valve_driver_node", "vicon_bridge_node", "imu_bridge_node", "ekf_node"), 30):
+            self.add(pid, 10, 10, [f"/home/smrl/FSS_FSW/.native-install/unified-20261118/lib/{name}"])
+            self.names.append(name)
+        self.assertEqual(self.b.available(self.names)[0], ("toss_run",))
+        args = ["Proposed", "tracking_mode:=velocity", "instant_close:=true"]
+        self.assertEqual(toss.toss_run_args(args), args)
+        self.paper(owned=True, args=args)
+        self.assertEqual(self.b.available(self.names)[0], ("toss_start",))
+
     def test_own_executor_uses_fresh_status_and_unique_local_owner(self):
         self.flight()
         self.paper(owned=True)
@@ -102,6 +113,23 @@ class TossTests(unittest.TestCase):
         (self.b.state / "toss_run.json").write_text(json.dumps([20, 313, "Nominal"]))
         self.names.append("paper_toss_executor")
         self.assertEqual(self.b.available(self.names)[0], ())
+
+    def test_air_control_requires_ready_bench_and_owned_idle_experiment(self):
+        self.assertFalse(self.b.can_control_air([]))
+        self.flight()
+        self.assertFalse(self.b.can_control_air(self.names))
+        self.names.append("valve_driver_node")
+        self.assertTrue(self.b.can_control_air(self.names))
+        self.paper(owned=False)
+        self.assertFalse(self.b.can_control_air(self.names))
+        (self.b.state / "toss_run.json").write_text('[20, 313, "Nominal"]')
+        self.assertTrue(self.b.can_control_air(self.names))
+        self.b.observe({"phase": "LAUNCH"})
+        self.assertFalse(self.b.can_control_air(self.names))
+        self.b.observe({"phase": "STOPPED"})
+        self.assertTrue(self.b.can_control_air(self.names))
+        self.b.phase_at -= 4
+        self.assertFalse(self.b.can_control_air(self.names))
 
     def test_idle_upgrade_and_competing_owners(self):
         with patch.object(toss, "guarded_full_launch", return_value=False):

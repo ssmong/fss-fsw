@@ -238,6 +238,12 @@ class TossBench:
     def available(self, names):
         return self._stage(names)
 
+    def can_control_air(self, names, actions=None):
+        if actions is None:
+            actions, _ = self.available(names)
+        return (names.count("valve_driver_node") == 1
+                and bool({"toss_run", "toss_start"}.intersection(actions)))
+
     def _has_close_alias(self):
         try:
             return bool(re.search(r"^\s*(?:function\s+)?toss_close\s*\(\s*\)\s*\{",

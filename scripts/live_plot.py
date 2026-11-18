@@ -1216,6 +1216,7 @@ class Dashboard(QMainWindow):
 
     def _can_start_body(self, endpoint, link):
         return (self._links.get(endpoint) is link and link.ready and not link.stopped.is_set()
+                and link.data.control_view == "position"
                 and link.profile in ("auto", "control")
                 and not link.read_only and not link.bridge_error and link.can_start_body
                 and not link.body_start_pending and not link.toss_pending
@@ -1239,12 +1240,12 @@ class Dashboard(QMainWindow):
                 button.deleteLater()
             return
         if button is None:
-            button = QPushButton("본체 시작", self._vehicles)
+            button = QPushButton("위치제어 시작", self._vehicles)
             button.setObjectName("bodyStart")
             button.adjustSize()
             button.clicked.connect(lambda: self._start_vehicle_body(endpoint, link))
             self._vehicles.setTabButton(index, side, button)
-        action = f"{label} 본체 FSW 시작"
+        action = f"{label} 위치제어 FSW 시작"
         button.setAccessibleName(action)
         button.setToolTip(action)
 
@@ -1683,7 +1684,18 @@ class Dashboard(QMainWindow):
         layout.addWidget(self._toss_options, 1, 2, 1, 3)
         self._toss_gripper_position = QLabel("Gripper —")
         self._toss_gripper_position.setTextFormat(Qt.PlainText)
-        layout.addWidget(self._toss_gripper_position, 3, 0, 1, 5)
+        layout.addWidget(self._toss_gripper_position, 3, 0, 1, 2)
+        air = QHBoxLayout()
+        air.addStretch()
+        air.addWidget(QLabel("에어베어링"))
+        self._toss_air_on = AirBearingButton("ON")
+        self._toss_air_off = AirBearingButton("OFF")
+        for button, value in ((self._toss_air_on, True), (self._toss_air_off, False)):
+            button.setObjectName("airOn" if value else "airOff")
+            button.setCheckable(True)
+            button.clicked.connect(lambda checked=False, state=value: self._send_toss_air(state))
+            air.addWidget(button)
+        layout.addLayout(air, 3, 2, 1, 3)
         self._toss_alignment = QLabel()
         self._toss_alignment.setTextFormat(Qt.PlainText)
         self._toss_alignment.setStyleSheet(f"color:{C_TEXT_DIM};")
@@ -1694,6 +1706,14 @@ class Dashboard(QMainWindow):
     def _can_send_toss(self, link, action):
         return (self._node.control_view == "toss" and link and link.data is self._node
                 and not self._shared_domain(link) and link.can_toss(action))
+
+    def _send_toss_air(self, state):
+        link = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
+        if link:
+            link.drain()
+        if (self._node.control_view == "toss" and link and link.data is self._node
+                and not self._shared_domain(link) and link.can_toss_air()):
+            self._node.request_main_valve(state)
 
     def _choose_toss_method(self, method):
         self._node.toss_method = method
@@ -1772,6 +1792,13 @@ class Dashboard(QMainWindow):
             status = "상태 미수신"
         self._toss_status.setText(status)
         self._toss_status.setToolTip((link.read_only or link.toss_state or status) if link else status)
+        run = self._toss_buttons["toss_run"]
+        reason = status
+        if link and "toss_fss" in link.toss_actions:
+            reason = "toss_fss 실행 후 사용 가능"
+        elif link and any(action in link.toss_actions for action in ("toss_close", "toss_start", "toss_stop")):
+            reason = "실험 실행기가 이미 켜져 있습니다."
+        run.setToolTip("" if run.isEnabled() else reason)
         alignment = self._live_toss_alignment(link)
         self._toss_alignment.setText(alignment)
         self._toss_alignment.setVisible(bool(alignment))
@@ -2597,6 +2624,10 @@ class Dashboard(QMainWindow):
         air_state = node.reported_air_state() if selected is None or (selected.ready and not selected.stopped.is_set()) else None
         self._update_status_cards(air_state)
         self._update_controls(enabled, air_state)
+        toss_air_enabled = bool(toss and selected and not shared_domain and selected.can_toss_air())
+        for button, state in ((self._toss_air_on, True), (self._toss_air_off, False)):
+            button.setEnabled(toss_air_enabled)
+            button.setChecked(air_state is state)
         if shared_domain:
             self._command_status.setText("공유 ROS 도메인 · 기체별 도메인을 지정하세요")
         elif not self._node.last_command_msg:

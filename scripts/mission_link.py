@@ -44,6 +44,7 @@ class JetsonLink(QObject):
         self.workflow = "toss" if self.profile == "toss" else "control"
         self.monitor_only = self.profile == "monitor"
         self.toss_actions = ()
+        self.toss_air_available = False
         self.toss_state = ""
         self.toss_pending = False
         self.workspace = None
@@ -65,10 +66,16 @@ class JetsonLink(QObject):
                 and time.monotonic() - self.last_body_status_at <= SOURCE_TIMEOUT_SEC
                 and name in ("toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop") and name in self.toss_actions)
 
+    def can_toss_air(self):
+        return self.toss_air_available and any(self.can_toss(action) for action in ("toss_run", "toss_start"))
+
     def request(self, name, value):
         if not self.ready or self.monitor_only or self.read_only or self.stopped.is_set() or self.bridge_error:
             return
-        if name.startswith("toss_"):
+        if name == "valve" and self.workflow == "toss":
+            if type(value) is not bool or not self.can_toss_air():
+                return
+        elif name.startswith("toss_"):
             if not self.can_toss(name):
                 return
             if name in ("toss_prepare", "toss_run"):
@@ -120,6 +127,7 @@ class JetsonLink(QObject):
                         self.can_start_body = getattr(value, "can_start_body", False)
                         self.last_body_status_at = getattr(value, "received_at", float("-inf"))
                         self.toss_actions = tuple(getattr(value, "toss_actions", ()))
+                        self.toss_air_available = getattr(value, "toss_air_available", False)
                         self.toss_state = getattr(value, "toss_state", "")
                         self.read_only = getattr(value, "read_only", "") or (
                             "모니터링 전용" if self.monitor_only else "")

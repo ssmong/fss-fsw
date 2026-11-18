@@ -31,6 +31,9 @@ class MissionActions:
             self.air_open, self.health_at = msg.main_valve_open, time.monotonic()
 
     def _sequence(self, name, value):
+        if name == "toss_air":
+            yield name, value
+            return "에어베어링 ON" if value else "에어베어링 OFF"
         if name == "mode":
             yield "mode", value
             return "모드 변경"
@@ -381,7 +384,14 @@ def open_node(receive, reply, args=None, reject=None):
         services["target"] = (node.create_client(SetTarget, "/gnc/set_target"), SetTarget, None)
 
     def call(name, value):
-        if globals().get("read_only"):
+        toss_air = name == "toss_air"
+        if toss_air:
+            bench = globals().get("toss_bench")
+            if (type(value) is not bool or not bench or globals().get("toss_monitor")
+                    or not bench.can_control_air(node.get_node_names())):
+                raise ValueError("에어베어링 변경은 Self-tossing 대기 상태에서만 가능합니다.")
+            name = "valve"
+        if globals().get("read_only") and not (toss_air and globals()["read_only"] == "Self-tossing"):
             raise ValueError(globals()["read_only"])
         if name not in services:
             raise ValueError("/gnc/set_target 미설치 · Jetson GNC 업데이트 필요")
@@ -391,7 +401,7 @@ def open_node(receive, reply, args=None, reject=None):
         owner = {"mode": "manager_node", "valve": "valve_driver_node",
                  "target": "gnc_node", "controller": "gnc_node"}[name]
         owns_service = globals().get("local_service_owner")
-        if owns_service and not owns_service(owner):
+        if owns_service and not toss_air and not owns_service(owner):
             raise ValueError(f"이 Jetson에서 {owner}를 찾을 수 없습니다.")
         if node.get_node_names().count(owner) > 1:
             raise ValueError("같은 ROS 도메인에서 기체가 중복되어 명령 대상을 구분할 수 없습니다.")
@@ -561,6 +571,8 @@ def serve(hub=None):
                                    "can_start_body": body_allowed and not passive and toss_future is None,
                                    "workflow": "toss" if bench else "control",
                                    "toss_actions": toss_actions if toss_future is None and not passive else (),
+                                   "toss_air_available": bool(bench and not passive and toss_future is None
+                                                              and bench.can_control_air(names, toss_actions)),
                                    "toss_state": toss_state, "read_only": ("모니터링 전용" if passive else "")
                                    if bench else globals().get("read_only", "")})
                 heartbeat = time.monotonic() + 1
@@ -600,7 +612,13 @@ def serve(hub=None):
                 if name == "record_stream":
                     recording = value is True
                 elif bench:
-                    if name == "start_body":
+                    if name == "valve":
+                        if (passive or toss_future is not None or type(value) is not bool
+                                or not bench.can_control_air(node.get_node_names())):
+                            emit("reply_error", "에어베어링 변경은 Self-tossing 대기 상태에서만 가능합니다.")
+                        else:
+                            request("toss_air", value)
+                    elif name == "start_body":
                         try:
                             if (value is not True or passive or toss_future is not None
                                     or not bench.capabilities(node.get_node_names(), domain)[2]):

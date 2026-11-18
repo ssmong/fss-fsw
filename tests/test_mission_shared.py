@@ -89,6 +89,21 @@ class SharedTransportTest(unittest.TestCase):
         with self.assertRaises(socket.timeout):
             monitor.recv(1)
 
+    def test_air_command_respects_workflow_and_profile(self):
+        clients = [(*self.client(profile), profile) for profile in ("toss", "control", "monitor")]
+        self.hub.poll()
+        for workflow in ("toss", "control"):
+            self.hub.publish("connected", dict(observer="one", workflow=workflow))
+            for sock, key, profile in clients:
+                self.assertEqual(self.receive(sock)[0], "connected")
+                sock.sendall((json.dumps(["valve", True, "one"]) + "\n").encode())
+                if profile == workflow:
+                    self.until(lambda: not self.hub.commands.empty())
+                    self.assertEqual(self.hub.poll(), [(key, "valve", True)])
+                else:
+                    self.assertEqual(self.receive(sock)[0], "reply_error")
+                    self.assertEqual(self.hub.poll(), [])
+
     def test_recording_is_per_client_and_disconnect_does_not_stop_other_client(self):
         a, aid = self.client()
         b, bid = self.client("monitor")

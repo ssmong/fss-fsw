@@ -12,7 +12,7 @@ import threading
 import time
 
 
-SHARED_PROTOCOL = 2
+SHARED_PROTOCOL = 3
 SHARED_CACHE = {"plans", "plan_defaults", "arm_registration", "connected"}
 SHARED_DISPLAY = {"vicon", "ekf", "ref", "arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"}
 
@@ -142,12 +142,16 @@ class SharedHub:
             "body_error" if name == "start_body" else "reply_error")
         profile = client["profile"]
         if (profile == "monitor" or (profile == "control" and isinstance(name, str) and name.startswith("toss_"))
-                or (profile == "toss" and name not in ("toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop"))
+                or (profile == "toss" and name not in ("valve", "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop"))
                 or name not in ("mode", "valve", "target", "controller", "start_body",
                                 "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop")):
             self.publish(error, "이 연결에서는 명령을 보낼 수 없습니다.", target=key)
             return
         status = self.cache.get("connected", ({}, None))[0]
+        if name == "valve" and ((profile == "toss" and status.get("workflow") != "toss")
+                                or (profile == "control" and status.get("workflow") == "toss")):
+            self.publish(error, "이 연결에서는 명령을 보낼 수 없습니다.", target=key)
+            return
         if len(event) != 3 or not event[2] or event[2] != status.get("observer"):
             self.publish(error, "중계 전환 중 · 연결 상태 갱신 후 다시 보내세요.", target=key)
             return
