@@ -412,7 +412,7 @@ def serve(hub=None):
         elif name in ("plans", "plan_defaults", "paper_trial", "paper_status", "tracking_error", "arm_registration"):
             data = msg
         elif name == "valve_output":
-            data = {"duty_cycles": msg.duty_cycles}
+            data = {"duty_cycles": [float(value) for value in msg.duty_cycles]}
             if recording:
                 data["header"] = message_to_ordereddict(msg.header)
         elif name == "valve":

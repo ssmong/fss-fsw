@@ -12,6 +12,29 @@ from mission_tracking import PaperTracking
 
 
 class CatalogRelayTest(unittest.TestCase):
+    def test_numpy_valve_output_serializes_during_monitoring_and_recording(self):
+        import json
+        import numpy as np
+        from mission_shared import SharedHub
+        for recording in (False, True):
+            packets = []
+            hub = Mock(recording=recording)
+            hub.publish.side_effect = lambda kind, data: packets.append(
+                json.loads(SharedHub._packet(kind, data)))
+            msg = SimpleNamespace(header={"stamp": 123}, duty_cycles=np.array([.2] * 8, dtype=np.float32))
+            def opened(receive, reply, reject):
+                receive("valve_output", msg)
+                return Mock(), Mock()
+            modules = {"rclpy": SimpleNamespace(ok=lambda: False, shutdown=Mock()),
+                       "rosidl_runtime_py": SimpleNamespace(),
+                       "rosidl_runtime_py.convert": SimpleNamespace(message_to_ordereddict=lambda msg: msg)}
+            with patch.dict(sys.modules, modules), patch.object(mission_ros, "open_node", side_effect=opened):
+                mission_ros.serve(hub)
+            self.assertEqual(packets[0][0], "valve_output")
+            self.assertEqual(len(packets[0][1]["duty_cycles"]), 8)
+            self.assertAlmostEqual(packets[0][1]["duty_cycles"][0], .2)
+            self.assertEqual("header" in packets[0][1], recording)
+
     def test_toss_air_changes_only_valve_without_position_control_modes(self):
         for value in (True, False):
             calls, replies = [], []
