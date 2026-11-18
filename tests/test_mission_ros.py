@@ -94,7 +94,8 @@ class CatalogRelayTest(unittest.TestCase):
                 status(SimpleNamespace(data=json.dumps({"frame_id": "table", "plan_id": "A", "phase": "PREPARING"})))
                 self.assertEqual(events[0][0], "paper_status")
                 actual = {"launch_position_gain_change_s": 2.5, "launch_position_gain_before_per_s": 0.8,
-                          "launch_position_gain_after_per_s": 0.2}
+                          "launch_position_gain_after_per_s": 0.2,
+                          "launch_velocity_feedforward_scale": 0.8, "release_open_delay_s": -0.1}
                 mission_ros.paper_run_files.return_value = ("run", Path("samples.jsonl"), {"experiment": actual})
                 events.clear()
                 status(SimpleNamespace(data=json.dumps({"frame_id": "table", "plan_id": "A", "phase": "PREPARING"})))

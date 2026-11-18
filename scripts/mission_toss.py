@@ -20,7 +20,8 @@ TOSS_METHODS = ("Proposed", "Nominal", "JF_only")
 TOSS_COMMANDS = ("toss_fss", "toss_run", "toss_close", "toss_start", "toss_stop", "toss_prepare", "toss_reset")
 TOSS_START_PHASES = ("IDLE", "STOPPED", "MISSED", "A_HELD", "FAULT")
 TOSS_UPGRADE = "Self-tossing FSW 런처 업데이트 필요"
-TOSS_GAIN_KEYS = ("launch_position_gain_change_s", "launch_position_gain_before_per_s")
+TOSS_TUNING_KEYS = ("launch_position_gain_change_s", "launch_position_gain_before_per_s",
+                    "launch_velocity_feedforward_scale", "release_open_delay_s")
 
 
 def toss_run_args(value):
@@ -39,12 +40,12 @@ def toss_run_args(value):
             raise ValueError(f"{key}는 실험 준비에서 지정합니다.")
         if key in keys:
             raise ValueError(f"중복 옵션 · {key}")
-        if key in TOSS_GAIN_KEYS:
+        if key in TOSS_TUNING_KEYS:
             try:
                 number = float(argument)
             except ValueError as exc:
                 raise ValueError(f"{key}: 0 이상의 유한한 값을 입력하세요.") from exc
-            if not math.isfinite(number) or number < 0:
+            if not math.isfinite(number) or (number < 0 and key != "release_open_delay_s"):
                 raise ValueError(f"{key}: 0 이상의 유한한 값을 입력하세요.")
         keys.add(key)
     return list(args)
@@ -93,12 +94,12 @@ def snapshot_toss_tuning(args, state, root=None):
 
     args = toss_run_args(args)
     overrides = {key: float(value) for option in args[1:] for key, value in [option.split(":=", 1)]
-                 if key in TOSS_GAIN_KEYS}
+                 if key in TOSS_TUNING_KEYS}
     if not overrides:
         return args
     from omegaconf import OmegaConf
     root = Path(root or os.environ.get("SELF_TOSSING_HARDWARE_ROOT", Path.home() / "self_tossing_hardware"))
-    actual = [args[0], *(option for option in args[1:] if option.split(":=", 1)[0] not in TOSS_GAIN_KEYS)]
+    actual = [args[0], *(option for option in args[1:] if option.split(":=", 1)[0] not in TOSS_TUNING_KEYS)]
     source = _toss_capture_config(actual, root)
     config = OmegaConf.to_container(OmegaConf.load(source), resolve=True)
     if not isinstance(config, dict):
@@ -110,9 +111,11 @@ def snapshot_toss_tuning(args, state, root=None):
         if not isinstance(tuning, dict) or config.keys() & tuning.keys():
             raise ValueError("Self-tossing tuning 설정이 중복되거나 잘못되었습니다.")
     applied = {**config, **(tuning or {}), **overrides}
-    for key in (*TOSS_GAIN_KEYS, "launch_position_gain_after_per_s"):
-        value = applied.get(key)
-        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+    for key in (*TOSS_TUNING_KEYS, "launch_position_gain_after_per_s"):
+        if key not in applied:
+            continue
+        value = applied[key]
+        if type(value) not in (int, float) or not math.isfinite(value) or (value < 0 and key != "release_open_delay_s"):
             raise ValueError(f"Self-tossing 설정 확인 필요 · {key}")
     if config.get("model_file"):
         config["model_file"] = str((source.parent / config["model_file"]).resolve())
@@ -123,7 +126,8 @@ def snapshot_toss_tuning(args, state, root=None):
     directory.mkdir(parents=True, exist_ok=True)
     snapshot = Path(tempfile.mkdtemp(prefix="toss-", dir=directory)) / "capture.yaml"
     if tuning is not None:
-        tuning.update(overrides)
+        for key, value in overrides.items():
+            (config if key in config else tuning)[key] = value
         OmegaConf.save(config=OmegaConf.create(tuning), f=snapshot.with_name("tuning.yaml"))
         config["tuning_file"] = "tuning.yaml"
     else:

@@ -77,13 +77,14 @@ class TossTests(unittest.TestCase):
         root = self.home / "self_tossing_hardware"
         root.mkdir()
         source = root / "capture.yaml"
-        original = "tuning_file: tuning.yaml\nmodel_file: model.json\nlog_directory: outputs\n"
+        original = "tuning_file: tuning.yaml\nmodel_file: model.json\nlog_directory: outputs\nrelease_open_delay_s: 0\n"
         tuning_text = ("launch_position_gain_change_s: 3\nlaunch_position_gain_before_per_s: 1\n"
                        "launch_position_gain_after_per_s: 0.25\njoint_position_gain_per_s: 0.5\n")
         source.write_text(original)
         (root / "tuning.yaml").write_text(tuning_text)
         args = ["Nominal", f"config_file:={source}", "tracking_mode:=velocity",
-                "launch_position_gain_change_s:=2.125", "launch_position_gain_before_per_s:=0"]
+                "launch_position_gain_change_s:=2.125", "launch_position_gain_before_per_s:=0",
+                "launch_velocity_feedforward_scale:=0.8", "release_open_delay_s:=-0.1"]
         with patch.object(toss, "_toss_capture_config", return_value=source) as resolve:
             actual = toss.snapshot_toss_tuning(args, self.b.state, root)
         self.assertEqual(resolve.call_args.args[0], args[:3])
@@ -92,6 +93,9 @@ class TossTests(unittest.TestCase):
         tuned = OmegaConf.load(snapshot.parent / cfg.tuning_file)
         self.assertEqual(tuned.launch_position_gain_change_s, 2.125)
         self.assertEqual(tuned.launch_position_gain_before_per_s, 0)
+        self.assertEqual(tuned.launch_velocity_feedforward_scale, .8)
+        self.assertEqual(cfg.release_open_delay_s, -.1)
+        self.assertNotIn("release_open_delay_s", tuned)
         self.assertEqual(tuned.launch_position_gain_after_per_s, .25)
         self.assertEqual(tuned.joint_position_gain_per_s, .5)
         self.assertEqual(Path(cfg.model_file), (root / "model.json").resolve())

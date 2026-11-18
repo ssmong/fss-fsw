@@ -1760,22 +1760,30 @@ class Dashboard(QMainWindow):
         self._toss_advanced.setAccessibleName("Self-tossing 고급 설정")
         layout.addWidget(self._toss_advanced, 0, 4)
         self._toss_tuning_panel = QWidget()
-        tuning = QHBoxLayout(self._toss_tuning_panel)
+        tuning = QGridLayout(self._toss_tuning_panel)
         tuning.setContentsMargins(0, 0, 0, 0)
         self._toss_tuning_panel.hide()
         self._toss_advanced.toggled.connect(self._toss_tuning_panel.setVisible)
         self._toss_tuning = {}
-        for label, key, unit in (("change", "launch_position_gain_change_s", "s"),
-                                 ("before pos", "launch_position_gain_before_per_s", "1/s")):
-            tuning.addWidget(QLabel(label))
+        tuning.setHorizontalSpacing(10)
+        tuning.setVerticalSpacing(4)
+        for row, key in enumerate(("launch_position_gain_change_s", "launch_position_gain_before_per_s",
+                                   "launch_velocity_feedforward_scale", "release_open_delay_s")):
+            label = QLabel(key)
+            font = label.font()
+            font.setPointSizeF(9.5)
+            label.setFont(font)
+            tuning.addWidget(label, row, 0)
             field = QLineEdit()
-            field.setAccessibleName(label)
+            field.setAccessibleName(key)
+            field.setFixedSize(88, 30)
+            field.setAlignment(Qt.AlignRight)
             field.setPlaceholderText("YAML")
-            field.setToolTip(f"{key} ({unit}) · 비우면 tuning.yaml 값 사용")
+            field.setToolTip(f"{key} · 비우면 tuning.yaml 값 사용")
             field.textChanged.connect(lambda text, k=key: self._node.toss_tuning_draft.update({k: text}))
             self._toss_tuning[key] = field
-            tuning.addWidget(field)
-            tuning.addWidget(QLabel(unit))
+            tuning.addWidget(field, row, 1)
+        tuning.setColumnStretch(2, 1)
         layout.addWidget(self._toss_tuning_panel, 4, 0, 1, 5)
         self._toss_gripper_position = QLabel("Gripper —")
         self._toss_gripper_position.setTextFormat(Qt.PlainText)
@@ -1836,8 +1844,8 @@ class Dashboard(QMainWindow):
                     for key, field in self._toss_tuning.items():
                         if field.text().strip():
                             number = float(field.text())
-                            if not math.isfinite(number) or number < 0:
-                                raise ValueError(f"{field.accessibleName()}는 0 이상의 유한한 값이어야 합니다.")
+                            if not math.isfinite(number) or (number < 0 and key != "release_open_delay_s"):
+                                raise ValueError(f"{key} 값의 범위를 확인하세요.")
                             value.append(f"{key}:={number}")
                     toss_run_args(value)
                     if len(value) == 1:

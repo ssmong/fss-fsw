@@ -268,7 +268,7 @@ def open_node(receive, reply, args=None, reject=None):
         if source is not None:
             applied = source[2].get("experiment", {})
             keys = ("launch_position_gain_change_s", "launch_position_gain_before_per_s",
-                    "launch_position_gain_after_per_s")
+                    "launch_position_gain_after_per_s", "launch_velocity_feedforward_scale", "release_open_delay_s")
             if isinstance(applied, dict):
                 tuning = {key: applied[key] for key in keys if key in applied}
                 if tuning:

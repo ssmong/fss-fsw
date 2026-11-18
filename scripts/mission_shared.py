@@ -12,7 +12,7 @@ import threading
 import time
 
 
-SHARED_PROTOCOL = 7
+SHARED_PROTOCOL = 8
 SHARED_CACHE = {"plans", "plan_defaults", "arm_registration", "connected"}
 SHARED_DISPLAY = {"vicon", "ekf", "ref", "arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"}
 

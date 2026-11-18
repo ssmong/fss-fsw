@@ -608,6 +608,9 @@ class MissionControlTest(unittest.TestCase):
             self.assertTrue(first.commands.empty())
         fields[0].setText("2.5")
         fields[1].setText("0.7")
+        fields[2].setText("0.8")
+        fields[3].setText("-0.1")
+        self.assertTrue(all(field.width() == 88 for field in fields))
         w._vehicles.setCurrentIndex(1)
         self.assertEqual(fields[0].text(), "")
         w._vehicles.setCurrentIndex(0)
@@ -617,6 +620,8 @@ class MissionControlTest(unittest.TestCase):
         self.assertEqual(action, "toss_run")
         self.assertIn("launch_position_gain_change_s:=2.5", values)
         self.assertIn("launch_position_gain_before_per_s:=0.7", values)
+        self.assertIn("launch_velocity_feedforward_scale:=0.8", values)
+        self.assertIn("release_open_delay_s:=-0.1", values)
 
     def test_toss_gripper_position_is_fresh_and_per_selected_fss(self):
         w = self.window

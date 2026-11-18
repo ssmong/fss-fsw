@@ -75,7 +75,8 @@ class RecordingTest(unittest.TestCase):
             fss = self.gui.DashboardNode()
             run = fss.recorder.start(root, "self-tossing", "FSS-1")
             tuning = {"launch_position_gain_change_s": 2.5,
-                      "launch_position_gain_before_per_s": .7}
+                      "launch_position_gain_before_per_s": .7,
+                      "launch_velocity_feedforward_scale": .8, "release_open_delay_s": -.1}
             fss.receive("paper_status", {"phase": "IDLE", "tuning": tuning})
             fss.recorder.stop()
             self.assertEqual(json.loads((run / "tuning.json").read_text()), tuning)
