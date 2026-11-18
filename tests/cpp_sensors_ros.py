@@ -23,9 +23,12 @@ def check_close(actual, expected):
 def main():
     imu_executable, vicon_executable = sys.argv[1:]
     os.environ.setdefault("ROS_DOMAIN_ID", str(160 + os.getpid() % 60))
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+    with (socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve,
+          socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as corrected_reserve):
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
+        corrected_reserve.bind(("127.0.0.1", 0))
+        corrected_port = corrected_reserve.getsockname()[1]
     topic_root = f"/cpp_sensor_test_{os.getpid()}"
     processes = []
     with tempfile.TemporaryDirectory(prefix="fss-sensors-ros-") as directory:
@@ -43,6 +46,8 @@ def main():
                     "frame_offset_x": 3.0, "frame_offset_y": 4.0, "frame_rotation_deg": 90.0,
                 }),
             ]
+            configs.append((vicon_executable, {**configs[1][1], "port": corrected_port,
+                "center_correction": True, "marker_offset_x": -0.12, "marker_offset_y": -0.08}))
 
             def bridge_args(executable, parameters):
                 args = [executable, "--ros-args"]
@@ -62,14 +67,19 @@ def main():
                 log_path = Path(directory) / f"bridge_{index}.log"
                 logs.append(log_path)
                 with log_path.open("w", encoding="utf-8") as log:
-                    processes.append(subprocess.Popen(bridge_args(executable, parameters),
+                    args = bridge_args(executable, parameters)
+                    if index == 2:
+                        args.extend(["-r", f"/sensors/vicon_state:={topic_root}/center",
+                                     "-r", "__node:=corrected_vicon_test"])
+                    processes.append(subprocess.Popen(args,
                                                        stdout=log, stderr=subprocess.STDOUT))
 
             rclpy.init()
             node = rclpy.create_node(f"cpp_sensor_test_{os.getpid()}")
-            imus, states = [], []
+            imus, states, centers = [], [], []
             node.create_subscription(Imu, f"{topic_root}/imu", imus.append, 10)
             node.create_subscription(SpacecraftState, "/sensors/vicon_state", states.append, 10)
+            node.create_subscription(SpacecraftState, f"{topic_root}/center", centers.append, 10)
             publisher = node.create_publisher(Imu, f"{topic_root}/input", 10)
 
             def until(predicate, timeout=10.0):
@@ -86,7 +96,8 @@ def main():
 
             until(lambda: node.count_subscribers(f"{topic_root}/input") > 0
                   and node.count_publishers(f"{topic_root}/imu") > 0
-                  and node.count_publishers("/sensors/vicon_state") > 0)
+                  and node.count_publishers("/sensors/vicon_state") > 0
+                  and node.count_publishers(f"{topic_root}/center") > 0)
             settle()
             measurement = Imu()
             measurement.header.stamp.sec = 123
@@ -132,6 +143,7 @@ def main():
                     data = {"frame": frame, "t": source_time, "objects": {
                         "robotA": {"valid": True, "x": x, "y": 2000.0, "yaw": yaw}}}
                     sender.sendto(json.dumps(data).encode(), ("127.0.0.1", port))
+                    sender.sendto(json.dumps(data).encode(), ("127.0.0.1", corrected_port))
 
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as wrong_sender:
                     wrong_sender.bind(("127.0.0.2", 0))
@@ -148,11 +160,22 @@ def main():
                 check_close(first.y, 5.0)
                 check_close(first.theta, math.pi / 2)
                 assert first.vx == first.vy == first.omega == 0.0
+                until(lambda: len(centers) == 1)
+                check_close(centers[-1].x, 0.92)
+                check_close(centers[-1].y, 5.12)
                 send_pose(2, 100.1, 1100.0, math.degrees(0.1))
                 until(lambda: len(states) == 2)
                 check_close(states[-1].vx, 0.0)
                 check_close(states[-1].vy, 1.0)
                 check_close(states[-1].omega, 1.0)
+                until(lambda: len(centers) == 2)
+                theta = math.pi / 2 + 0.1
+                center_x = 1.0 + 0.12 * math.cos(theta) - 0.08 * math.sin(theta)
+                center_y = 5.1 + 0.12 * math.sin(theta) + 0.08 * math.cos(theta)
+                check_close(centers[-1].x, center_x)
+                check_close(centers[-1].y, center_y)
+                check_close(centers[-1].vx, (center_x - 0.92) / 0.1)
+                check_close(centers[-1].vy, (center_y - 5.12) / 0.1)
                 sender.sendto(b'{"frame":3,"t":100.2,"objects":{"robotA":{"valid":false}}}',
                               ("127.0.0.1", port))
                 sender.sendto(b'{"frame":', ("127.0.0.1", port))

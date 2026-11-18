@@ -33,5 +33,6 @@ system:
   use_arm: false          # 로봇팔 노드 실행
   use_thrusters: true     # 추력 출력 허용; false이면 GNC도 생략
   use_gnc: true           # 추력기 사용 시 본체 GNC 실행
+  use_imu: true           # false: Vicon 단독 항법
   gnc_backend: cpp        # cpp: 기본 런타임, python: bindings를 사용하는 연구용 GNC
   log_level: INFO         # ROS2 로깅 레벨

@@ -23,6 +23,9 @@ class ViconBridgeNode final : public rclcpp::Node {
     declare_parameter("frame_offset_x", ParameterType::PARAMETER_DOUBLE);
     declare_parameter("frame_offset_y", ParameterType::PARAMETER_DOUBLE);
     declare_parameter("frame_rotation_deg", ParameterType::PARAMETER_DOUBLE);
+    declare_parameter("center_correction", false);
+    declare_parameter("marker_offset_x", 0.0);
+    declare_parameter("marker_offset_y", 0.0);
 
     const auto port = get_parameter("port").as_int();
     if (port < 1 || port > 65535) throw std::invalid_argument("Vicon port must be in 1..65535");
@@ -40,7 +43,9 @@ class ViconBridgeNode final : public rclcpp::Node {
     frame_id_ = get_parameter("vicon_frame_id").as_string();
     transform_ = std::make_unique<fss_hal::PlanarPoseTransform>(
         get_parameter("frame_offset_x").as_double(), get_parameter("frame_offset_y").as_double(),
-        get_parameter("frame_rotation_deg").as_double() * (fss_hal::kPi / 180.0));
+        get_parameter("frame_rotation_deg").as_double() * (fss_hal::kPi / 180.0),
+        get_parameter("center_correction").as_bool(),
+        get_parameter("marker_offset_x").as_double(), get_parameter("marker_offset_y").as_double());
     hal_ = std::make_unique<fss_hal::ViconHAL>(
         fss_hal::ViconConfig{get_parameter("bind_ip").as_string(), static_cast<int>(port),
                              get_parameter("source_ip").as_string(),

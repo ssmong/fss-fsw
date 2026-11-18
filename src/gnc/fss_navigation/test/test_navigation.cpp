@@ -260,6 +260,12 @@ TEST(Navigation, ViconOutlierCannotResetTimeoutAndFreshViconRestoresNavigation) 
     }
     EXPECT_TRUE(navigation.navigation_degraded());
     EXPECT_EQ(navigation.on_vicon(150000000, 150000000, 0.0, 0.0, 0.0), InputResult::Accepted);
+    // The observation waits until IMU history reaches its acquisition time.
+    EXPECT_TRUE(navigation.navigation_degraded());
+    navigation.on_imu(150000000, 150000000, 0.0, 0.0, 0.0);
+    // After the old outlier, require a consistent subsequent observation.
+    navigation.on_imu(160000000, 160000000, 0.0, 0.0, 0.0);
+    EXPECT_EQ(navigation.on_vicon(160000000, 160000000, 0.0, 0.0, 0.0), InputResult::Accepted);
     EXPECT_FALSE(navigation.navigation_degraded());
 }
 

@@ -12,3 +12,8 @@ vicon_frame_id: "table"
 frame_offset_x: 0.0                # [m]
 frame_offset_y: 0.0
 frame_rotation_deg: 0.0            # [deg]
+
+# 본체 중심 → 마커 원점 벡터 [m], 본체 좌표. 실측 보정값이 있을 때만 활성화.
+center_correction: false
+marker_offset_x: 0.0
+marker_offset_y: 0.0

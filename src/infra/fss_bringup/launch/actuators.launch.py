@@ -30,6 +30,12 @@ def generate_launch_description() -> LaunchDescription:
         default_value="true",
         description="추력 출력 허용 여부; false여도 메인밸브 서비스와 상태 발행 유지",
     )
+    command_input_arg = DeclareLaunchArgument(
+        "command_input", default_value="thrust", choices=["thrust", "duty"],
+        description="추력(N) 또는 실험용 직접 듀티 입력",
+    )
+    dry_bench_arg = DeclareLaunchArgument("dry_bench_solenoid", default_value="false")
+    release_nozzle_arg = DeclareLaunchArgument("release_nozzle", default_value="-1")
     cpu_pin_arg = DeclareLaunchArgument(
         "cpu_pin",
         default_value=scheduling["cpu_pin"],
@@ -63,6 +69,9 @@ def generate_launch_description() -> LaunchDescription:
         {
             "use_sim": ParameterValue(use_sim, value_type=bool),
             "use_thrusters": ParameterValue(LaunchConfiguration("use_thrusters"), value_type=bool),
+            "command_input": ParameterValue(LaunchConfiguration("command_input"), value_type=str),
+            "dry_bench_solenoid": ParameterValue(LaunchConfiguration("dry_bench_solenoid"), value_type=bool),
+            "release_nozzle": ParameterValue(LaunchConfiguration("release_nozzle"), value_type=int),
             "use_sim_time": ParameterValue(LaunchConfiguration("use_sim_time"), value_type=bool),
         },
     ]
@@ -83,6 +92,9 @@ def generate_launch_description() -> LaunchDescription:
         [
             use_sim_arg,
             use_thrusters_arg,
+            command_input_arg,
+            dry_bench_arg,
+            release_nozzle_arg,
             cpu_pin_arg,
             cpu_core_arg,
             rt_priority_arg,

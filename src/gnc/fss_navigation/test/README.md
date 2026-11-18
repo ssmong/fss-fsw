@@ -22,6 +22,18 @@ NIS history, zero-length prediction, and reinitialization without clearing NIS.
 `2e-11`, with exact acceptance and consistency decisions. The fixture is test data,
 not generated during testing or by the implementation under test.
 
+`timed_ekf_golden.npz` separately freezes 1,607 operations from the private Python
+`ekf.py` and `timed_ekf.py` used by Self-tossing on 2026-11-18. The SHA-256 of their
+concatenated source bytes is
+`c8bb0ba1b5d6cc57c9c25e947fcfb7d42f0fe952c61720568d260486143406a3`.
+It checks delayed interval splitting/replay, rejected-measurement rollback,
+history bounds, bias-preserving recovery, incoherent/frozen observations, and
+motion-dependent timestamp uncertainty. Rows contain acceptance, consistency,
+mean NIS, recovery/history decisions, update NIS and three innovations, then the
+11 states and 121 covariance entries. The same numerical tolerances apply.
+Timed initialization and recovery clear NIS, matching that experiment reference;
+the raw EKF initialization keeps its existing default for legacy callers.
+
 Coverage retained when removing obsolete Python tests:
 
 | Removed tests | Native replacement |

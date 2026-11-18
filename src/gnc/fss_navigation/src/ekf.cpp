@@ -31,7 +31,8 @@ double wrap_angle(double angle) {
 PlanarEKF::PlanarEKF(const EKFParameters& parameters) : parameters_(parameters) {
     for (double noise : {parameters.gyro_noise_density, parameters.accel_noise_density,
                          parameters.gyro_bias_random_walk, parameters.accel_bias_random_walk,
-                         parameters.table_accel_bias_random_walk}) {
+                         parameters.table_accel_bias_random_walk, parameters.vicon_timestamp_std_ms,
+                         parameters.accel_model_noise_density}) {
         if (!std::isfinite(noise) || noise < 0.0) {
             throw std::invalid_argument("EKF noise densities must be finite and nonnegative");
         }
@@ -47,7 +48,7 @@ PlanarEKF::PlanarEKF(const EKFParameters& parameters) : parameters_(parameters) 
                                         square(parameters.vicon_heading_noise)).asDiagonal();
 }
 
-void PlanarEKF::initialize(double px, double py, double theta) {
+void PlanarEKF::initialize(double px, double py, double theta, bool reset_nis) {
     if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(theta)) {
         return;
     }
@@ -56,6 +57,9 @@ void PlanarEKF::initialize(double px, double py, double theta) {
     P.setZero();
     P.diagonal() << 1e-4, 1e-4, 1e-4, 0.01, 0.01, 1e-4, 1e-5, 1e-4, 1e-4, 2.5e-3, 2.5e-3;
     initialized_ = true;
+    if (reset_nis) { nis_history_.clear(); }
+    last_vicon_nis = 0.0;
+    last_vicon_innovation.setZero();
 }
 
 void PlanarEKF::predict(double dt, double omega_imu, double ax_imu, double ay_imu) {
@@ -98,8 +102,8 @@ void PlanarEKF::predict(double dt, double omega_imu, double ax_imu, double ay_im
 
     Covariance Q = Covariance::Zero();
     Q.diagonal() << 1e-10 * dt, 1e-10 * dt, square(parameters_.gyro_noise_density) * dt,
-        square(parameters_.accel_noise_density) * dt,
-        square(parameters_.accel_noise_density) * dt,
+        (square(parameters_.accel_noise_density) + square(parameters_.accel_model_noise_density)) * dt,
+        (square(parameters_.accel_noise_density) + square(parameters_.accel_model_noise_density)) * dt,
         square(parameters_.gyro_noise_density) / dt,
         square(parameters_.gyro_bias_random_walk) * dt,
         square(parameters_.accel_bias_random_walk) * dt,
@@ -110,7 +114,7 @@ void PlanarEKF::predict(double dt, double omega_imu, double ax_imu, double ay_im
     P = (0.5 * (P + P.transpose())).eval();
 }
 
-bool PlanarEKF::update_vicon(double px, double py, double theta) {
+bool PlanarEKF::update_vicon(double px, double py, double theta, bool gate_only) {
     if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(theta)) {
         return false;
     }
@@ -120,17 +124,22 @@ bool PlanarEKF::update_vicon(double px, double py, double theta) {
     }
     Eigen::Vector3d innovation = Eigen::Vector3d(px, py, theta) - x.head<3>();
     innovation[2] = wrap_angle(innovation[2]);
-    const Eigen::Matrix3d S = P.topLeftCorner<3, 3>() + measurement_noise_;
+    const Eigen::Vector3d timing_error = x.segment<3>(IVX) * (parameters_.vicon_timestamp_std_ms * 1e-3);
+    const Eigen::Matrix3d measurement_cov = measurement_noise_ + timing_error * timing_error.transpose();
+    const Eigen::Matrix3d S = P.topLeftCorner<3, 3>() + measurement_cov;
+    last_vicon_innovation = innovation;
     const Eigen::LDLT<Eigen::Matrix3d> factor(S);
     if (!S.allFinite() || !x.allFinite() || !P.allFinite() ||
         factor.info() != Eigen::Success || !factor.isPositive() ||
         (factor.vectorD().array() <= 0.0).any()) {
         record_nis(std::numeric_limits<double>::infinity());
+        last_vicon_nis = std::numeric_limits<double>::infinity();
         return false;
     }
     const double nis = innovation.dot(factor.solve(innovation));
     record_nis(nis);
-    if (!std::isfinite(nis) || nis > parameters_.gate_threshold) {
+    last_vicon_nis = nis;
+    if (gate_only || !std::isfinite(nis) || nis > parameters_.gate_threshold) {
         return false;
     }
     const Eigen::Matrix<double, N_STATES, 3> K =
@@ -139,7 +148,7 @@ bool PlanarEKF::update_vicon(double px, double py, double theta) {
     x[ITHETA] = wrap_angle(x[ITHETA]);
     Covariance I_KH = Covariance::Identity();
     I_KH.leftCols<3>() -= K;
-    P = (I_KH * P * I_KH.transpose() + K * measurement_noise_ * K.transpose()).eval();
+    P = (I_KH * P * I_KH.transpose() + K * measurement_cov * K.transpose()).eval();
     P = (0.5 * (P + P.transpose())).eval();
     return true;
 }

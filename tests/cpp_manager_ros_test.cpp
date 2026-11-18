@@ -187,7 +187,7 @@ void adapter_topics_services_and_clock() {
     healthy_tick(2200);
     CHECK(modes.back().mode == SystemMode::ACTIVE);
     time_ms(3199);
-    CHECK(modes.back().mode == SystemMode::ACTIVE);
+    CHECK(modes.back().mode == SystemMode::SAFE_HOLD);
     CHECK(health.back().navigation_ok);
     time_ms(3200);
     CHECK(modes.back().mode == SystemMode::SAFE_HOLD);
@@ -214,6 +214,87 @@ void adapter_topics_services_and_clock() {
     CHECK(modes.back().header.stamp.sec == 3);
     CHECK(modes.back().header.stamp.nanosec == 800000000);
 }
+
+void automatic_start_keeps_arm_gate_and_external_cancellation() {
+    for (const auto scenario : {0, 1, 2, 3}) {
+        const bool dry = scenario == 1;
+        const bool cancel = scenario == 2;
+        const bool fail = scenario == 3;
+        auto opts = options();
+        auto params = opts.parameter_overrides();
+        for (auto& parameter : params) {
+            if (parameter.get_name() == "use_sim_time") parameter = rclcpp::Parameter("use_sim_time", false);
+            if (parameter.get_name() == "control_rate_min_hz") parameter = rclcpp::Parameter("control_rate_min_hz", 1.0);
+        }
+        params.emplace_back("auto_activate", true);
+        params.emplace_back("dry_bench_solenoid", dry);
+        params.emplace_back("require_arm_status", true);
+        opts.parameter_overrides(params);
+        auto manager = std::make_shared<fss_manager::ManagerNode>(opts);
+        auto helper = std::make_shared<rclcpp::Node>("cpp_manager_auto_test");
+        rclcpp::executors::SingleThreadedExecutor executor;
+        executor.add_node(manager);
+        executor.add_node(helper);
+        int valve_calls = 0;
+        bool valve_open = false;
+        std::uint8_t last_mode = SystemMode::IDLE;
+        auto valve_service = helper->create_service<fss_interfaces::srv::MainValveControl>(
+            "/actuators/main_valve", [&](const std::shared_ptr<fss_interfaces::srv::MainValveControl::Request> request,
+                                         std::shared_ptr<fss_interfaces::srv::MainValveControl::Response> response) {
+                ++valve_calls;
+                CHECK(request->open == !dry);
+                valve_open = !fail && request->open;
+                response->success = !fail;
+            });
+        auto mode_sub = helper->create_subscription<SystemMode>("/system/mode", 10,
+            [&](const SystemMode& msg) { last_mode = msg.mode; });
+        auto nav = helper->create_publisher<SpacecraftState>("/navigation/state", 10);
+        auto vicon = helper->create_publisher<SpacecraftState>("/sensors/vicon_state", 10);
+        auto valve = helper->create_publisher<ValveStatus>(dry ? "/actuators/dry_bench/valve_status" : "/actuators/valve_status", 10);
+        auto arm = helper->create_publisher<std_msgs::msg::String>("/arm/operation_status", rclcpp::SensorDataQoS());
+        auto mode_client = helper->create_client<SetSystemMode>("/system/set_mode");
+        const auto started = std::chrono::steady_clock::now();
+        bool cancellation_sent = false;
+        std::optional<rclcpp::Client<SetSystemMode>::SharedFuture> cancellation;
+        while (std::chrono::steady_clock::now() - started < 5s) {
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            SpacecraftState state;
+            state.header.stamp = helper->now();
+            state.std_x = state.std_y = 0.001;
+            state.std_theta = 0.002;
+            nav->publish(state);
+            vicon->publish(state);
+            ValveStatus feedback;
+            feedback.main_valve_open = valve_open;
+            valve->publish(feedback);
+            std_msgs::msg::String status;
+            status.data = elapsed < 1200ms ? "{invalid" :
+                "{\"api_version\":1,\"status_stamp\":" + std::to_string(helper->now().seconds()) + "}";
+            arm->publish(status);
+            if (elapsed < 1200ms) CHECK(last_mode != SystemMode::ACTIVE);
+            if (cancel && !cancellation_sent && last_mode == SystemMode::PRESSURIZING) {
+                auto request = std::make_shared<SetSystemMode::Request>();
+                request->requested_mode = SystemMode::IDLE;
+                cancellation = mode_client->async_send_request(request).future.share();
+                cancellation_sent = true;
+            }
+            executor.spin_once(10ms);
+            if (!cancel && !fail && last_mode == SystemMode::ACTIVE) break;
+            if ((cancel || fail) && elapsed > 2200ms) break;
+        }
+        CHECK(valve_calls == 1);
+        if (cancel) {
+            CHECK(cancellation_sent);
+            CHECK(cancellation->wait_for(0s) == std::future_status::ready);
+            CHECK(cancellation->get()->success);
+            CHECK(last_mode == SystemMode::IDLE);
+        } else if (fail) {
+            CHECK(last_mode == SystemMode::PRESSURIZING);
+        } else {
+            CHECK(last_mode == SystemMode::ACTIVE);
+        }
+    }
+}
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -221,6 +302,7 @@ int main(int argc, char* argv[]) {
     try {
         startup_requires_valid_parameters();
         adapter_topics_services_and_clock();
+        automatic_start_keeps_arm_gate_and_external_cancellation();
         std::cout
             << "manager ROS startup, topics, service, fake ROS clock and safety tests passed\n";
     } catch (const std::exception& error) {

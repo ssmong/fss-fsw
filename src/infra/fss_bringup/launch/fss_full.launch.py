@@ -19,12 +19,12 @@ IDLE 기동 후 /system/set_mode 서비스로 전이한다.
 """
 
 from fss_common.hardware_ownership import claim_launch
-from fss_common.launch_utils import node_params, scheduling_defaults
+from fss_common.launch_utils import node_params, scheduling_defaults, use_imu_default, vicon_delay_default, vicon_center_correction_default
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -68,6 +68,11 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     use_sim = LaunchConfiguration("use_sim")
+    use_imu_arg = DeclareLaunchArgument("use_imu", default_value=use_imu_default())
+    start_imu_driver_arg = DeclareLaunchArgument("start_imu_driver", default_value="false")
+    use_imu = LaunchConfiguration("use_imu")
+    vicon_delay_arg = DeclareLaunchArgument("vicon_delay_ms", default_value=vicon_delay_default())
+    center_correction_arg = DeclareLaunchArgument("vicon_center_correction", default_value=vicon_center_correction_default())
     use_arm_arg = DeclareLaunchArgument(
         "use_arm", default_value="false", description="로봇팔 위치·속도·전류 명령 노드 실행"
     )
@@ -120,7 +125,9 @@ def generate_launch_description() -> LaunchDescription:
             PathJoinSubstitution([bringup_share, "launch", "sensors.launch.py"])
         ),
         launch_arguments={
-            "use_imu": "true",
+            "use_imu": use_imu,
+            "start_imu_driver": LaunchConfiguration("start_imu_driver"),
+            "vicon_center_correction": LaunchConfiguration("vicon_center_correction"),
             "use_realsense": use_realsense,
         }.items(),
         condition=UnlessCondition(use_sim),
@@ -144,7 +151,10 @@ def generate_launch_description() -> LaunchDescription:
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([bringup_share, "launch", "navigation.launch.py"])
         ),
-        launch_arguments={"use_sim_time": use_sim}.items(),
+        launch_arguments={
+            "use_sim_time": use_sim, "use_imu": use_imu, "simulated_sensors": use_sim,
+            "vicon_delay_ms": IfElseSubstitution(use_sim, if_value="0.0", else_value=LaunchConfiguration("vicon_delay_ms")),
+        }.items(),
     )
 
     # ── GNC (유도 + 제어 + 할당) ──
@@ -180,6 +190,10 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             use_sim_arg,
+            use_imu_arg,
+            start_imu_driver_arg,
+            vicon_delay_arg,
+            center_correction_arg,
             use_arm_arg,
             use_thrusters_arg,
             use_gnc_arg,

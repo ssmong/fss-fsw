@@ -9,6 +9,7 @@ Hydra 오버라이드는 FSS_HYDRA_OVERRIDES 환경변수(공백 구분)로 전�
 """
 
 import logging
+import math
 import os
 import shlex
 import tempfile
@@ -21,6 +22,36 @@ _ENV_OVERRIDES = "FSS_HYDRA_OVERRIDES"
 def hydra_overrides_from_env() -> list[str]:
     """환경변수에서 Hydra 오버라이드 목록을 읽는다."""
     return shlex.split(os.environ.get(_ENV_OVERRIDES, ""))
+
+
+def use_imu_default() -> str:
+    from fss_common.hydra_bridge import load_hydra_config
+    from fss_common.paths import config_dir
+
+    value = load_hydra_config(config_dir(), overrides=hydra_overrides_from_env()).system.get("use_imu", True)
+    if type(value) is not bool:
+        raise ValueError("system.use_imu must be true or false")
+    return str(value).lower()
+
+
+def vicon_center_correction_default() -> str:
+    from fss_common.hydra_bridge import load_hydra_config
+    from fss_common.paths import config_dir
+
+    value = load_hydra_config(config_dir(), overrides=hydra_overrides_from_env()).vicon_bridge_node.get("center_correction", False)
+    if type(value) is not bool:
+        raise ValueError("vicon_bridge_node.center_correction must be true or false")
+    return str(value).lower()
+
+
+def vicon_delay_default() -> str:
+    from fss_common.hydra_bridge import load_hydra_config
+    from fss_common.paths import config_dir
+
+    value = load_hydra_config(config_dir(), overrides=hydra_overrides_from_env()).ekf_node.vicon_delay_ms
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError("ekf_node.vicon_delay_ms must be a finite nonnegative number")
+    return str(float(value))
 
 
 def execution_prefix(cpu_pin: bool, cpu_core: str, rt_priority: str) -> str:

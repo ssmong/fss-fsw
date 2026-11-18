@@ -62,6 +62,9 @@ struct ManagerConfig {
     bool auto_safe_hold{true};
     double nav_pos_std_limit{0.005};
     double nav_heading_std_limit{0.02};
+    bool dry_bench_solenoid{false};
+    bool require_arm_status{false};
+    bool toss_nav_uncertainty_grace{false};
 };
 
 struct ModeResponse {
@@ -74,12 +77,17 @@ struct ModeResponse {
 class ManagerCore {
 public:
     explicit ManagerCore(const ManagerConfig& config);
-    void on_nav(std::int64_t now_ns, double std_x, double std_y, double std_theta);
-    void on_vicon(std::int64_t now_ns);
+    void on_nav(std::int64_t now_ns, double std_x, double std_y, double std_theta,
+                std::optional<std::int64_t> stamp_ns = std::nullopt);
+    void on_vicon(std::int64_t now_ns, std::optional<std::int64_t> stamp_ns = std::nullopt,
+                  bool valid_pose = true);
+    void on_arm_status(std::int64_t stamp_ns) { arm_status_stamp_ns_ = stamp_ns; }
     void on_valve(std::int64_t now_ns, bool main_valve_open, double modbus_rtt_ms);
     void measure_nav_hz();
     bool health_check(std::int64_t now_ns);
-    ModeResponse set_mode(std::uint8_t requested_mode);
+    ModeResponse set_mode(std::uint8_t requested_mode,
+                          std::optional<std::int64_t> now_ns = std::nullopt);
+    std::string arming_failure(Mode target, std::optional<std::int64_t> now_ns = std::nullopt) const;
 
     Mode mode() const { return fsm_.mode; }
     const HealthStatus& health() const { return health_; }
@@ -90,7 +98,7 @@ public:
     const std::vector<Transition>& transition_log() const { return fsm_.transition_log; }
 
 private:
-    std::string arming_failure(Mode target) const;
+    bool within_std(double scale = 1.0) const;
     static double age_ms(std::int64_t now_ns, std::int64_t then_ns);
     static bool fresh(std::int64_t now_ns, const std::optional<std::int64_t>& then_ns);
 
@@ -100,6 +108,11 @@ private:
     std::optional<std::int64_t> last_nav_ns_;
     std::optional<std::int64_t> last_vicon_ns_;
     std::optional<std::int64_t> last_valve_ns_;
+    std::optional<std::int64_t> nav_stamp_ns_;
+    std::optional<std::int64_t> valid_vicon_stamp_ns_;
+    std::optional<std::int64_t> last_good_nav_stamp_ns_;
+    std::optional<std::int64_t> arm_status_stamp_ns_;
+    std::int64_t now_ns_{0};
     double nav_hz_{0.0};
     std::uint64_t nav_count_{0};
     std::array<double, 3> nav_std_{};

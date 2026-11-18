@@ -32,6 +32,32 @@ class ValveControl {
       if (!map_) v = std::clamp(v / max_thrust_, 0.0, 1.0);
     }
     if (map_) commanded = map_->duty_from_thrust(commanded);
+    apply_duty(commanded, enabled);
+  }
+
+  void command_duty(const std::array<double, kCount>& duty, const std::array<bool, kCount>& enabled) {
+    std::vector<double> commanded(duty.begin(), duty.end());
+    for (auto& value : commanded) if (!std::isfinite(value)) value = 0.0;
+    apply_duty(commanded, enabled);
+  }
+
+  // A validated release event owns this channel for the entire pulse.
+  void release_pulse(bool open, int nozzle) {
+    if (nozzle < 0) {
+      main_valve(open);
+      return;
+    }
+    if (nozzle >= static_cast<int>(kCount)) throw std::invalid_argument("Invalid release nozzle");
+    std::vector<double> duty(kCount, 0.0);
+    if (open) duty[nozzle] = 0.60;
+    hal_.set_valves(duty);
+    std::copy(duty.begin(), duty.end(), commanded_.begin());
+    for (std::size_t i = 0; i < kCount; ++i)
+      registers_[i] = fss_hal::valve_register_value(duty[i], maximum_);
+  }
+
+ private:
+  void apply_duty(const std::vector<double>& commanded, const std::array<bool, kCount>& enabled) {
     std::vector<double> applied(kCount, 0.0);
     for (std::size_t i = 0; i < kCount; ++i) {
       if (use_thrusters_ && enabled[i] && mode_ == kActive && commanded[i] >= threshold_)
@@ -43,6 +69,7 @@ class ValveControl {
       registers_[i] = fss_hal::valve_register_value(applied[i], maximum_);
   }
 
+ public:
   bool mode(std::uint8_t value) {
     mode_ = value;
     if (value == kActive) return false;

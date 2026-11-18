@@ -1,6 +1,7 @@
 #include "fss_manager/mode_fsm.hpp"
 
 #include <iomanip>
+#include <cmath>
 #include <sstream>
 
 namespace fss_manager {
@@ -96,14 +97,20 @@ bool HealthStatus::navigation_ok() const {
 ManagerCore::ManagerCore(const ManagerConfig& config)
     : config_(config), health_(config.nav_age_limit_ms, config.control_rate_min_hz) {}
 
-void ManagerCore::on_nav(std::int64_t now_ns, double std_x, double std_y, double std_theta) {
+void ManagerCore::on_nav(std::int64_t now_ns, double std_x, double std_y, double std_theta,
+                         std::optional<std::int64_t> stamp_ns) {
     last_nav_ns_ = now_ns;
     ++nav_count_;
     nav_std_ = {std_x, std_y, std_theta};
+    nav_stamp_ns_ = stamp_ns.value_or(now_ns);
+    const auto age = age_ms(now_ns, *nav_stamp_ns_);
+    if (config_.toss_nav_uncertainty_grace && within_std() && age >= 0.0 && age <= 100.0)
+        last_good_nav_stamp_ns_ = nav_stamp_ns_;
 }
 
-void ManagerCore::on_vicon(std::int64_t now_ns) {
+void ManagerCore::on_vicon(std::int64_t now_ns, std::optional<std::int64_t> stamp_ns, bool valid_pose) {
     last_vicon_ns_ = now_ns;
+    valid_vicon_stamp_ns_ = valid_pose ? std::optional<std::int64_t>(stamp_ns.value_or(now_ns)) : std::nullopt;
 }
 
 void ManagerCore::on_valve(std::int64_t now_ns, bool main_valve_open, double modbus_rtt_ms) {
@@ -122,19 +129,38 @@ double ManagerCore::age_ms(std::int64_t now_ns, std::int64_t then_ns) {
 }
 
 bool ManagerCore::fresh(std::int64_t now_ns, const std::optional<std::int64_t>& then_ns) {
-    return then_ns && age_ms(now_ns, *then_ns) < 500.0;
+    return then_ns && age_ms(now_ns, *then_ns) >= 0.0 && age_ms(now_ns, *then_ns) < 500.0;
+}
+
+bool ManagerCore::within_std(double scale) const {
+    return nav_std_[0] >= 0.0 && nav_std_[0] <= scale * config_.nav_pos_std_limit &&
+           nav_std_[1] >= 0.0 && nav_std_[1] <= scale * config_.nav_pos_std_limit &&
+           nav_std_[2] >= 0.0 && nav_std_[2] <= scale * config_.nav_heading_std_limit;
 }
 
 bool ManagerCore::health_check(std::int64_t now_ns) {
+    now_ns_ = now_ns;
     const double nav_age_ms = last_nav_ns_ ? age_ms(now_ns, *last_nav_ns_) : 9999.0;
-    nav_uncertainty_ok_ = nav_std_[0] <= config_.nav_pos_std_limit &&
-                          nav_std_[1] <= config_.nav_pos_std_limit &&
-                          nav_std_[2] <= config_.nav_heading_std_limit;
-    const bool vicon_ok = last_nav_ns_.has_value() && nav_uncertainty_ok_;
+    nav_uncertainty_ok_ = within_std();
+    const auto measurement_fresh = [now_ns](const std::optional<std::int64_t>& stamp) {
+        return stamp && age_ms(now_ns, *stamp) >= 0.0 && age_ms(now_ns, *stamp) <= 100.0;
+    };
+    const bool grace = config_.toss_nav_uncertainty_grace && fsm_.mode == Mode::ACTIVE &&
+        !nav_uncertainty_ok_ && within_std(2.0) && fresh(now_ns, last_good_nav_stamp_ns_) &&
+        measurement_fresh(nav_stamp_ns_) && measurement_fresh(valid_vicon_stamp_ns_);
+    const bool vicon_ok = last_nav_ns_.has_value() && (nav_uncertainty_ok_ || grace);
     health_.update(nav_age_ms, nav_hz_, modbus_rtt_ms_, main_valve_open_, vicon_ok);
     act_ready_ = fresh(now_ns, last_valve_ns_);
     vicon_ready_ = fresh(now_ns, last_vicon_ns_);
     nav_ready_ = fresh(now_ns, last_nav_ns_) && nav_uncertainty_ok_ && health_.navigation_ok();
+    if (fsm_.mode == Mode::ACTIVE) {
+        if (!act_ready_)
+            health_.errors.push_back("액추에이터(PLC) 상태 수신 만료");
+        if (!config_.dry_bench_solenoid && !main_valve_open_)
+            health_.errors.push_back("ACTIVE 중 에어베어링 메인밸브 닫힘");
+    }
+    if (grace)
+        health_.warnings.push_back("일시적 항법 불확실도 증가");
 
     if (config_.auto_safe_hold && fsm_.mode == Mode::ACTIVE && health_.has_fault()) {
         std::string reason;
@@ -149,32 +175,36 @@ bool ManagerCore::health_check(std::int64_t now_ns) {
     return false;
 }
 
-std::string ManagerCore::arming_failure(Mode target) const {
+std::string ManagerCore::arming_failure(Mode target, std::optional<std::int64_t> now_ns) const {
     if (target == Mode::PRESSURIZING) {
         if (!act_ready_)
             return "액추에이터(PLC) 미수신 — 메인밸브 명령 불가";
     } else if (target == Mode::READY) {
         if (!act_ready_)
             return "액추에이터(PLC) 미수신";
-        if (!main_valve_open_)
-            return "에어베어링(메인밸브) 미개방";
     } else if (target == Mode::ACTIVE) {
+        if (config_.require_arm_status && (!arm_status_stamp_ns_ ||
+            age_ms(now_ns.value_or(now_ns_), *arm_status_stamp_ns_) < 0.0 ||
+            age_ms(now_ns.value_or(now_ns_), *arm_status_stamp_ns_) > 150.0))
+            return "팔 드라이버 /arm/operation_status 미수신 또는 만료";
+        if (!act_ready_)
+            return "액추에이터(PLC) 미수신";
         if (!nav_ready_)
             return "항법 미수렴/미수신 (Vicon·EKF 확인)";
         if (!vicon_ready_)
             return "Vicon 미수신";
-        if (!main_valve_open_)
-            return "에어베어링(메인밸브) 미개방";
     }
+    if ((target == Mode::READY || target == Mode::ACTIVE) && main_valve_open_ == config_.dry_bench_solenoid)
+        return config_.dry_bench_solenoid ? "벤치 메인밸브가 열려 있음" : "에어베어링(메인밸브) 미개방";
     return "";
 }
 
-ModeResponse ManagerCore::set_mode(std::uint8_t requested_mode) {
+ModeResponse ManagerCore::set_mode(std::uint8_t requested_mode, std::optional<std::int64_t> now_ns) {
     if (requested_mode > static_cast<std::uint8_t>(Mode::EMERGENCY_STOP)) {
         return {false, fsm_.mode, "알 수 없는 모드 값: " + std::to_string(requested_mode)};
     }
     const auto target = static_cast<Mode>(requested_mode);
-    const auto reason = arming_failure(target);
+    const auto reason = arming_failure(target, now_ns);
     if (!reason.empty())
         return {false, fsm_.mode, "준비 미충족 — " + reason};
     if (!fsm_.transition(target, "서비스 요청")) {

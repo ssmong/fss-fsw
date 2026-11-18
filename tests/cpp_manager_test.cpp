@@ -245,6 +245,7 @@ void active_fault_holds_once_and_requires_rearming() {
     Fixture f;
     f.active();
     f.clock.advance_ms(1000);
+    f.manager.on_valve(f.clock.now_ns, true, 0.0);
     CHECK(!f.manager.health_check(f.clock.now_ns));
     CHECK(f.manager.mode() == Mode::ACTIVE);
     ++f.clock.now_ns;
@@ -271,6 +272,7 @@ void short_navigation_gap_recovers_without_latching() {
     CHECK(!f.manager.health_check(f.clock.now_ns));
     CHECK(f.manager.mode() == Mode::ACTIVE);
     f.clock.advance_ms(799);
+    f.manager.on_valve(f.clock.now_ns, true, 0.0);
     CHECK(!f.manager.health_check(f.clock.now_ns));
     CHECK(f.manager.mode() == Mode::ACTIVE);
     CHECK(f.manager.health().navigation_ok());
@@ -327,7 +329,7 @@ void invalid_wire_values_never_change_state() {
     CHECK(f.manager.transition_log().size() == log_size);
 }
 
-void inherited_vicon_uncertainty_fault_semantics() {
+void active_requires_fresh_valve_confirmation() {
     Fixture f;
     f.active();
     f.clock.advance_ms(501);
@@ -336,8 +338,66 @@ void inherited_vicon_uncertainty_fault_semantics() {
     CHECK(!f.manager.vicon_ready());
     CHECK(!f.manager.actuators_ready());
     CHECK(f.manager.health().vicon_connected);
-    CHECK(!f.manager.health().has_fault());
+    CHECK(f.manager.health().has_fault());
+    CHECK(f.manager.mode() == Mode::SAFE_HOLD);
+    Fixture closed;
+    closed.active();
+    closed.manager.on_valve(0, false, 0.0);
+    CHECK(closed.manager.health_check(0));
+    CHECK(closed.manager.mode() == Mode::SAFE_HOLD);
+}
+
+void arm_status_and_dry_bench_gate_activation() {
+    ManagerConfig config;
+    config.require_arm_status = true;
+    config.dry_bench_solenoid = true;
+    Fixture f(config);
+    f.sensors(false);
+    f.check();
+    CHECK(f.request(Mode::PRESSURIZING));
+    CHECK(f.request(Mode::READY));
+    CHECK(!f.request(Mode::ACTIVE));
+    f.manager.on_arm_status(0);
+    CHECK(f.manager.set_mode(3, 150000001).success == false);
+    CHECK(f.manager.set_mode(3, -1).success == false);
+    CHECK(f.manager.set_mode(3, 150000000).success);
+    f.check();
     CHECK(f.manager.mode() == Mode::ACTIVE);
+    CHECK(!f.manager.health().has_fault());
+}
+
+void toss_grace_is_bounded_and_never_relaxes_arming() {
+    ManagerConfig config;
+    config.toss_nav_uncertainty_grace = true;
+    Fixture f(config);
+    f.active();
+    f.clock.advance_ms(100);
+    f.manager.on_nav(f.clock.now_ns, .008, .008, .03, f.clock.now_ns);
+    f.manager.on_vicon(f.clock.now_ns, f.clock.now_ns);
+    f.check();
+    CHECK(f.manager.mode() == Mode::ACTIVE);
+    CHECK(f.manager.navigation_degraded());
+    CHECK(!f.manager.health().has_fault());
+    CHECK(!f.manager.nav_ready());
+    f.clock.advance_ms(101);
+    f.check();
+    CHECK(f.manager.mode() == Mode::SAFE_HOLD);
+    CHECK(f.request(Mode::READY));
+    CHECK(!f.request(Mode::ACTIVE));
+
+    Fixture bounded(config);
+    bounded.active();
+    bounded.clock.advance_ms(500);
+    bounded.manager.on_nav(500000000, .008, .008, .03, 500000000);
+    bounded.manager.on_vicon(500000000, 500000000);
+    bounded.manager.on_valve(500000000, true, 0.0);
+    bounded.check();
+    CHECK(bounded.manager.mode() == Mode::SAFE_HOLD);
+    Fixture invalid;
+    invalid.sensors();
+    invalid.manager.on_nav(0, -.001, .001, .001);
+    invalid.check();
+    CHECK(!invalid.manager.nav_ready());
 }
 }  // namespace
 
@@ -361,8 +421,9 @@ int main() {
         {"auto_hold_can_be_disabled", auto_hold_can_be_disabled},
         {"safety_transitions_ignore_readiness", safety_transitions_ignore_readiness},
         {"invalid_wire_values_never_change_state", invalid_wire_values_never_change_state},
-        {"inherited_vicon_uncertainty_fault_semantics",
-         inherited_vicon_uncertainty_fault_semantics},
+        {"active_requires_fresh_valve_confirmation", active_requires_fresh_valve_confirmation},
+        {"arm_status_and_dry_bench_gate_activation", arm_status_and_dry_bench_gate_activation},
+        {"toss_grace_is_bounded_and_never_relaxes_arming", toss_grace_is_bounded_and_never_relaxes_arming},
     };
     for (const auto& test : tests) {
         try {

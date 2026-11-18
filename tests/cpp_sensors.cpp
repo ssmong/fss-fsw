@@ -129,6 +129,26 @@ void test_vicon_frame_and_derivatives() {
   rejects([] { fss_hal::PlanarPoseTransform invalid(0, 0, std::numeric_limits<double>::infinity()); });
 }
 
+void test_vicon_center_correction() {
+  const double offset_x = -0.12, offset_y = -0.08;
+  fss_hal::PlanarPoseTransform corrected(3, 4, fss_hal::kPi / 2, true, offset_x, offset_y);
+  // A stationary center in source coordinates, with the marker rotating around it.
+  for (int i = 0; i < 3; ++i) {
+    const double yaw = i * 0.1;
+    const double mx = 1 + std::cos(yaw) * offset_x - std::sin(yaw) * offset_y;
+    const double my = 2 + std::sin(yaw) * offset_x + std::cos(yaw) * offset_y;
+    const auto state = corrected.convert({mx, my, yaw, static_cast<std::uint64_t>(i), 100 + i * 0.1});
+    near(state.x, 1); near(state.y, 5);
+    near(state.vx, 0); near(state.vy, 0);
+    near(state.omega, i == 0 ? 0 : 1);
+  }
+  fss_hal::PlanarPoseTransform disabled(0, 0, 0, false, offset_x, offset_y);
+  const auto marker = disabled.convert({1, 2, 0.3, 1, 100});
+  near(marker.x, 1); near(marker.y, 2);
+  rejects([] { fss_hal::PlanarPoseTransform invalid(0, 0, 0, false,
+      std::numeric_limits<double>::quiet_NaN(), 0); });
+}
+
 fss_hal::ImuSample imu_sample() {
   fss_hal::ImuSample sample;
   sample.stamp_ns = 123000000007LL;
@@ -204,6 +224,7 @@ int main() {
   try {
     test_vicon_packets();
     test_vicon_frame_and_derivatives();
+    test_vicon_center_correction();
     test_imu_conversion();
     std::cout << "C++ sensor checks passed\n";
     return 0;

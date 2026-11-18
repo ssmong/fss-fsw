@@ -38,11 +38,18 @@ struct PlanarState {
 // Vicon source time supplies derivatives; the ROS bridge supplies its receive stamp.
 class PlanarPoseTransform {
  public:
-  PlanarPoseTransform(double offset_x, double offset_y, double rotation_rad)
-      : offset_x_(offset_x), offset_y_(offset_y), rotation_(rotation_rad) {
+  PlanarPoseTransform(double offset_x, double offset_y, double rotation_rad,
+                      bool center_correction = false, double marker_offset_x = 0.0,
+                      double marker_offset_y = 0.0)
+      : offset_x_(offset_x), offset_y_(offset_y), rotation_(rotation_rad),
+        center_correction_(center_correction), marker_offset_x_(marker_offset_x),
+        marker_offset_y_(marker_offset_y) {
     if (!std::isfinite(offset_x_) || !std::isfinite(offset_y_) ||
         !std::isfinite(rotation_)) {
       throw std::invalid_argument("Vicon frame transform must be finite");
+    }
+    if (!std::isfinite(marker_offset_x_) || !std::isfinite(marker_offset_y_)) {
+      throw std::invalid_argument("Vicon marker offsets must be finite");
     }
   }
 
@@ -56,6 +63,12 @@ class PlanarPoseTransform {
     state.x = c * sample.x_m - s * sample.y_m + offset_x_;
     state.y = s * sample.x_m + c * sample.y_m + offset_y_;
     state.theta = wrap_planar_angle(sample.yaw_rad + rotation_);
+    if (center_correction_) {
+      // Differentiate the corrected center so rotation does not look like translation.
+      const double ct = std::cos(state.theta), st = std::sin(state.theta);
+      state.x -= ct * marker_offset_x_ - st * marker_offset_y_;
+      state.y -= st * marker_offset_x_ + ct * marker_offset_y_;
+    }
     if (previous_) {
       const double dt = sample.source_time_sec - previous_time_;
       if (dt > 1e-6 && dt < 1.0) {
@@ -76,6 +89,8 @@ class PlanarPoseTransform {
 
  private:
   double offset_x_, offset_y_, rotation_;
+  bool center_correction_;
+  double marker_offset_x_, marker_offset_y_;
   std::optional<PlanarState> previous_;
   double previous_time_{};
 };

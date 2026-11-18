@@ -17,6 +17,8 @@ struct EKFParameters {
     double gate_threshold = 11.345;
     std::size_t nis_window = 50;
     double table_accel_bias_random_walk = 1.0e-5;
+    double vicon_timestamp_std_ms = 0.0;
+    double accel_model_noise_density = 0.0;
 };
 
 double covariance_to_std(double variance);
@@ -30,15 +32,17 @@ public:
     using Covariance = Eigen::Matrix<double, N_STATES, N_STATES>;
 
     explicit PlanarEKF(const EKFParameters& parameters);
-    void initialize(double px, double py, double theta);
+    void initialize(double px, double py, double theta, bool reset_nis = false);
     void predict(double dt, double omega_imu, double ax_imu, double ay_imu);
-    bool update_vicon(double px, double py, double theta);
+    bool update_vicon(double px, double py, double theta, bool gate_only = false);
     double nis_mean() const;
     bool filter_consistent() const;
     bool initialized() const { return initialized_; }
 
     State x = State::Zero();
     Covariance P = Covariance::Identity() * 0.1;
+    double last_vicon_nis = 0.0;
+    Eigen::Vector3d last_vicon_innovation = Eigen::Vector3d::Zero();
 
 private:
     void record_nis(double nis);

@@ -1,5 +1,6 @@
 #include "fss_actuators/reaction_wheel_control.hpp"
 #include "fss_actuators/valve_control.hpp"
+#include "fss_actuators/release_pulse.hpp"
 
 #include <gtest/gtest.h>
 
@@ -16,6 +17,72 @@
 #include <unistd.h>
 
 namespace {
+TEST(ValveControl, DirectDutyDoesNotInvertThrustMapAndReleaseUsesReservedChannel) {
+  fss_hal::SimHal hal;
+  hal.connect();
+  auto map = std::make_unique<fss_actuators::ValveThrustMap>(
+      std::vector<double>{0, 1}, std::vector<std::vector<double>>(8, {0, 0.5}));
+  fss_actuators::ValveControl control(hal, 4000, 1000, 1.0, true, std::move(map));
+  std::array<double, 8> duty{{0.60, 0.1, 1.5, NAN}};
+  std::array<bool, 8> enabled{}; enabled.fill(true);
+  control.command_duty(duty, enabled);
+  EXPECT_EQ(hal.values(), std::vector<std::uint16_t>(8, 0));
+  control.mode(3);
+  control.command_duty(duty, enabled);
+  EXPECT_EQ(hal.values(), (std::vector<std::uint16_t>{2400, 0, 4000, 0, 0, 0, 0, 0}));
+  EXPECT_DOUBLE_EQ(control.estimated_thrust()[0], 0.3);
+  control.release_pulse(true, 5);
+  EXPECT_EQ(hal.values(), (std::vector<std::uint16_t>{0, 0, 0, 0, 0, 2400, 0, 0}));
+  control.release_pulse(false, 5);
+  EXPECT_EQ(hal.values(), std::vector<std::uint16_t>(8, 0));
+}
+
+TEST(ReleasePulse, RequiresFreshActiveAndDeduplicatesTenMillisecondPulse) {
+  std::vector<bool> writes;
+  std::vector<std::string> events;
+  fss_actuators::ReleasePulse pulse([&](bool on) { writes.push_back(on); },
+      [&](auto, const char* state, const auto&) { events.push_back(state); });
+  pulse.request(1000000000, 1200000000, 1.0, true, 1.0, false);
+  pulse.request(1000000000, 1000000000, 1.0, false, 1.0, false);
+  pulse.request(1000000000, 1000000000, 2.0, true, 0.0, false);
+  pulse.request(1000000000, 1000000000, 1.0, true, 1.0, true);
+  EXPECT_TRUE(writes.empty());
+  EXPECT_EQ(events, std::vector<std::string>(4, "REJECTED"));
+  pulse.request(1000000000, 1000000000, 1.0, true, 1.0, false);
+  EXPECT_EQ(writes, std::vector<bool>{true});
+  EXPECT_FALSE(pulse.due(1.009));
+  EXPECT_TRUE(pulse.due(1.010));
+  pulse.request(1000000000, 1000000000, 1.0, true, 1.0, false);
+  EXPECT_EQ(writes.size(), 1u);
+  pulse.close();
+  EXPECT_EQ(writes, (std::vector<bool>{true, false}));
+  EXPECT_FALSE(pulse.pending());
+  pulse.request(1000000000, 1000000000, 1.1, true, 1.1, false);
+  EXPECT_EQ(writes.size(), 2u);
+  EXPECT_EQ(events.back(), "OFF_ACK");
+}
+
+TEST(ReleasePulse, LostOnReplyStillAttemptsOffAndFailedOffRemainsPending) {
+  bool failing = true;
+  std::vector<bool> writes;
+  std::vector<std::string> events;
+  fss_actuators::ReleasePulse pulse([&](bool on) {
+      writes.push_back(on);
+      if (failing) throw std::runtime_error("Lost PLC response");
+    }, [&](auto, const char* state, const auto&) { events.push_back(state); });
+  pulse.request(1, 1, 1.0, true, 1.0, false);
+  EXPECT_EQ(writes, (std::vector<bool>{true, false}));
+  EXPECT_EQ(events, (std::vector<std::string>{"ON_UNCONFIRMED", "OFF_UNCONFIRMED"}));
+  EXPECT_TRUE(pulse.pending());
+  EXPECT_TRUE(pulse.due(1.0));
+  pulse.request(2, 2, 1.0, true, 1.0, false);
+  EXPECT_EQ(events.back(), "REJECTED");
+  failing = false;
+  pulse.close();
+  EXPECT_FALSE(pulse.pending());
+  EXPECT_EQ(events.back(), "OFF_ACK");
+}
+
 TEST(ValveThrustMap, PreservesMeasuredInterpolationAndSmallestPlateauInput) {
   fss_actuators::ValveThrustMap map({0, 0.2, 0.4, 0.6, 0.8, 1}, {{0, 0, 0.5, 0.5, 1, 1}}, 1);
   for (const auto& point : std::vector<std::pair<double, double>>{{0, 0}, {0.25, 0.3},
