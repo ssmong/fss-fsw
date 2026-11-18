@@ -59,13 +59,14 @@ class CatalogRelayTest(unittest.TestCase):
             "geometry_msgs.msg": "PoseArray PoseStamped",
             "sensor_msgs.msg": "Imu JointState",
             "std_msgs.msg": "String",
-            "std_srvs.srv": "Trigger",
+            "std_srvs.srv": "Trigger SetBool",
         }
         for module, names in declarations.items():
             modules[module] = SimpleNamespace(**{name: type(name, (), {"Request": SimpleNamespace}) for name in names.split()})
         modules["rclpy"] = SimpleNamespace(init=Mock(), create_node=Mock(return_value=node))
         modules["rclpy.qos"] = SimpleNamespace(qos_profile_sensor_data=object())
-        catalog = SimpleNamespace(plans=[], signatures={}, defaults={}, refresh=Mock(return_value=False))
+        catalog = SimpleNamespace(plans=[], signatures={}, defaults={}, refresh=Mock(return_value=False),
+                                  run_options=Mock(return_value={}))
         with patch.dict(sys.modules, modules), patch.multiple(
             mission_ros, create=True, PlanCatalog=lambda: catalog, load_table_plans=Mock(),
             toss_tuning_defaults=Mock(return_value={"Nominal": {"launch_position_gain_change_s": 3}}),
@@ -75,10 +76,11 @@ class CatalogRelayTest(unittest.TestCase):
             rejects = Mock()
             _, request = mission_ros.open_node(lambda kind, value: events.append((kind, value)), Mock(), reject=rejects)
             self.assertEqual(events[:2], [("plans", []), ("plan_defaults", {})])
-            self.assertEqual(events[2], ("tuning_defaults", {"Nominal": {"launch_position_gain_change_s": 3}}))
+            self.assertEqual(events[2], ("plan_options", {}))
+            self.assertEqual(events[3], ("tuning_defaults", {"Nominal": {"launch_position_gain_change_s": 3}}))
             refresh = next(callback for _, callback in timers if callback.__name__ == "refresh_plans")
             refresh()
-            self.assertEqual(len(events), 3)
+            self.assertEqual(len(events), 4)
             mission_ros.toss_tuning_defaults.assert_called_once()
             catalog.plans = [["bundle/Nominal", "A", [[0, 0], [1, 1]], [0, 1]]]
             catalog.defaults = {"Nominal": "bundle/Nominal"}

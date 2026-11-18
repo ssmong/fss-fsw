@@ -73,6 +73,10 @@ class JetsonLink(QObject):
                 and time.monotonic() - self.last_body_status_at <= SOURCE_TIMEOUT_SEC)
 
     def request(self, name, value):
+        if name == "refresh_plans":
+            if self.ready and not self.stopped.is_set() and not self.bridge_error:
+                self.commands.put((time.monotonic(), name, True))
+            return
         if (not self.ready or self.monitor_only or (self.read_only and name != "stop_body")
                 or self.stopped.is_set() or self.bridge_error):
             return
@@ -81,6 +85,9 @@ class JetsonLink(QObject):
                     or time.monotonic() - self.last_body_status_at > SOURCE_TIMEOUT_SEC):
                 return
             self.body_start_pending = True
+        elif name == "cover":
+            if type(value) is not bool:
+                return
         elif name == "valve" and self.workflow == "toss":
             if type(value) is not bool or not self.can_toss_air():
                 return

@@ -33,6 +33,11 @@ class MissionActions:
             self.air_open, self.health_at = msg.main_valve_open, time.monotonic()
 
     def _sequence(self, name, value):
+        if name == "cover":
+            if type(value) is not bool:
+                raise ValueError("Cover selection must be boolean")
+            yield name, value
+            return "Cover 적용 · 13.04 kg" if value else "Uncover 적용 · 11.84 kg"
         if name == "toss_air":
             yield name, value
             return "에어베어링 ON" if value else "에어베어링 OFF"
@@ -207,7 +212,7 @@ def open_node(receive, reply, args=None, reject=None):
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Imu, JointState
     from std_msgs.msg import String
-    from std_srvs.srv import Trigger
+    from std_srvs.srv import SetBool, Trigger
 
     rclpy.init(args=args)
     node = rclpy.create_node("fss_mission_" + uuid.uuid4().hex)
@@ -240,6 +245,8 @@ def open_node(receive, reply, args=None, reject=None):
     tracking = tracker_type(catalog.plans, catalog.signatures, node.get_clock().now().nanoseconds / 1e9)
     receive("plans", catalog.plans)
     receive("plan_defaults", catalog.defaults)
+    last_options = catalog.run_options()
+    receive("plan_options", last_options)
     receive("tuning_defaults", read_tuning())
     last_run = None
     published_extra = None
@@ -247,9 +254,14 @@ def open_node(receive, reply, args=None, reject=None):
     last_paper_status_at = 0.0
     last_elapsed = None
 
-    def refresh_plans():
-        nonlocal published_extra
-        if not catalog.refresh():
+    def refresh_plans(force=False):
+        nonlocal published_extra, last_options
+        changed = catalog.refresh()
+        options = catalog.run_options()
+        if force or options != last_options:
+            receive("plan_options", options)
+            last_options = options
+        if not changed and not force:
             return
         tracking.refresh_catalog(catalog.plans, catalog.signatures)
         published_extra = tracking.extra_plan
@@ -262,6 +274,7 @@ def open_node(receive, reply, args=None, reject=None):
                 tracking.poll(status, node.get_clock().now().nanoseconds / 1e9, None)
             receive("paper_trial", [status.get("plan_id", ""), last_elapsed, tracking.active_key])
 
+    node.refresh_plans = lambda: refresh_plans(True)
     node.create_timer(1.0, refresh_plans)
 
     def paper_status(msg):
@@ -335,6 +348,7 @@ def open_node(receive, reply, args=None, reject=None):
         ("imu", "/sensors/imu", Imu, 20),
         ("arm_joints", "/arm/joint_states", JointState, qos_profile_sensor_data),
         ("arm_driver", "/arm/status", String, qos_profile_sensor_data),
+        ("body_configuration", "/arm/kinematics_status", String, qos_profile_sensor_data),
         ("arm_table", "/arm/link_poses", PoseArray, qos_profile_sensor_data),
         ("arm_tcp", "/arm/end_effector_pose", PoseStamped, qos_profile_sensor_data),
         ("arm_base", "/arm/link_poses_base", PoseArray, qos_profile_sensor_data),
@@ -349,6 +363,7 @@ def open_node(receive, reply, args=None, reject=None):
     }
 
     services["target"] = (node.create_client(SetTarget, "/gnc/set_target"), SetTarget, None)
+    services["cover"] = (node.create_client(SetBool, "/arm/set_cover"), SetBool, "data")
 
     def call(name, value):
         toss_air = name == "toss_air"
@@ -358,7 +373,7 @@ def open_node(receive, reply, args=None, reject=None):
                     or not bench.can_control_air(node.get_node_names())):
                 raise ValueError("Self-tossing 에어베어링 명령 대상을 확인할 수 없습니다.")
             name = "valve"
-        if globals().get("read_only") and not (toss_air and globals()["read_only"] == "Self-tossing"):
+        if globals().get("read_only") and not ((toss_air or name == "cover") and globals()["read_only"] == "Self-tossing"):
             raise ValueError(globals()["read_only"])
         if name not in services:
             raise ValueError("/gnc/set_target 미설치 · Jetson GNC 업데이트 필요")
@@ -366,9 +381,11 @@ def open_node(receive, reply, args=None, reject=None):
         if not client.service_is_ready():
             raise ValueError(f"{client.srv_name} 서비스 미연결")
         owner = {"mode": "manager_node", "valve": "valve_driver_node",
-                 "target": "gnc_node", "controller": "gnc_node"}[name]
+                 "target": "gnc_node", "controller": "gnc_node", "cover": "arm_kinematics_node"}[name]
         owns_service = globals().get("local_service_owner")
-        if owns_service and not toss_air and not owns_service(owner):
+        executable = "arm_kinematics" if name == "cover" else owner
+        if (owns_service and not toss_air and not (name == "cover" and globals().get("toss_bench"))
+                and not owns_service(executable)):
             raise ValueError(f"이 Jetson에서 {owner}를 찾을 수 없습니다.")
         if node.get_node_names().count(owner) > 1:
             raise ValueError("같은 ROS 도메인에서 기체가 중복되어 명령 대상을 구분할 수 없습니다.")
@@ -430,7 +447,7 @@ def serve(hub=None):
         # The dashboard uses IMU arrivals only to measure the incoming rate.
         if name == "imu" and not recording:
             data = {}
-        elif name in ("plans", "plan_defaults", "tuning_defaults", "paper_trial", "paper_status", "tracking_error", "arm_registration"):
+        elif name in ("plans", "plan_defaults", "plan_options", "tuning_defaults", "paper_trial", "paper_status", "tracking_error", "arm_registration"):
             data = msg
         elif name == "valve_output":
             data = {"duty_cycles": [float(value) for value in msg.duty_cycles]}
@@ -574,6 +591,9 @@ def serve(hub=None):
                     name, value = json.loads(command)
                     commands.append((None, name, value))
             for owner, name, value in commands:
+                if name == "refresh_plans":
+                    node.refresh_plans()
+                    continue
                 if name == "__attach__" and hub is not None:
                     continue
                 error_kind = "toss_error" if name.startswith("toss_") else (
@@ -608,6 +628,11 @@ def serve(hub=None):
                         (bench or switch_bench).cancelled.set()
                         stop_owner, command_owner = command_owner, None
                         stop_future = toss_pool.submit((bench or switch_bench).stop_body)
+                elif name == "cover":
+                    if passive:
+                        emit("reply_error", "이 연결에서는 모델을 변경할 수 없습니다.")
+                    else:
+                        request(name, value)
                 elif bench:
                     if name == "valve":
                         if (passive or type(value) is not bool

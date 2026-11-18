@@ -189,6 +189,29 @@ class PlanCatalog:
         self.cache, self.plans, self.signatures = cache, plans, signatures
         return changed
 
+    def run_options(self):
+        """Only offer validated plans with their own existing capture configuration."""
+        import yaml
+        options = {}
+        methods = {"Nominal": "Nominal", "JF_only": "JF_only", "Proposed": "Proposed",
+                   "P_nom": "Nominal", "P_F_samebox": "JF_only", "P_F_T": "Proposed"}
+        for key, plan_id, *_ in self.plans:
+            folder = self.root / key
+            method = methods.get(folder.name)
+            config = folder / "capture.yaml"
+            if not config.is_file():
+                config = folder.parent / "capture.yaml"
+            try:
+                shared = yaml.safe_load((folder / "trial.yaml").read_text()).get("capture_config_file")
+                if shared:
+                    config = (folder / shared).resolve()
+            except (OSError, TypeError, ValueError, AttributeError, yaml.YAMLError):
+                continue
+            if method and config.is_file() and config.resolve().is_relative_to(self.root):
+                options[key] = dict(method=method, plan_id=plan_id,
+                                    trial_file=str(folder / "trial.yaml"), config_file=str(config))
+        return options
+
 
 def _paper_launch_path(root):
     try:

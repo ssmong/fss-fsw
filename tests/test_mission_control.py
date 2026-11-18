@@ -589,6 +589,74 @@ class MissionControlTest(unittest.TestCase):
             link.request("valve", True)
             self.assertTrue(link.commands.empty())
 
+    def test_cover_selector_sends_immediately_even_during_launch(self):
+        w = self.window
+        link = self.connect("first", 0)
+        link.data.control_view = "toss"
+        self.body_status(link, workflow="toss", toss_actions=["toss_stop"])
+        link.data.receive("body_configuration", SimpleNamespace(data='{"cover":true,"base_mass_kg":13.04}'))
+        link.data.receive("paper_status", {"phase": "LAUNCH"})
+        w._update()
+        self.assertTrue(w._toss_cover.isEnabled())
+        self.assertIs(w._toss_cover.currentData(), True)
+        w._choose_cover(w._toss_cover.findData(False))
+        self.assertEqual(link.commands.get_nowait()[1:], ("cover", False))
+        link.data.receive("body_configuration", SimpleNamespace(data='{"cover":false,"base_mass_kg":11.84}'))
+        w._update()
+        self.assertIs(w._toss_cover.currentData(), False)
+
+    def test_selected_bundle_sends_matching_trial_config_and_refresh_is_read_only(self):
+        w = self.window
+        link = self.connect("first", 0)
+        link.data.control_view = "toss"
+        self.body_status(link, workflow="toss", toss_actions=["toss_run"])
+        key = "acrylic_cover/Nominal"
+        option = dict(method="Nominal", plan_id="cover-id", trial_file="/plans/cover/trial.yaml",
+                      config_file="/plans/cover/capture.yaml")
+        link.data.receive("plans", [[key, "cover-id", [[1., 0.], [2., 3.]], [0., 4.]]])
+        link.data.receive("plan_options", {key: option})
+        w._update()
+        w._toss_bundle.setCurrentIndex(w._toss_bundle.findData("acrylic_cover"))
+        w._update()
+        self.assertEqual(link.data.preview_plan_key(), key)
+        self.assertEqual(w._toss_plan_id.text(), "cover-id")
+        self.assertTrue(link.commands.empty())
+        w._toss_refresh.click()
+        self.assertEqual(link.commands.get_nowait()[1:], ("refresh_plans", True))
+        w._send_toss("toss_run")
+        self.assertEqual(link.commands.get_nowait()[1:], ("toss_run", ["Nominal",
+                         "trial_file:=/plans/cover/trial.yaml", "config_file:=/plans/cover/capture.yaml"]))
+        link.data.receive("paper_trial", ["cover-id", 1., key])
+        link.data.receive("paper_status", {"phase": "LAUNCH"})
+        w._update()
+        self.assertFalse(w._toss_bundle.isEnabled())
+
+    def test_applied_tuning_from_ssh_renders_for_control_and_monitor(self):
+        import json
+
+        w = self.window
+        for monitor in (False, True):
+            with self.subTest(monitor=monitor):
+                host = f"tuning-{monitor}"
+                w.add_jetson(host, "operator", None, "", monitor_only=monitor)
+                link = w._links[host]
+                self.body_status(link, workflow="toss", can_start_body=False)
+                link.data.control_view = "toss"
+                link.data.receive("plans", [["bundle/Nominal", "id", [[0., 0.], [1., 1.]], [0., 1.]]])
+                link.data.receive("paper_trial", ["id", .2, "bundle/Nominal"])
+                tuning = {"launch_velocity_feedforward_scale": 0.8, "release_open_delay_s": -0.1}
+                for decode in (lambda value: value,
+                               lambda value: json.loads(json.dumps(value), object_hook=lambda d: SimpleNamespace(**d))):
+                    link.data.receive("paper_status", decode({"phase": "LAUNCH", "tuning": tuning}))
+                    w._update()
+                    self.assertEqual(w._toss_tuning["launch_velocity_feedforward_scale"].placeholderText(), "0.8")
+                    self.assertEqual(w._toss_tuning["release_open_delay_s"].placeholderText(), "-0.1")
+                    self.assertEqual(link.data.recording_context()["tuning"], tuning)
+                link.data.receive("paper_status", SimpleNamespace(phase="STOPPED"))
+                w._update()
+                self.assertIsNone(link.data.toss_tuning_applied)
+                self.assertTrue(link.commands.empty())
+
     def test_toss_tuning_values_are_per_vehicle_and_sent_as_run_options(self):
         w = self.window
         first, second = self.connect("first", 0), self.connect("second", 1)

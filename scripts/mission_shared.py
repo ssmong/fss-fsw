@@ -12,8 +12,8 @@ import threading
 import time
 
 
-SHARED_PROTOCOL = 10
-SHARED_CACHE = {"plans", "plan_defaults", "tuning_defaults", "arm_registration", "connected"}
+SHARED_PROTOCOL = 12
+SHARED_CACHE = {"plans", "plan_defaults", "plan_options", "tuning_defaults", "arm_registration", "connected"}
 SHARED_DISPLAY = {"vicon", "ekf", "ref", "arm_joints", "arm_driver", "arm_table", "arm_base", "arm_tcp"}
 
 
@@ -135,6 +135,9 @@ class SharedHub:
             if value["profile"] in ("auto", "control"):
                 self.commands.put_nowait((key, "__attach__", True, time.monotonic()))
             return
+        if name == "refresh_plans" and value is True:
+            self.commands.put_nowait((key, name, value, time.monotonic()))
+            return
         if name == "record_stream":
             client["recording"] = value is True
             return
@@ -142,8 +145,8 @@ class SharedHub:
             "body_error" if name in ("start_body", "stop_body") else "reply_error")
         profile = client["profile"]
         if (profile == "monitor" or (profile == "control" and isinstance(name, str) and name.startswith("toss_"))
-                or (profile == "toss" and name not in ("stop_body", "valve", "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop", "toss_reset"))
-                or name not in ("mode", "valve", "target", "controller", "start_body", "stop_body",
+                or (profile == "toss" and name not in ("cover", "stop_body", "valve", "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop", "toss_reset"))
+                or name not in ("cover", "mode", "valve", "target", "controller", "start_body", "stop_body",
                                 "toss_fss", "toss_run", "toss_close", "toss_prepare", "toss_start", "toss_stop", "toss_reset")):
             self.publish(error, "이 연결에서는 명령을 보낼 수 없습니다.", target=key)
             return

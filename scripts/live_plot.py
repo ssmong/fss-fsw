@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import math
 import shlex
 import sys
@@ -339,6 +340,9 @@ class DashboardNode:
         self.tracking_since = None
         self.target_draft = ("PID", 0.0, 0.0, 0.0)
         self.toss_method = "Nominal"
+        self.toss_bundle = ""
+        self.plan_options = {}
+        self.body_cover = None
         self.control_view = "position"
         self.toss_options = ""
         self.toss_tuning_draft = {}
@@ -441,7 +445,8 @@ class DashboardNode:
     def receive(self, name, msg):
         if name == "paper_status":
             status = msg if isinstance(msg, dict) else vars(msg)
-            self.toss_tuning_applied = status.get("tuning")
+            tuning = status.get("tuning")
+            self.toss_tuning_applied = tuning if isinstance(tuning, dict) else getattr(tuning, "__dict__", None)
         if name == "paper_status" and self.recording_status:
             self.recording_status(msg, False)
         if self.recorder.active:
@@ -575,6 +580,14 @@ class DashboardNode:
     def _cb_arm_registration(self, values):
         self.arm_overlay.configure(values)
 
+    def _cb_body_configuration(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, AttributeError, TypeError):
+            return
+        self.body_cover = data.get("cover") if type(data.get("cover")) is bool else None
+        self._mark_rx("body_configuration")
+
     def _cb_arm_tcp(self, msg):
         p = msg.pose.position
         if msg.header.frame_id != "table" or not all(math.isfinite(v) for v in (p.x, p.y)):
@@ -675,6 +688,11 @@ class DashboardNode:
         self.toss_tuning_defaults = {method: item if isinstance(item, dict) else vars(item)
                                     for method, item in values.items()}
 
+    def _cb_plan_options(self, options):
+        values = options if isinstance(options, dict) else vars(options)
+        self.plan_options = {key: item if isinstance(item, dict) else vars(item)
+                             for key, item in values.items()}
+
     def _cb_plan_defaults(self, defaults):
         values = defaults if isinstance(defaults, dict) else getattr(defaults, "__dict__", {})
         self.plan_defaults = {method: key for method, key in values.items()
@@ -758,6 +776,10 @@ class DashboardNode:
             return None
         if any(option.split(":=", 1)[0] == "trial_file" for option in options):
             return None
+        if self.toss_bundle:
+            return next((key for key, item in self.plan_options.items()
+                         if key.rsplit("/", 1)[0] == self.toss_bundle
+                         and item["method"] == self.toss_method), None)
         if self.plan_defaults is not None:
             return self.plan_defaults.get(self.toss_method)
         matches = [key for key in self.paper_plans if key.rsplit("/", 1)[-1] == self.toss_method]
@@ -1733,8 +1755,11 @@ class Dashboard(QMainWindow):
         panel.setObjectName("panel")
         panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         layout = QGridLayout(panel)
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
         layout.setContentsMargins(12, 9, 12, 10)
         layout.setSpacing(5)
+        for col in range(5):
+            layout.setColumnStretch(col, 1)
         layout.addWidget(QLabel("경로"), 0, 0)
         self._toss_status = QLabel()
         self._toss_status.setTextFormat(Qt.PlainText)
@@ -1766,8 +1791,23 @@ class Dashboard(QMainWindow):
         self._toss_advanced.setAccessibleName("Self-tossing 고급 설정")
         layout.addWidget(self._toss_advanced, 0, 4)
         self._toss_tuning_panel = QWidget()
-        tuning = QGridLayout(self._toss_tuning_panel)
+        advanced = QVBoxLayout(self._toss_tuning_panel)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        advanced.setSpacing(8)
+        body = QHBoxLayout()
+        body.addWidget(QLabel("기체 모델"))
+        self._toss_cover = QComboBox()
+        self._toss_cover.setAccessibleName("기체 Cover / Uncover")
+        self._toss_cover.addItem("Cover · 13.04 kg", True)
+        self._toss_cover.addItem("Uncover · 11.84 kg", False)
+        self._toss_cover.setPlaceholderText("기체 모델 수신 대기")
+        self._toss_cover.setCurrentIndex(-1)
+        self._toss_cover.activated.connect(self._choose_cover)
+        body.addWidget(self._toss_cover, 1)
+        advanced.addLayout(body)
+        tuning = QGridLayout()
         tuning.setContentsMargins(0, 0, 0, 0)
+        advanced.addLayout(tuning)
         self._toss_tuning_panel.hide()
         self._toss_advanced.toggled.connect(self._toss_tuning_panel.setVisible)
         self._toss_tuning = {}
@@ -1782,7 +1822,7 @@ class Dashboard(QMainWindow):
             tuning.addWidget(label, row, 0)
             field = QLineEdit()
             field.setAccessibleName(key)
-            field.setFixedSize(120, 30)
+            field.setFixedWidth(120)
             field.setAlignment(Qt.AlignRight)
             field.setPlaceholderText("—")
             field.setToolTip(f"{key} · 비우면 tuning.yaml 값 사용")
@@ -1813,6 +1853,19 @@ class Dashboard(QMainWindow):
         self._toss_alignment.setStyleSheet(f"color:{C_TEXT_DIM};")
         self._toss_alignment.hide()
         layout.addWidget(self._toss_alignment, 5, 0, 1, 5)
+        self._toss_bundle = QComboBox()
+        self._toss_bundle.setAccessibleName("Self-tossing 계획 묶음")
+        self._toss_bundle.currentIndexChanged.connect(self._choose_toss_bundle)
+        plans = QHBoxLayout()
+        plans.addWidget(self._toss_bundle, 1)
+        advanced.addLayout(plans)
+        self._toss_refresh = QPushButton("↻ 새로고침")
+        self._toss_refresh.clicked.connect(self._refresh_toss_plans)
+        plans.addWidget(self._toss_refresh)
+        self._toss_plan_id = QLabel()
+        self._toss_plan_id.setTextFormat(Qt.PlainText)
+        self._toss_plan_id.setWordWrap(True)
+        advanced.addWidget(self._toss_plan_id)
         return panel
 
     def _can_send_toss(self, link, action):
@@ -1826,6 +1879,17 @@ class Dashboard(QMainWindow):
         if (self._node.control_view == "toss" and link and link.data is self._node
                 and not self._shared_domain(link) and link.can_toss_air()):
             self._node.request_main_valve(state)
+
+    def _refresh_toss_plans(self):
+        self._node.send_command("refresh_plans", True)
+
+    def _choose_cover(self, index):
+        self._node.send_command("cover", self._toss_cover.itemData(index))
+
+    def _choose_toss_bundle(self, index):
+        self._node.toss_bundle = self._toss_bundle.itemData(index) or ""
+        self._node.plan_choice = "auto"
+        self._update_trajectory()
 
     def _choose_toss_method(self, method):
         self._node.toss_method = method
@@ -1847,6 +1911,14 @@ class Dashboard(QMainWindow):
             if action == "toss_run":
                 try:
                     value = [value, *shlex.split(self._toss_options.text())]
+                    if self._node.toss_bundle:
+                        key = self._node.preview_plan_key()
+                        selected = self._node.plan_options.get(key)
+                        if selected is None:
+                            raise ValueError("선택한 묶음에 실행 가능한 계획이 없습니다.")
+                        if any(option.split(":=", 1)[0] in ("trial_file", "config_file") for option in value[1:]):
+                            raise ValueError("계획 묶음 선택 시 trial_file/config_file 추가 옵션을 비워 주세요.")
+                        value.extend(f"{name}:={selected[name]}" for name in ("trial_file", "config_file"))
                     for key, field in self._toss_tuning.items():
                         if field.text().strip():
                             number = float(field.text())
@@ -1875,6 +1947,15 @@ class Dashboard(QMainWindow):
         return ""
 
     def _update_toss_controls(self, link):
+        self._toss_cover.setCurrentIndex(self._toss_cover.findData(self._node.body_cover)
+                                        if self._node.body_cover is not None else -1)
+        self._toss_cover.setEnabled(bool(link and link.ready and not link.stopped.is_set()
+                                         and not link.bridge_error and not link.read_only
+                                         and not self._shared_domain(link)
+                                         and self._node.body_cover is not None
+                                         and self._node.source_age("body_configuration") <= SOURCE_TIMEOUT_SEC))
+        self._toss_refresh.setEnabled(bool(link and link.ready and not link.stopped.is_set()
+                                          and not link.bridge_error))
         self._toss_standby.setEnabled(bool(self._can_send_toss(link, "toss_reset")))
         for action, button in self._toss_buttons.items():
             button.setEnabled(bool(self._can_send_toss(link, action)))
@@ -1884,12 +1965,31 @@ class Dashboard(QMainWindow):
         self._toss_method.blockSignals(True)
         self._toss_method.setCurrentText(method)
         self._toss_method.blockSignals(False)
+        self._toss_bundle.blockSignals(True)
+        bundles = sorted({key.rsplit("/", 1)[0] for key in self._node.plan_options})
+        selected_bundle = active.rsplit("/", 1)[0] if bound else self._node.toss_bundle
+        if selected_bundle and selected_bundle not in bundles:
+            bundles.append(selected_bundle)
+        if [self._toss_bundle.itemData(i) for i in range(self._toss_bundle.count())] != ["", *bundles]:
+            self._toss_bundle.clear()
+            self._toss_bundle.addItem("Jetson 기본 계획", "")
+            for bundle in bundles:
+                self._toss_bundle.addItem(bundle, bundle)
+        self._toss_bundle.setCurrentIndex(self._toss_bundle.findData(selected_bundle))
+        self._toss_bundle.blockSignals(False)
+        self._toss_bundle.setEnabled(not bound)
+        key = active if bound else self._node.preview_plan_key()
+        entry = self._node.paper_plans.get(key)
+        self._toss_plan_id.setText(entry[0] if entry else "계획 없음 · 묶음/실행 방식 확인")
+        if self._node.toss_bundle and key not in self._node.plan_options:
+            self._toss_buttons["toss_run"].setEnabled(False)
         self._toss_method.setEnabled(not bound)
         self._toss_method.setToolTip("현재 실험의 경로" if bound else "실험 경로 미리보기")
         phase_fresh = bool(self._node.toss_phase) and self._node.source_age("paper_status") <= SOURCE_TIMEOUT_SEC
         self._toss_method.setVisible(True)
         self._toss_options.setEnabled(not bound)
-        defaults = (self._node.toss_tuning_applied if bound else None) or self._node.toss_tuning_defaults.get(method, {})
+        defaults = ((self._node.toss_tuning_applied if bound else None)
+                    or ({} if self._node.toss_bundle else self._node.toss_tuning_defaults.get(method, {})))
         for key, field in self._toss_tuning.items():
             value = defaults.get(key)
             field.setPlaceholderText(f"{value:g}" if type(value) in (int, float) and math.isfinite(value) else "—")

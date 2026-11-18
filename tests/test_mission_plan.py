@@ -45,6 +45,37 @@ class RegisteredPlanTest(unittest.TestCase):
                 "urdf_commit": "1aa9864b55c8a3032085244ab4e365785faf354c",
                 "urdf_sha256": "23ad70e02d040ea482776261baaae14fbf1de2fc1da3770742b2a54bbab449f3"}}))
 
+    def test_run_options_require_bundle_config_and_prefer_method_config(self):
+        catalog = PlanCatalog(self.root, self.model)
+        catalog.refresh()
+        self.assertEqual(catalog.run_options(), {})
+        config = self.manifest.parent.parent / "capture.yaml"
+        config.write_text("{}")
+        option = catalog.run_options()["trial/Nominal"]
+        self.assertEqual(option["trial_file"], str(self.manifest))
+        self.assertEqual(option["config_file"], str(config))
+        self.assertEqual(option["method"], "Nominal")
+        local = self.manifest.with_name("capture.yaml")
+        local.write_text("{}")
+        self.assertEqual(catalog.run_options()["trial/Nominal"]["config_file"], str(local))
+        self.archive.unlink()
+        catalog.refresh()
+        self.assertEqual(catalog.run_options(), {})
+
+    def test_run_options_reuse_declared_shared_config_inside_experiments(self):
+        shared = self.root / "previous" / "capture.yaml"
+        shared.parent.mkdir()
+        shared.write_text("{}")
+        self.manifest.with_name("capture.yaml").write_text("{}")
+        self.trial["capture_config_file"] = "../../previous/capture.yaml"
+        self.manifest.write_text(json.dumps(self.trial))
+        catalog = PlanCatalog(self.root, self.model)
+        catalog.refresh()
+        self.assertEqual(catalog.run_options()["trial/Nominal"]["config_file"], str(shared))
+        self.trial["capture_config_file"] = "../../previous/missing.yaml"
+        self.manifest.write_text(json.dumps(self.trial))
+        self.assertEqual(catalog.run_options(), {})
+
     def test_registered_body_pose(self):
         (key, plan_id, xy, times, yaw, joints, geometry), = load_table_plans(self.root, self.model)
         self.assertEqual((key, plan_id), ("trial/Nominal", "trial-1"))
