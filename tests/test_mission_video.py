@@ -72,6 +72,7 @@ class VideoTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             recorder = VideoRecorder(directory)
             self.assertFalse(recorder.error, recorder.error)
+            player = sink = None
             try:
                 for i in range(12):
                     recorder.capture({"pose": [1., 1., i / 10],
@@ -80,6 +81,9 @@ class VideoTest(unittest.TestCase):
                                       "ghost_arm": [[0, 0], [.2, .2]]}, i / 10)
                     self.spin_until(lambda: recorder.frames_written >= i + 1 or recorder.error)
                     self.assertFalse(recorder.error, recorder.error)
+                    # Match the live 10 Hz producer while the native encoder processes its queue.
+                    next_frame = time.monotonic() + .1
+                    self.spin_until(lambda: time.monotonic() >= next_frame)
                 recorder.stop()
                 self.spin_until(lambda: recorder.finished)
                 self.assertFalse(recorder.error, recorder.error)
@@ -113,11 +117,12 @@ class VideoTest(unittest.TestCase):
                 self.assertEqual([t for t, _ in frames], [i * 100000 for i in range(12)])
                 self.assertTrue(all(color.red() > color.green() + 12
                                     and color.green() > color.blue() + 12 for _, color in frames))
-                player.stop()
-                player.setSource(QUrl())
-                player.deleteLater()
-                sink.deleteLater()
             finally:
+                if player is not None:
+                    player.stop()
+                    player.setSource(QUrl())
+                    player.deleteLater()
+                    sink.deleteLater()
                 recorder.stop()
                 self.spin_until(lambda: recorder.finished)
                 recorder.deleteLater()

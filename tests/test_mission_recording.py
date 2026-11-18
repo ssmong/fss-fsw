@@ -185,7 +185,8 @@ class RecordingTest(unittest.TestCase):
             self.assertEqual((first["run_id"], second["run_id"]), ("run-1", "run-B"))
             self.assertEqual((first["plan_time_s"], second["plan_time_s"]), ("3.5", "4"))
             self.assertEqual(first["error_xy_m"], "0.5")
-            self.assertEqual(first_node.plan_errors[-1][:4], (3.5, 0.3, -0.4, 0.5))
+            self.assertEqual(first_node.plan_samples[-1]["actual_x_m"], 1.3)
+            self.assertEqual(first_node.plan_samples[-1]["planned_x_m"], 1.0)
             self.assertEqual(first["error_y_m"], "-0.4")
             self.assertEqual(first["error_elbow_rad"], "-0.3")
             for field in ("planned_yaw_rad", "error_yaw_rad", "error_shoulder_rad", "error_wrist_rad"):

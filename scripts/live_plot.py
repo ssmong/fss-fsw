@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mission_arm import JOINT_LABELS, ViconArmOverlay, encoder_model, feedback_source, joint_angles, link_points, plan_arm_points, pose_yaw_deg
+from mission_arm import ViconArmOverlay, feedback_source, joint_angles, link_points, plan_arm_points, pose_yaw_deg
 from mission_link import JetsonLink, PREFERRED_WORKSPACE, SOURCE_TIMEOUT_SEC
 from mission_recording import ExperimentRecorder
 from mission_terminal import TerminalView
@@ -357,12 +357,13 @@ class DashboardNode:
         self.arm_table_origin = None
         self.arm_table_stamp = self.arm_tcp_stamp = None
         self.arm_gripper_pair = None
-        self.arm_local_cad = False
         self.arm_source = "출처 미확인"
         self.t_v: deque[float] = deque(maxlen=history_size)
         self.x_v: deque[float] = deque(maxlen=history_size)
         self.y_v: deque[float] = deque(maxlen=history_size)
         self.th_v: deque[float] = deque(maxlen=history_size)
+        self.t_j = deque(maxlen=history_size)
+        self.joint_history = [deque(maxlen=history_size) for _ in range(3)]
 
         # EKF 상태와 불확실도
         self.t_e: deque[float] = deque(maxlen=history_size)
@@ -393,9 +394,9 @@ class DashboardNode:
         self.t_err: deque[float] = deque(maxlen=history_size)
         self.pos_err: deque[float] = deque(maxlen=history_size)
         self.hdg_err: deque[float] = deque(maxlen=history_size)
-        self.plan_errors = deque(maxlen=history_size)
+        self.plan_samples = deque(maxlen=history_size)
         self.error_run = self.error_plan = self.trial_directory = ""
-        self.error_view = None
+        self.comparison_source = None
 
         # 밸브 명령
         self.valve_cmd = None
@@ -528,6 +529,11 @@ class DashboardNode:
         if (sample := joint_angles(msg)) is not None:
             self.arm_joints = sample
             self._mark_rx("arm_joints")
+            stamp = getattr(getattr(msg, "header", None), "stamp", None)
+            if stamp is not None:
+                self.t_j.append(self._relative_time(stamp))
+                for history, angle in zip(self.joint_history, sample):
+                    history.append(math.degrees(angle))
 
     def _cb_arm_driver(self, msg):
         source = feedback_source(msg.data)
@@ -711,20 +717,16 @@ class DashboardNode:
         if (data.get("frame_id") == "table" and data.get("plan_id")
                 and directory and directory != self.trial_directory):
             self.trial_directory = directory
-            self.plan_errors.clear()
+            self.plan_samples.clear()
             self.error_run = self.error_plan = ""
 
     def _cb_tracking_error(self, sample):
         data = sample if isinstance(sample, dict) else vars(sample)
         run, plan = data["run_id"], data["plan_key"]
         if (run, plan) != (self.error_run, self.error_plan):
-            self.plan_errors.clear()
+            self.plan_samples.clear()
             self.error_run, self.error_plan = run, plan
-        angles = (data.get(f"error_{name}_rad") for name in ("yaw", "shoulder", "elbow", "wrist"))
-        self.plan_errors.append((
-            data["plan_time_s"], data["error_x_m"], data["error_y_m"], data["error_xy_m"],
-            *(math.nan if angle is None else math.degrees(angle) for angle in angles),
-        ))
+        self.plan_samples.append(data)
 
     def active_plan_key(self):
         if not self.paper_trial or self.source_age("paper_trial") > SOURCE_TIMEOUT_SEC:
@@ -1075,7 +1077,6 @@ class Dashboard(QMainWindow):
         panels.addLayout(sidebar, stretch=1)
         views.addWidget(overview)
         self._tabs = self._build_detail_tabs()
-        self._arm_tab = self._tabs.addTab(self._build_arm_detail(), "로봇팔")
         self._log_panel = QWidget()
         log_layout = QVBoxLayout(self._log_panel)
         log_layout.setContentsMargins(0, 0, 0, 0)
@@ -1107,6 +1108,9 @@ class Dashboard(QMainWindow):
         detail_row.addWidget(self._build_readiness_panel())
         detail_row.addWidget(self._build_summary_panel())
         details.addLayout(detail_row)
+        self._arm_status = self._build_arm_status()
+        details.addWidget(self._arm_status)
+        details.addWidget(self._build_status_trends())
         self._tabs.addTab(diagnostics, "상태")
         views.addWidget(self._tabs)
         root.addWidget(views)
@@ -1918,38 +1922,21 @@ class Dashboard(QMainWindow):
         return plot.plot(pen=pg.mkPen(C_ARM, width=3), symbol="o", symbolSize=6,
                          symbolBrush=C_ARM, symbolPen=pg.mkPen("#ffffff"))
 
-    def _build_arm_detail(self):
-        panel = QWidget()
+    def _build_arm_status(self):
+        panel = QFrame()
+        panel.setObjectName("panel")
         layout = QVBoxLayout(panel)
-        self._arm_readout = QLabel("관절 데이터 대기")
-        self._arm_readout.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self._arm_readout)
+        layout.setContentsMargins(12, 8, 12, 8)
+        self._arm_readout = QLabel("로봇팔 · 관절 데이터 대기")
         self._tcp_readout = QLabel()
-        self._tcp_readout.setAlignment(Qt.AlignCenter)
         self._tcp_readout.setToolTip("기체가 /arm/end_effector_pose에 발행한 모델 파지점")
-        layout.addWidget(self._tcp_readout)
         self._arm_alignment = QLabel()
-        self._arm_alignment.setAlignment(Qt.AlignCenter)
         self._arm_alignment.setTextFormat(Qt.PlainText)
         self._arm_alignment.hide()
-        layout.addWidget(self._arm_alignment)
-        self._cad_choice = QCheckBox("fss-fsw CAD (+X) · 관절각으로 보기")
-        self._cad_choice.clicked.connect(self._select_arm_cad)
-        layout.addWidget(self._cad_choice, alignment=Qt.AlignCenter)
-        plot = pg.PlotWidget()
-        _style_plot(plot, "본체 기준", x_label="X [m]", y_label="Y [m]")
-        plot.setAspectLocked()
-        plot.setRange(xRange=(-0.65, 0.65), yRange=(-0.65, 0.65), padding=0)
-        self._arm_model = self._arm_curve(plot)
-        self._wrist_direction = pg.ArrowItem(brush=C_ARM, pen=None, headLen=13)
-        plot.addItem(self._wrist_direction)
-        layout.addWidget(plot)
+        for label in (self._arm_readout, self._tcp_readout, self._arm_alignment):
+            label.setWordWrap(True)
+            layout.addWidget(label)
         return panel
-
-    def _select_arm_cad(self, checked):
-        self._node.arm_local_cad = checked
-        selected = self._links.get(self._vehicles.tabData(self._vehicles.currentIndex()))
-        self._update_arm(allow_overlay=not (selected and self._shared_domain(selected)))
 
     @staticmethod
     def _draw_arm(curve, shape, age):
@@ -1972,7 +1959,7 @@ class Dashboard(QMainWindow):
         base = node.arm_base if age_base < XY_TRAIL_SEC else None
         tip = node.arm_tcp if age_tcp < XY_TRAIL_SEC else None
         shown = node.arm_equipped and bool(self._links or node.request or joints or base or table or tip)
-        self._tabs.setTabVisible(self._arm_tab, shown)
+        self._arm_status.setVisible(shown)
         trace = node.arm_tcp_trail.coordinates() if shown else ([], [])
         self._arm_trace.setData(*trace)
         if not shown:
@@ -2018,31 +2005,10 @@ class Dashboard(QMainWindow):
             self._arm_notice.show()
         else:
             self._arm_notice.hide()
-        workspace = (selected.workspace or PREFERRED_WORKSPACE) if selected else PREFERRED_WORKSPACE
-        private_arm = workspace.split("/", 1)[0] == "FSS_FSW" or bool(selected and (
-            getattr(selected, "private_arm", False) or "FSS_FSW" in selected.read_only
-            or "hardware_runtime" in selected.read_only))
-        self._cad_choice.setVisible(bool(joints and not base and not private_arm))
-        self._cad_choice.setChecked(node.arm_local_cad)
-        use_cad = joints and node.arm_local_cad and not private_arm
-        detail = base or (encoder_model(joints) if use_cad else None)
-        age_detail = age_base if base else age_joints
-        self._draw_arm(self._arm_model, detail, age_detail)
-        if joints:
-            angle_text = "   ".join(f"{label} {math.degrees(q):.1f}°" for label, q in zip(JOINT_LABELS, joints))
-        else:
-            angle_text = ""
-        frame = "본체 기준" if base else "fss-fsw CAD (+X)" if detail else "자세 대기"
-        source = f" · {node.arm_source}" if joints or table or base or tip else ""
-        def held(age):
-            return f" · 마지막 수신 {age:.0f}초 전" if math.isfinite(age) and age > ARM_TIMEOUT_SEC else ""
-        self._arm_readout.setText(f"{frame}{source}{held(age_detail) if detail else ''}   {angle_text}".strip())
-        self._wrist_direction.setVisible(bool(detail))
-        if detail:
-            points, heading = detail
-            self._wrist_direction.setPos(*points[-1])
-            self._wrist_direction.setStyle(angle=180 - math.degrees(heading),
-                                           brush=C_IDLE if age_detail > ARM_TIMEOUT_SEC else C_ARM)
+        angles = "   ".join(f"J{i} {math.degrees(q):.1f}°" for i, q in enumerate(joints, 1)) if joints else "관절 데이터 대기"
+        source = f" · {node.arm_source}" if joints else ""
+        held = f" · 마지막 수신 {age_joints:.0f}초 전" if joints and age_joints > ARM_TIMEOUT_SEC else ""
+        self._arm_readout.setText(f"로봇팔 · {angles}{source}{held}")
 
     def _build_summary_panel(self) -> QWidget:
         panel = QFrame()
@@ -2139,194 +2105,116 @@ class Dashboard(QMainWindow):
             )
         return plot
 
-    def _build_plan_errors(self):
-        panel = QWidget()
-        grid = QGridLayout(panel)
-        grid.setContentsMargins(0, 0, 0, 0)
-        self._error_curves = []
-        self._error_sample_shown = None
-        for row, column, span, title, units, series in (
-            (0, 0, 1, "본체 위치 오차", "m", (("X", C_VICON), ("Y", C_ARM), ("거리", C_ERROR))),
-            (0, 1, 1, "Yaw 오차", "°", (("Yaw", C_WARN),)),
-            (1, 0, 2, "관절각 오차", "°", (("J1", C_VICON), ("J2", C_ARM), ("J3", C_WARN))),
-        ):
-            plot = pg.PlotWidget()
-            _style_plot(plot, title, x_label="계획 시간 [s]", y_label=units)
-            if len(series) > 1:
-                _add_readable_legend(plot, (8, 8), len(series))
-            for label, color in series:
-                self._error_curves.append(plot.plot(name=label, pen=pg.mkPen(color, width=2)))
-            grid.addWidget(plot, row, column, 1, span)
-        self._joint_error_plot = plot
-        return panel
+    def _choose_comparison_source(self, index):
+        self._node.comparison_source = index
+        self._update_comparison()
 
-    def _choose_error_view(self, index):
-        self._node.error_view = index
-        self._update_error_view()
-
-    def _update_error_view(self):
+    def _update_comparison(self):
         node = self._node
-        index = node.error_view
-        if index is None:
-            index = int(not (node.paper_trial or node.plan_errors) and node.latest_ref is not None)
-        self._error_source.setCurrentIndex(index)
-        self._error_pages.setCurrentIndex(index)
-        if index != 0:
-            self._error_caption.clear()
-            return
-        last = node.plan_errors[-1] if node.plan_errors else None
-        caption = (f"{node.error_plan.rsplit('/', 1)[-1]}   ·   {last[0]:.2f} s" if last else
-                   "실측 대기" if node.paper_trial else "실행 계획 대기")
-        self._error_caption.setText(caption)
-        self._error_caption.setToolTip(node.error_run)
-        self._joint_error_plot.setVisible(node.arm_equipped)
-        if last is self._error_sample_shown:
-            return
-        self._error_sample_shown = last
-        if last is None:
-            for curve in self._error_curves:
-                curve.clear()
-            return
-        times, *signals = np.asarray(node.plan_errors, dtype=float).T
-        for curve, signal in zip(self._error_curves, signals):
-            curve.setData(times, signal, connect="finite")
+        source = node.comparison_source
+        if source is None:
+            source = int(not (node.paper_trial or node.plan_samples) and node.latest_ref is not None)
+        self._comparison_source.setCurrentIndex(source)
+        for plot in self._comparison_plots[3:]:
+            plot.setVisible(node.arm_equipped)
+        if source == 0:
+            samples = node.plan_samples
+            last = samples[-1] if samples else None
+            signature = (node, node.error_run, node.error_plan, id(last), len(samples))
+            if signature == self._comparison_signature:
+                return
+            self._comparison_signature = signature
+            self._comparison_caption.setText(
+                f"{node.error_plan.rsplit('/', 1)[-1]} · {last['plan_time_s']:.2f} s" if last else
+                "실측 대기" if node.paper_trial else "실행 계획 대기")
+            self._comparison_caption.setToolTip(node.error_run)
+            times = [sample["plan_time_s"] for sample in samples]
+            for (actual, planned), field in zip(self._comparison_curves,
+                    ("x_m", "y_m", "yaw_rad", "shoulder_rad", "elbow_rad", "wrist_rad")):
+                for curve, prefix in ((actual, "actual_"), (planned, "planned_")):
+                    values = [sample.get(prefix + field) for sample in samples]
+                    values = np.asarray([math.nan if value is None else value for value in values], dtype=float)
+                    if field.endswith("_rad"):
+                        values = np.degrees(values)
+                    if field == "yaw_rad" and prefix == "actual_":
+                        reference = np.degrees(np.asarray([
+                            sample.get("planned_yaw_rad", math.nan) for sample in samples], dtype=float))
+                        # Show equivalent headings on the plan's branch across ±180°.
+                        values = np.where(np.isfinite(reference),
+                                          reference + (values - reference + 180) % 360 - 180, values)
+                    curve.setData(times, values, connect="finite")
+        else:
+            self._comparison_signature = None
+            self._comparison_caption.clear()
+            self._comparison_caption.setToolTip("")
+            for (actual, planned), measured, target in zip(self._comparison_curves[:3],
+                    (node.x_v, node.y_v, node.th_v), (node.ref_x, node.ref_y, node.ref_th)):
+                actual.setData(list(node.t_v), list(measured), connect="finite")
+                planned.setData(list(node.t_r), list(target), connect="finite")
+            for (actual, planned), measured in zip(self._comparison_curves[3:], node.joint_history):
+                actual.setData(list(node.t_j), list(measured), connect="finite")
+                planned.clear()
+        label = "계획 시간 [s]" if source == 0 else "시간 [s]"
+        for plot in self._comparison_plots:
+            plot.setLabel("bottom", label)
 
     def _build_detail_tabs(self) -> QTabWidget:
-        """상세 탭을 구성한다.
-
-        새 plot은 아래처럼 ``_make_plot`` 호출과 ``SeriesSpec``만 추가하면 된다.
-        ROS 콜백에서 같은 길이의 시간 deque와 값 deque를 준비해야 한다.
-        """
         tabs = QTabWidget()
-
-        error_tab = QWidget()
-        errors = QVBoxLayout(error_tab)
-        sources = QHBoxLayout()
-        self._error_source = QComboBox()
-        self._error_source.setAccessibleName("추종 오차 기준")
-        self._error_source.addItems(["실험 계획", "제어기 목표"])
-        self._error_source.activated.connect(self._choose_error_view)
-        sources.addWidget(self._error_source)
-        self._error_caption = QLabel()
-        sources.addWidget(self._error_caption)
-        sources.addStretch()
-        errors.addLayout(sources)
-        self._error_pages = QStackedWidget()
-        self._error_pages.addWidget(self._build_plan_errors())
-        controller_errors = QWidget()
-        error_layout = QHBoxLayout(controller_errors)
-        error_layout.setContentsMargins(6, 6, 6, 6)
-        error_layout.addWidget(
-            self._make_plot(
-                "위치 추종 오차",
-                [SeriesSpec("t_err", "pos_err", "|eₚ|", C_ERROR, 2.0)],
-                "m",
-                (0.0, 0.25),
-            )
-        )
-        error_layout.addWidget(
-            self._make_plot(
-                "방향 추종 오차",
-                [SeriesSpec("t_err", "hdg_err", "eθ", C_WARN, 2.0)],
-                "deg",
-                (-15.0, 15.0),
-            )
-        )
-        self._error_pages.addWidget(controller_errors)
-        errors.addWidget(self._error_pages)
-        tabs.addTab(error_tab, "추종 오차")
-
-        state_tab = QWidget()
-        state_layout = QGridLayout(state_tab)
-        state_layout.setContentsMargins(6, 6, 6, 6)
-        state_layout.addWidget(
-            self._make_plot(
-                "X 위치",
-                [
-                    SeriesSpec("t_e", "x_e", "EKF", C_EKF, 2.5),
-                    SeriesSpec("t_v", "x_v", "Vicon", C_VICON, 2.0, "dotted"),
-                    SeriesSpec(
-                        "t_r", "ref_x", "Reference", C_REFERENCE, 2.2, "dashed"
-                    ),
-                ],
-                "m",
-                min_y_span=0.2,
-            ),
-            0,
-            0,
-        )
-        state_layout.addWidget(
-            self._make_plot(
-                "Y 위치",
-                [
-                    SeriesSpec("t_e", "y_e", "EKF", C_EKF, 2.5),
-                    SeriesSpec("t_v", "y_v", "Vicon", C_VICON, 2.0, "dotted"),
-                    SeriesSpec(
-                        "t_r", "ref_y", "Reference", C_REFERENCE, 2.2, "dashed"
-                    ),
-                ],
-                "m",
-                min_y_span=0.2,
-            ),
-            0,
-            1,
-        )
-        state_layout.addWidget(
-            self._make_plot(
-                "테이블 프레임 속도",
-                [
-                    SeriesSpec("t_e", "vx_e", "vx", C_ERROR),
-                    SeriesSpec("t_e", "vy_e", "vy", "#7048a2"),
-                ],
-                "m/s",
-                min_y_span=0.1,
-            ),
-            1,
-            0,
-        )
-        state_layout.addWidget(
-            self._make_plot(
-                "방향과 각속도",
-                [
-                    SeriesSpec("t_e", "th_e", "θ EKF", C_EKF, 2.5),
-                    SeriesSpec(
-                        "t_r", "ref_th", "θ Ref", C_REFERENCE, 2.2, "dashed"
-                    ),
-                    SeriesSpec("t_e", "om_e", "ω", C_WARN),
-                ],
-                "deg / deg/s",
-                min_y_span=20.0,
-            ),
-            1,
-            1,
-        )
-        tabs.addTab(state_tab, "상태 추세")
-
-        quality_tab = QWidget()
-        quality_layout = QHBoxLayout(quality_tab)
-        quality_layout.setContentsMargins(6, 6, 6, 6)
-        quality_layout.addWidget(
-            self._make_plot(
-                "위치 추정 불확실도 (1σ)",
-                [
-                    SeriesSpec("t_e", "std_x", "σx", C_VICON),
-                    SeriesSpec("t_e", "std_y", "σy", C_EKF),
-                ],
-                "m",
-                min_y_span=0.02,
-            )
-        )
-        quality_layout.addWidget(
-            self._make_plot(
-                "방향 추정 불확실도 (1σ)",
-                [SeriesSpec("t_e", "std_th", "σθ", C_WARN)],
-                "deg",
-                min_y_span=2.0,
-            )
-        )
-        tabs.addTab(quality_tab, "추정 품질")
-
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(6, 6, 6, 6)
+        row = QHBoxLayout()
+        self._comparison_source = QComboBox()
+        self._comparison_source.setAccessibleName("비교 기준")
+        self._comparison_source.addItems(["실험 계획", "제어기 목표"])
+        self._comparison_source.activated.connect(self._choose_comparison_source)
+        row.addWidget(self._comparison_source)
+        self._comparison_caption = QLabel()
+        row.addWidget(self._comparison_caption)
+        row.addStretch()
+        for text, color in (("실측", C_VICON), ("계획", C_REFERENCE)):
+            legend = QLabel(text)
+            legend.setStyleSheet(f"color:{color}; padding:0 8px;")
+            row.addWidget(legend)
+        layout.addLayout(row)
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        self._comparison_plots, self._comparison_curves = [], []
+        self._comparison_signature = None
+        for i, title in enumerate(("X", "Y", "Yaw", "J1", "J2", "J3")):
+            plot = pg.PlotWidget()
+            _style_plot(plot, title, x_label="계획 시간 [s]", y_label="m" if i < 2 else "°")
+            plot.getViewBox().setLimits(minYRange=.05 if i < 2 else 5.)
+            actual = plot.plot(pen=pg.mkPen(C_VICON, width=2))
+            planned = plot.plot(pen=pg.mkPen(C_REFERENCE, width=2, style=Qt.DashLine))
+            if self._comparison_plots:
+                plot.setXLink(self._comparison_plots[0])
+            self._comparison_plots.append(plot)
+            self._comparison_curves.append((actual, planned))
+            grid.addWidget(plot, i // 3, i % 3)
+        layout.addLayout(grid, 1)
+        tabs.addTab(panel, "추종")
         return tabs
+
+    def _build_status_trends(self):
+        panel = QWidget()
+        panel.setMaximumHeight(210)
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._status_trend_plots = []
+        for title, units, span, series, stretch in (
+            ("테이블 속도", "m/s", .1,
+             [SeriesSpec("t_e", "vx_e", "Vx", C_VICON), SeriesSpec("t_e", "vy_e", "Vy", C_ARM)], 2),
+            ("각속도", "°/s", 10., [SeriesSpec("t_e", "om_e", "ω", C_WARN)], 1),
+            ("위치 · 1σ", "m", .02,
+             [SeriesSpec("t_e", "std_x", "σx", C_VICON), SeriesSpec("t_e", "std_y", "σy", C_ARM)], 1),
+            ("Yaw · 1σ", "°", 2., [SeriesSpec("t_e", "std_th", "σθ", C_WARN)], 1),
+        ):
+            plot = self._make_plot(title, series, units, min_y_span=span)
+            plot.setMinimumHeight(130)
+            self._status_trend_plots.append(plot)
+            layout.addWidget(plot, stretch)
+        return panel
 
     def _set_summary_value(self, key: str, text: str, color: str = C_TEXT) -> None:
         label = self._summary_values[key]
@@ -2539,8 +2427,8 @@ class Dashboard(QMainWindow):
             elif curve.xData is not None:
                 curve.clear()
 
-        if self._error_source.isVisible():
-            self._update_error_view()
+        if self._tabs.isVisible() and self._tabs.currentIndex() == 0:
+            self._update_comparison()
 
         duties = node.fresh_valve_command()
         if duties is not None:

@@ -246,27 +246,18 @@ class ArmPlotTest(unittest.TestCase):
             window._update_arm()
             self.assertEqual(window._arm_links.yData.tolist(), [0, 0, 0, 0])
 
-    def test_private_arm_uses_published_geometry(self):
+    def test_arm_readouts_live_in_status_without_a_separate_arm_tab(self):
         node, window = self.node, self.window
-        node._cb_arm_joints(NS(name=["shoulder", "elbow", "wrist"], position=[0., 0., 0.]))
-        with patch.object(self.ui, "PREFERRED_WORKSPACE", "FSS_FSW"):
-            window._select_arm_cad(True)
-            self.assertIsNone(window._arm_model.xData)
-            self.assertTrue(window._cad_choice.isHidden())
-        key = window._vehicles.tabData(window._vehicles.currentIndex())
-        for workspace, reason, private_arm in (("FSS_FSW", "", False), ("FSS_FSW/runtime/cpp", "", False),
-                                               ("fss-fsw", "FSS_FSW/runtime/cpp 사용 중 · 모니터링만 가능", False),
-                                               ("fss-fsw", "", True)):
-            link = NS(workspace=workspace, read_only=reason, private_arm=private_arm)
-            with self.subTest(workspace=workspace), patch.dict(window._links, {key: link}), patch.object(self.ui, "PREFERRED_WORKSPACE", "fss-fsw"):
-                window._update_arm()
-                self.assertIsNone(window._arm_model.xData)
-                self.assertTrue(window._cad_choice.isHidden())
-                node._cb_arm_base(NS(header=NS(frame_id="base_link", stamp=NS(sec=2, nanosec=0)),
-                                     poses=[pose(0, -i) for i in range(4)]))
-                window._update_arm()
-                self.assertEqual(window._arm_model.yData.tolist(), [0, -1, -2, -3])
-                node.arm_base = None
+        node.request = lambda *_: None
+        node._cb_arm_joints(NS(name=["shoulder", "elbow", "wrist"], position=[0., .5, 1.]))
+        window._update_arm()
+        self.assertEqual([window._tabs.tabText(i) for i in range(window._tabs.count())], ["추종", "상태"])
+        status = window._tabs.widget(1)
+        self.assertTrue(status.isAncestorOf(window._arm_readout))
+        self.assertTrue(status.isAncestorOf(window._tcp_readout))
+        self.assertTrue(status.isAncestorOf(window._arm_alignment))
+        self.assertIn("J2 28.6°", window._arm_readout.text())
+        self.assertIsNone(window._arm_links.xData)
 
     def test_frames_source_expiry_and_tcp_trail(self):
         node, window = self.node, self.window
@@ -278,15 +269,12 @@ class ArmPlotTest(unittest.TestCase):
             window._update_arm()
             self.assertIn("모의", window._arm_readout.text())
             self.assertIn("57.3°", window._arm_readout.text())
-            self.assertIsNone(window._arm_model.xData)
             self.assertFalse(window._local_bubble.isVisible())
             node._cb_vicon(NS(header=NS(stamp=stamp), x=0.3, y=1.2, theta=math.pi/2))
             window._update_arm()
             self.assertTrue(window._local_bubble.isVisible())
             self.assertIn("yaw 90.0°", window._local_bubble.toPlainText())
             self.assertEqual(window._local_bubble.toPlainText().split(), ["x", "0.30", "y", "1.20", "yaw", "90.0°"])
-            window._select_arm_cad(True)
-            self.assertEqual(len(window._arm_model.xData), 4)
             self.assertIsNone(window._arm_links.xData)
             for i in range(60):
                 now.return_value = 100 + i / 10
@@ -326,7 +314,7 @@ class ArmPlotTest(unittest.TestCase):
             node.arm_equipped = False
             window._update_arm()
             self.assertIsNone(window._arm_links.xData)
-            self.assertFalse(window._tabs.isTabVisible(window._arm_tab))
+            self.assertTrue(window._arm_status.isHidden())
 
 
 if __name__ == "__main__":

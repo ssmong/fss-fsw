@@ -894,33 +894,73 @@ class MissionControlTest(unittest.TestCase):
                 self.assertEqual(w._toss_method.currentText(), "Proposed")
                 self.assertTrue(link.commands.empty())
 
-    def test_plan_error_graph_stays_with_vehicle_and_run(self):
+    def test_comparison_graphs_keep_planned_and_actual_values_with_vehicle_and_run(self):
         w = self.window
         first = self.connect("first", 1)
         second = self.connect("second", 2)
         w._vehicles.setCurrentIndex(0)
-        sample = dict(run_id="run1", plan_key="bundle/Nominal", plan_time_s=1.,
-                      error_x_m=0.03, error_y_m=0.04, error_xy_m=0.05,
-                      error_yaw_rad=-math.pi / 6, error_shoulder_rad=math.pi / 3)
+        sample = dict(run_id="run1", plan_key="bundle/Proposed", plan_time_s=1.,
+                      actual_x_m=1.03, actual_y_m=2.04, planned_x_m=1., planned_y_m=2.,
+                      actual_yaw_rad=-math.pi / 6, planned_yaw_rad=-math.pi / 3,
+                      actual_shoulder_rad=math.pi / 3, planned_shoulder_rad=math.pi / 2,
+                      planned_elbow_rad=.2, actual_wrist_rad=.1, planned_wrist_rad=.3)
         first.data.receive("tracking_error", SimpleNamespace(**sample))
         first.data.plan_choice = "off"
-        w._update_error_view()
-        self.assertEqual(w._error_curves[2].yData.tolist(), [0.05])
-        self.assertAlmostEqual(w._error_curves[3].yData[-1], -30.)
-        self.assertAlmostEqual(w._error_curves[4].yData[-1], 60.)
-        self.assertTrue(math.isnan(w._error_curves[5].yData[-1]))
+        w._update_comparison()
+        curves = w._comparison_curves
+        self.assertEqual(curves[0][0].yData.tolist(), [1.03])
+        self.assertEqual(curves[0][1].yData.tolist(), [1.])
+        self.assertAlmostEqual(curves[2][0].yData[-1], -30.)
+        self.assertAlmostEqual(curves[2][1].yData[-1], -60.)
+        self.assertAlmostEqual(curves[3][0].yData[-1], 60.)
+        self.assertAlmostEqual(curves[3][1].yData[-1], 90.)
+        self.assertTrue(math.isnan(curves[4][0].yData[-1]))
+        self.assertAlmostEqual(curves[4][1].yData[-1], math.degrees(.2))
+        self.assertIn("Proposed", w._comparison_caption.text())
+        first.data.receive("tracking_error", {**sample, "plan_time_s": 2.,
+                           "actual_yaw_rad": math.radians(-179), "planned_yaw_rad": math.radians(181)})
+        w._update_comparison()
+        self.assertAlmostEqual(curves[2][0].yData[-1], 181.)
+        self.assertAlmostEqual(curves[2][1].yData[-1], 181.)
         second.data.latest_ref = (0., 0., 0.)
         w._vehicles.setCurrentIndex(1)
-        w._update_error_view()
-        self.assertEqual(w._error_pages.currentIndex(), 1)
-        w._choose_error_view(0)
-        self.assertIsNone(w._error_curves[2].xData)
+        w._update_comparison()
+        self.assertEqual(w._comparison_source.currentIndex(), 1)
+        w._choose_comparison_source(0)
+        self.assertIsNone(curves[0][0].xData)
         w._vehicles.setCurrentIndex(0)
         first.data.receive("paper_status", {"frame_id": "table", "plan_id": "id", "log_directory": "/run2"})
         first.data.receive("tracking_error", {**sample, "run_id": "run2", "plan_time_s": 0.2})
-        w._update_error_view()
-        self.assertEqual(w._error_curves[0].xData.tolist(), [0.2])
-        self.assertEqual(w._error_caption.toolTip(), "run2")
+        w._update_comparison()
+        self.assertEqual(curves[0][0].xData.tolist(), [0.2])
+        self.assertEqual(w._comparison_caption.toolTip(), "run2")
+        self.assertTrue(first.commands.empty() and second.commands.empty())
+
+    def test_comparison_controller_view_uses_vicon_and_separate_joint_history(self):
+        w = self.window
+        link = self.connect("first", 1)
+        header = SimpleNamespace(stamp=SimpleNamespace(sec=12, nanosec=0))
+        link.data.receive("vicon", SimpleNamespace(header=header, x=1., y=2., theta=.5))
+        link.data.receive("ref", SimpleNamespace(header=header, x_ref=1.2, y_ref=2.3, theta_ref=.6))
+        link.data.receive("arm_joints", SimpleNamespace(header=header, name=["shoulder", "elbow", "wrist"],
+                                                       position=[.1, .2, .3]))
+        w._choose_comparison_source(1)
+        self.assertEqual(w._comparison_curves[0][0].yData.tolist(), [1.])
+        self.assertEqual(w._comparison_curves[0][1].yData.tolist(), [1.2])
+        for i in range(3):
+            self.assertAlmostEqual(w._comparison_curves[i+3][0].yData[-1], math.degrees((i+1)*.1))
+            self.assertIsNone(w._comparison_curves[i+3][1].yData)
+        link.data.arm_equipped = False
+        w._update_comparison()
+        self.assertTrue(all(plot.isHidden() for plot in w._comparison_plots[3:]))
+        tabs = [w._tabs.tabText(i) for i in range(w._tabs.count())]
+        self.assertEqual(tabs, ["추종", "상태"])
+        grid = w._comparison_plots[0].parentWidget().layout().itemAt(1).layout()
+        for i, plot in enumerate(w._comparison_plots):
+            self.assertIs(grid.itemAtPosition(i // 3, i % 3).widget(), plot)
+        self.assertEqual(len(w._status_trend_plots), 4)
+        status = w._tabs.widget(w._tabs.count()-1)
+        self.assertTrue(all(status.isAncestorOf(plot) for plot in w._status_trend_plots))
 
     def test_main_log_tracks_the_selected_vehicle_and_repeated_messages(self):
         first = self.connect("first", 1)
